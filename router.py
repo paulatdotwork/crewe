@@ -6857,54 +6857,19 @@ def panel_progress(job_id):
 COMPARE_JOBS: dict = {}
 COMPARE_JOBS_LOCK = threading.Lock()
 
-CREATIVE_SPEC_SYSTEM = (
-    "You are a senior product designer and creative director. "
-    "When given a request to build something, write a rich design specification "
-    "that an engineer will use to implement it. Be specific and opinionated. Cover:\n"
-    "- Overall purpose, feel, and target vibe\n"
-    "- Complete layout and structure (every section, panel, sidebar, etc.)\n"
-    "- Visual style: exact colors (hex values), fonts, spacing feel\n"
-    "- Every component — what it contains and what it does\n"
-    "- Key interactions, transitions, and animations worth noting\n"
-    "- Sample or placeholder content\n"
-    "- Edge cases or nice-to-haves worth flagging\n"
-    "Do NOT write any code. This brief goes directly to an engineer — the richer it is, the better the result."
-)
-
-CREATIVE_CODE_SYSTEM = (
-    "You are an expert software engineer implementing a design brief from a creative director. "
-    "Build it faithfully as complete, working, production-quality code. "
-    "Return the full implementation — no partial snippets, no TODOs, no placeholders. "
-    "Explain only genuinely non-obvious decisions."
-)
-
-# Used by both compare tracks — enforces a single downloadable, previewable file.
-COMPARE_CODE_SYSTEM = (
-    "You are an expert software engineer. "
-    "Output EXACTLY ONE self-contained HTML file — everything in a single ```html code block. "
-    "Rules:\n"
-    "- All CSS goes in a <style> tag inside the file. No external stylesheet files.\n"
-    "- All JavaScript goes in a <script> tag inside the file. No external JS files.\n"
-    "- Use CDN links for any libraries: Tailwind via https://cdn.tailwindcss.com, "
-    "others via unpkg.com or cdnjs.cloudflare.com. Never use npm, package.json, or build tools.\n"
-    "- The file must open and work by double-clicking it in a browser. No server required.\n"
-    "- No placeholders, no TODOs. Complete, working, production-quality output only.\n"
-    "Return the entire file as a single ```html ... ``` block and nothing else."
-)
-
-COMPARE_JUDGE_SYSTEM = (
-    "You are judging two code implementations of the same request. "
-    "Track A was coded directly by a code specialist. "
-    "Track B was first designed by a creative director (brief shown), then coded by an engineer. "
-    "Pick the better result on: visual quality, completeness, correctness, and wow factor. "
-    "In 3-5 sentences: name the winner clearly, explain the key difference, and note one weakness of each."
-)
+# (The old direct-vs-creative-brief A/B prompts lived here. /compare is now a
+# backend shoot-out; recover them from git history if that experiment returns.)
 
 
-def _stream_into(url: str, payload: dict, job_id: str, field: str) -> str:
-    parts = []
+def _stream_into(url: str, payload: dict, job_id: str, field: str,
+                 jobs=None, lock=None) -> str:
+    """Stream into a COMPARE_JOBS-shaped pane. `jobs`/`lock` default to the
+    compare tables; passing them lets other pages reuse this."""
+    jobs = COMPARE_JOBS if jobs is None else jobs
+    lock = COMPARE_JOBS_LOCK if lock is None else lock
+    parts, usage = [], None
     try:
-        payload = _inject_model(payload, url)
+        payload = _with_usage(_inject_model(payload, url), url)
         with requests.post(url, json=payload, headers=_hdrs(url),
                            stream=True, timeout=600) as r:
             r.raise_for_status()
@@ -6918,16 +6883,24 @@ def _stream_into(url: str, payload: dict, job_id: str, field: str) -> str:
                         break
                     try:
                         chunk = json.loads(data)
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+                        if not chunk.get("choices"):
+                            continue
                         delta = chunk["choices"][0]["delta"].get("content", "")
                         if delta:
                             parts.append(delta)
-                            with COMPARE_JOBS_LOCK:
-                                COMPARE_JOBS[job_id][field]["tokens"] += 1
+                            with lock:
+                                jobs[job_id][field]["tokens"] += 1
                     except Exception:
                         pass
     except Exception as e:
-        parts.append(f"\n\n[error: {e}]")
-    return "".join(parts)
+        parts.append(_specialist_error(field, url, e))
+    out = "".join(parts)
+    # A shoot-out can include paid backends — bill them like anything else.
+    record_spend(url, f"compare:{field}", usage,
+                 json.dumps(payload.get("messages", ""))[:20000], out)
+    return out
 
 
 # The worked example must NOT be parseable as a real file block. It used to
@@ -6947,72 +6920,78 @@ _FILE_FORMAT_NOTE = (
 )
 
 
-def run_compare_direct(job_id: str, question: str):
-    payload = {
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPTS["code"]},
-            {"role": "user", "content": question + _FILE_FORMAT_NOTE},
-        ],
-        "stream": True,
-    }
-    answer = _stream_into(SPECIALISTS["code"], payload, job_id, "direct")
-    with COMPARE_JOBS_LOCK:
-        COMPARE_JOBS[job_id]["direct"]["answer"] = answer
-        COMPARE_JOBS[job_id]["direct"]["done"] = True
-        COMPARE_JOBS[job_id]["direct"]["stage"] = "done"
-    _check_compare_judge(job_id, question)
+COMPARE_SYSTEM = (
+    "You are a capable assistant. Answer the request directly and completely. "
+    "If the request calls for code, return complete, working code with each "
+    "file in its own fenced block, the filename on the line above it."
+)
 
 
-def run_compare_pipeline(job_id: str, question: str):
-    spec_payload = {
-        "messages": [
-            {"role": "system", "content": CREATIVE_SPEC_SYSTEM},
-            {"role": "user", "content": question},
-        ],
-        "stream": True,
-    }
-    spec = _stream_into(SPECIALISTS["creative"], spec_payload, job_id, "spec")
-    with COMPARE_JOBS_LOCK:
-        COMPARE_JOBS[job_id]["spec"]["answer"] = spec
-        COMPARE_JOBS[job_id]["spec"]["done"] = True
-        COMPARE_JOBS[job_id]["spec"]["stage"] = "done"
-        COMPARE_JOBS[job_id]["cre_code"]["stage"] = "drafting"
+def compare_backends():
+    """Backends a shoot-out may use — NAMES ONLY.
 
-    code_payload = {
-        "messages": [
-            {"role": "system", "content": CREATIVE_CODE_SYSTEM},
-            {"role": "user", "content": f"Design brief from creative director:\n\n{spec}\n\n---\nOriginal request: {question}\n\nBuild this as complete, working code.{_FILE_FORMAT_NOTE}"},
-        ],
-        "stream": True,
-    }
-    code = _stream_into(SPECIALISTS["code"], code_payload, job_id, "cre_code")
+    /compare is open to any logged-in user while /settings is admin-only, so
+    this must never leak URLs or API keys. It reports whether a backend costs
+    money, because picking four models where three of them bill you is a
+    decision the user should make with their eyes open."""
+    with CONFIG_LOCK:
+        out = []
+        for b in ROUTER_CONFIG.get("backends", []):
+            out.append({"id": b.get("id"), "kind": b.get("kind") or "openai",
+                        "model": b.get("model") or "",
+                        "paid": bool(b.get("paid"))})
+    return out
+
+
+def run_compare_backend(job_id: str, bid: str, url: str, question: str):
+    payload = {"messages": [{"role": "system", "content": COMPARE_SYSTEM},
+                            {"role": "user", "content": question}],
+               "stream": True}
+    answer = _stream_into(url, payload, job_id, bid)
     with COMPARE_JOBS_LOCK:
-        COMPARE_JOBS[job_id]["cre_code"]["answer"] = code
-        COMPARE_JOBS[job_id]["cre_code"]["done"] = True
-        COMPARE_JOBS[job_id]["cre_code"]["stage"] = "done"
+        pane = COMPARE_JOBS.get(job_id, {}).get(bid)
+        if pane is not None:
+            pane["answer"] = answer
+            pane["done"] = True
+            pane["stage"] = "done"
     _check_compare_judge(job_id, question)
 
 
 def _check_compare_judge(job_id: str, question: str):
     with COMPARE_JOBS_LOCK:
-        if not (COMPARE_JOBS[job_id]["direct"]["done"] and COMPARE_JOBS[job_id]["cre_code"]["done"]):
+        job = COMPARE_JOBS.get(job_id)
+        if not job:
             return
-        direct = COMPARE_JOBS[job_id]["direct"]["answer"]
-        spec   = COMPARE_JOBS[job_id]["spec"]["answer"]
-        cre    = COMPARE_JOBS[job_id]["cre_code"]["answer"]
+        ids = job.get("order") or []
+        if not all(job.get(b, {}).get("done") for b in ids):
+            return
+        if job.get("judge", {}).get("started"):
+            return                      # last finisher wins; only judge once
+        job["judge"]["started"] = True
+        answers = [(b, job[b]["answer"]) for b in ids]
 
+    if len(answers) < 2:
+        with COMPARE_JOBS_LOCK:
+            COMPARE_JOBS[job_id]["judge"]["done"] = True
+            COMPARE_JOBS[job_id]["judge"]["answer"] = (
+                "_Only one model was selected, so there is nothing to compare._")
+            COMPARE_JOBS[job_id]["done"] = True
+        return
+
+    blocks = "\n\n".join(
+        f"=== {bid} ===\n{ans[:2500]}" for bid, ans in answers)
     payload = {
         "messages": [
             {"role": "system", "content": COMPARE_JUDGE_SYSTEM},
             {"role": "user", "content": (
                 f"Request: {question}\n\n"
-                f"=== TRACK A (Direct Code) ===\n{direct[:2500]}\n\n"
-                f"=== TRACK B – Design Brief (excerpt) ===\n{spec[:600]}\n\n"
-                f"=== TRACK B – Code from Brief ===\n{cre[:2500]}"
+                "Several models answered the same request. Compare them and say "
+                "which is strongest and why, naming them exactly as labelled.\n\n"
+                + blocks
             )},
         ],
         "stream": True,
-        "max_tokens": 500,
+        "max_tokens": 700,
     }
     parts = []
     try:
@@ -7051,6 +7030,14 @@ def compare_page_route():
     return Response(COMPARE_PAGE, mimetype="text/html")
 
 
+@app.route("/compare/backends")
+def compare_backends_route():
+    return jsonify({"backends": compare_backends()})
+
+
+COMPARE_MAX_BACKENDS = 6
+
+
 @app.route("/compare/ask", methods=["POST"])
 def compare_ask():
     body = request.json or {}
@@ -7058,20 +7045,40 @@ def compare_ask():
     if not question:
         return jsonify({"error": "empty question"}), 400
 
+    wanted = body.get("backends") or []
+    if not isinstance(wanted, list):
+        return jsonify({"error": "backends must be a list"}), 400
+    # Resolve names to URLs SERVER-SIDE. The browser never sends a URL, so a
+    # crafted request can't turn this into an SSRF gadget.
+    with CONFIG_LOCK:
+        by_id = {b["id"]: b for b in ROUTER_CONFIG.get("backends", [])}
+    chosen, seen = [], set()
+    for bid in wanted:
+        b = by_id.get(bid)
+        if b and bid not in seen:
+            seen.add(bid)
+            chosen.append((bid, _chat_url(b)))
+    if not chosen:
+        return jsonify({"error": "pick at least one backend"}), 400
+    if len(chosen) > COMPARE_MAX_BACKENDS:
+        return jsonify({"error": f"at most {COMPARE_MAX_BACKENDS} at once"}), 400
+
     job_id = uuid.uuid4().hex
     with COMPARE_JOBS_LOCK:
-        COMPARE_JOBS[job_id] = {
-            "owner":    _owner(),
-            "direct":   {"tokens": 0, "done": False, "answer": "", "stage": "drafting"},
-            "spec":     {"tokens": 0, "done": False, "answer": "", "stage": "drafting"},
-            "cre_code": {"tokens": 0, "done": False, "answer": "", "stage": "waiting"},
-            "judge":    {"tokens": 0, "done": False, "answer": ""},
-            "done": False,
-        }
+        job = {"owner": _owner(), "order": [b for b, _ in chosen],
+               "judge": {"tokens": 0, "done": False, "answer": "",
+                         "started": False},
+               "done": False}
+        for bid, _u in chosen:
+            job[bid] = {"tokens": 0, "done": False, "answer": "",
+                        "stage": "drafting"}
+        COMPARE_JOBS[job_id] = job
+        _prune_jobs(COMPARE_JOBS)
 
-    spawn_owned(target=run_compare_direct, args=(job_id, question), daemon=True).start()
-    spawn_owned(target=run_compare_pipeline, args=(job_id, question), daemon=True).start()
-    return jsonify({"job_id": job_id})
+    for bid, u in chosen:
+        spawn_owned(target=run_compare_backend, args=(job_id, bid, u, question),
+                    daemon=True).start()
+    return jsonify({"job_id": job_id, "backends": [b for b, _ in chosen]})
 
 
 @app.route("/compare/progress/<job_id>")
@@ -10288,6 +10295,19 @@ COMPARE_PAGE = r"""<!DOCTYPE html>
   .split { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
   @media (max-width: 800px) { .split { grid-template-columns: 1fr; } }
 
+  /* ---- backend picker ---- */
+  .pickrow { max-width:1400px; margin:10px auto 0; display:flex; flex-wrap:wrap;
+             gap:8px; align-items:center; }
+  .pickhint { color:var(--muted); font-size:12px; }
+  .pick { display:inline-flex; align-items:center; gap:7px; cursor:pointer;
+          border:1px solid var(--border); border-radius:999px;
+          padding:5px 12px; font-size:12.5px; background:var(--panel);
+          user-select:none; }
+  .pick input { margin:0; cursor:pointer; }
+  .pick.on { border-color:var(--accent); }
+  .pick .mdl { color:var(--muted); font-size:11px; }
+  .pick .cost { color:var(--accent); font-size:11px; font-weight:600; }
+
   /* ---- track card ---- */
   .track { background: var(--panel); border: 1px solid var(--border);
            border-radius: 14px; display: flex; flex-direction: column;
@@ -10391,15 +10411,17 @@ COMPARE_PAGE = r"""<!DOCTYPE html>
 </header>
 <div class="ask-bar">
   <div class="ask-inner">
-    <textarea id="q" rows="1" placeholder="What should we build? (Enter to run, Shift+Enter for newline)"></textarea>
-    <button id="go">Run A/B ›</button>
+    <textarea id="q" rows="1" placeholder="Ask anything — every selected model gets the same prompt (Enter to run, Shift+Enter for newline)"></textarea>
+    <button id="go">Compare ›</button>
   </div>
+  <div class="pickrow" id="pickRow"><span class="pickhint">loading backends…</span></div>
 </div>
 <div class="page" id="page">
   <div class="idle">
     <div class="icon">⚗️</div>
-    Describe something to build — both tracks run simultaneously,<br>
-    Track B writes a design brief first, then codes from it. Judge picks the winner.
+    Pick two or more backends above and ask a question.<br>
+    They all get the <b>same prompt and the same system prompt</b>, so what you
+    are comparing is the models themselves. A judge reads the answers afterwards.
   </div>
 </div>
 <script>
@@ -10413,7 +10435,7 @@ marked.use({ renderer: {
     const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 }});
 
-let answers = { A: '', B: '' };
+let answers = {};
 
 function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 function md(s){ return `<div class="md">${marked.parse(s)}</div>`; }
@@ -10552,113 +10574,60 @@ function setStage(id, html) {
   const el = document.getElementById(id); if (el) el.innerHTML = html;
 }
 
-function buildUI() {
-  page.innerHTML = `
-<div class="split" id="split">
+function buildUI(ids) {
+  page.innerHTML =
+    '<div class="split" id="split">' + ids.map(id => `
   <div class="track">
     <div class="track-head">
-      <span class="track-label a">A — Direct Code</span>
-      <span class="stage-info" id="stageA"><div class="spinner"></div>&nbsp;starting…</span>
+      <span class="track-label a">${esc(id)}</span>
+      <span class="stage-info" id="stage-${esc(id)}"><div class="spinner"></div>&nbsp;starting…</span>
     </div>
-    <div class="track-body" id="bodyA">
-      <div class="pending"><div class="spinner"></div> waiting for code specialist…</div>
+    <div class="track-body" id="body-${esc(id)}">
+      <div class="pending"><div class="spinner"></div> waiting…</div>
     </div>
-    <div class="track-foot" id="footA" style="display:none">
-      <button class="btn" onclick="doDownload('A')">⬇ Download</button>
-      <button class="btn hi" onclick="doPreview('A')">▶ Preview</button>
-      <button class="btn" onclick="doScratch('A')">↗ Scratchpad</button>
+    <div class="track-foot" id="foot-${esc(id)}" style="display:none">
+      <button class="btn" onclick="doDownload('${esc(id)}')">⬇ Download</button>
+      <button class="btn hi" onclick="doPreview('${esc(id)}')">▶ Preview</button>
+      <button class="btn" onclick="doScratch('${esc(id)}')">↗ Scratchpad</button>
     </div>
-  </div>
-  <div class="track">
-    <div class="track-head">
-      <span class="track-label b">B — Creative → Code</span>
-      <span class="stage-info" id="stageB"><div class="spinner"></div>&nbsp;writing brief…</span>
-    </div>
-    <div id="briefSection" style="display:none">
-      <button class="brief-toggle" onclick="toggleBrief()">
-        <span>Design Brief</span><span id="briefArrow">▾</span>
-      </button>
-      <div id="briefBody" class="brief-body" style="display:none"></div>
-    </div>
-    <div class="track-body" id="bodyB">
-      <div class="pending"><div class="spinner"></div> creative director writing brief…</div>
-    </div>
-    <div class="track-foot" id="footB" style="display:none">
-      <button class="btn" onclick="doDownload('B')">⬇ Download</button>
-      <button class="btn hi" onclick="doPreview('B')">▶ Preview</button>
-      <button class="btn" onclick="doScratch('B')">↗ Scratchpad</button>
-    </div>
-  </div>
-</div>
-<div class="preview-wrap" id="previewWrap" style="display:none">
-  <div class="preview-head">
-    <span class="preview-title" id="previewTitle">Preview</span>
-    <button class="preview-close" onclick="closePreview()">✕ close</button>
-  </div>
-  <iframe id="previewFrame" sandbox="allow-scripts"></iframe>
-</div>
+  </div>`).join('') + '</div>' + `
 <div class="judge-wrap" id="judgeWrap" style="display:none">
-  <div class="judge-head">
-    <span class="judge-title">⚖️ Judge's Verdict</span>
-    <span class="judge-tok" id="judgeTok"></span>
-  </div>
-  <div class="judge-body" id="judgeBody">
-    <div class="pending"><div class="spinner"></div> waiting for both tracks to finish…</div>
-  </div>
+  <div class="judge-head"><span class="judge-title">⚖ Judge</span>
+    <span class="stage-info" id="judgeTok"></span></div>
+  <div class="judge-body" id="judgeBody"></div>
 </div>`;
+  // Side-by-side to three; wrap beyond that so panes stay readable.
+  const split = document.getElementById('split');
+  if (split) split.style.gridTemplateColumns =
+    'repeat(' + Math.min(ids.length, 3) + ', minmax(0, 1fr))';
 }
 
-function poll(jobId) {
+function poll(jobId, ids) {
   const timer = setInterval(async () => {
     let p;
     try { p = await (await fetch('/compare/progress/' + jobId)).json(); }
     catch (e) { return; }
 
-    const { direct: d, spec: s, cre_code: cc, judge: j } = p;
-
-    // Track A
-    if (d.done && answers.A !== d.answer) {
-      answers.A = d.answer;
-      document.getElementById('bodyA').innerHTML = md(d.answer);
-      document.getElementById('footA').style.display = 'flex';
-      setStage('stageA', '<span class="done-tick">✓ done</span>');
-    } else if (!d.done) {
-      setStage('stageA', `<div class="spinner"></div>&nbsp;drafting… ${d.tokens} tok`);
-    }
-
-    // Track B spec
-    if (s.answer && document.getElementById('briefBody') &&
-        document.getElementById('briefBody').innerHTML === '') {
-      document.getElementById('briefSection').style.display = 'block';
-      document.getElementById('briefBody').innerHTML = md(s.answer);
-    }
-
-    // Track B code
-    if (cc.done && answers.B !== cc.answer) {
-      answers.B = cc.answer;
-      document.getElementById('bodyB').innerHTML = md(cc.answer);
-      document.getElementById('footB').style.display = 'flex';
-      setStage('stageB', '<span class="done-tick">✓ done</span>');
-    } else if (!cc.done) {
-      if (cc.stage === 'drafting') {
-        setStage('stageB', `<div class="spinner"></div>&nbsp;coding from brief… ${cc.tokens} tok`);
-      } else if (s.done) {
-        setStage('stageB', `<div class="spinner"></div>&nbsp;brief done, queuing code…`);
-      } else {
-        setStage('stageB', `<div class="spinner"></div>&nbsp;writing brief… ${s.tokens} tok`);
+    for (const id of ids) {
+      const pane = p[id]; if (!pane) continue;
+      if (pane.done && answers[id] !== pane.answer) {
+        answers[id] = pane.answer;
+        document.getElementById('body-' + id).innerHTML = md(pane.answer);
+        document.getElementById('foot-' + id).style.display = 'flex';
+        setStage('stage-' + id, '<span class="done-tick">✓ done</span>');
+      } else if (!pane.done) {
+        setStage('stage-' + id,
+          `<div class="spinner"></div>&nbsp;drafting… ${pane.tokens} tok`);
       }
     }
 
-    // Judge
+    const j = p.judge || {};
     if (j.tokens > 0 || j.done) {
       document.getElementById('judgeWrap').style.display = 'block';
       document.getElementById('judgeTok').textContent = j.tokens + ' tok' + (j.done ? '' : '…');
-      if (j.done && j.answer) {
-        document.getElementById('judgeBody').innerHTML = md(j.answer);
-      } else {
-        document.getElementById('judgeBody').innerHTML =
-          `<div class="pending"><div class="spinner"></div> deliberating… ${j.tokens} tokens</div>`;
-      }
+      document.getElementById('judgeBody').innerHTML = (j.done && j.answer)
+        ? md(j.answer)
+        : `<div class="pending"><div class="spinner"></div> deliberating… ${j.tokens} tokens</div>`;
     }
 
     if (p.done) { clearInterval(timer); go.disabled = false; q.focus(); }
@@ -10667,21 +10636,60 @@ function poll(jobId) {
 
 async function run() {
   const question = q.value.trim(); if (!question) return;
+  const ids = [...document.querySelectorAll('.pick input:checked')]
+                .map(i => i.dataset.id);
+  if (ids.length < 2) {
+    page.innerHTML = '<div class="idle">Pick at least two backends to compare.</div>';
+    return;
+  }
   go.disabled = true;
-  answers = { A: '', B: '' };
-  buildUI();
+  answers = {};
+  buildUI(ids);
   let res;
   try {
     res = await (await fetch('/compare/ask', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, backends: ids }),
     })).json();
   } catch (e) {
     page.innerHTML = `<div class="idle">⚠️ Router unreachable: ${esc(String(e))}</div>`;
     go.disabled = false; return;
   }
-  poll(res.job_id);
+  if (res.error) {
+    page.innerHTML = `<div class="idle">⚠️ ${esc(res.error)}</div>`;
+    go.disabled = false; return;
+  }
+  poll(res.job_id, res.backends || ids);
 }
+
+// ---- backend picker -------------------------------------------------------
+// Names only — /compare is open to any logged-in user, while backend URLs and
+// keys are admin-only, so the server never sends them here.
+async function loadBackends() {
+  const row = document.getElementById('pickRow');
+  let list = [];
+  try { list = (await (await fetch('/compare/backends')).json()).backends || []; }
+  catch (e) { row.innerHTML = '<span class="pickhint">could not load backends</span>'; return; }
+  if (!list.length) {
+    row.innerHTML = '<span class="pickhint">no backends configured — add some in Settings</span>';
+    return;
+  }
+  const saved = (localStorage.getItem('creweComparePick') || '').split(',').filter(Boolean);
+  row.innerHTML = '<span class="pickhint">compare:</span>' + list.map(b => `
+    <label class="pick${saved.includes(b.id) ? ' on' : ''}">
+      <input type="checkbox" data-id="${esc(b.id)}"${saved.includes(b.id) ? ' checked' : ''}>
+      <span>${esc(b.id)}</span>
+      ${b.model ? `<span class="mdl">${esc(b.model)}</span>` : ''}
+      ${b.paid ? '<span class="cost">💵</span>' : ''}
+    </label>`).join('');
+  row.querySelectorAll('.pick input').forEach(inp =>
+    inp.addEventListener('change', () => {
+      inp.closest('.pick').classList.toggle('on', inp.checked);
+      localStorage.setItem('creweComparePick',
+        [...row.querySelectorAll('.pick input:checked')].map(i => i.dataset.id).join(','));
+    }));
+}
+loadBackends();
 
 q.addEventListener('input', () => { q.style.height='auto'; q.style.height=Math.min(q.scrollHeight,120)+'px'; });
 go.addEventListener('click', run);
