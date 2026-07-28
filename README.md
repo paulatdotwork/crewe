@@ -89,6 +89,11 @@ Word and Excel files (plain text and source files need nothing extra).
   minting an invite link from `/admin`.
 - Data is **per-user**: each account gets its own `crewe_userdata/<id>/` for
   documents, sheets, recipes, uploads and conversation memory.
+- **Forgotten passwords** are reset from the server, not by email — Crewe sends
+  no mail, so there is no reset link and never can be one that works offline.
+  Run `python3 reset_password.py you@example.com` on the machine hosting Crewe.
+  Whoever can edit files on that box can reset any password on it; that is the
+  security model, so guard the box.
 - It serves via `waitress` when installed, falling back to Flask's dev server.
   Set `CREWE_BIND=127.0.0.1` to listen on loopback only (e.g. behind a tunnel);
   the default `0.0.0.0` is meant for a trusted LAN.
