@@ -1,8 +1,13 @@
 # --- Crewe .gitignore (rename to .gitignore in the release repo) -------------
 #
-# Rule of thumb: Crewe stores EVERYTHING in the directory it runs from, so the
-# default for a new store is "committed". Add new state here the day you add
-# the store, not the day you notice it in `git status`.
+# Crewe writes its state to your HOME directory (~/crewe_users.json,
+# ~/crewe_userdata/, ~/router_config.json ...), NOT to the checkout. So if you
+# cloned into a subdirectory, none of this can be committed by accident.
+#
+# These entries matter when the repo IS your home directory, which is exactly
+# how this project was developed — and they cost nothing otherwise. Add new
+# state here the day you add the store, not the day you notice it in
+# `git status`.
 
 # --- credentials & secrets — NEVER commit -----------------------------------
 crewe_users.json          # e-mail addresses + password hashes

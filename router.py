@@ -4729,6 +4729,35 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
                      daemon=True).start()
 
 
+def _specialist_error(route, url, exc):
+    """A failure the USER can act on, instead of a requests traceback.
+
+    On a fresh install nobody has a model server running yet, so this is the
+    very first thing most people ever see Crewe say. "HTTPConnectionPool(...)
+    Max retries exceeded with url: /v1/chat/completions" tells them nothing;
+    "nothing is listening, here is where to fix it" tells them everything."""
+    host = ""
+    try:
+        p = urlparse(url)
+        host = f"{p.hostname}:{p.port}" if p.port else (p.hostname or "")
+    except Exception:
+        pass
+    kind = exc.__class__.__name__
+    unreachable = isinstance(exc, (requests.ConnectionError, requests.Timeout))
+    if unreachable:
+        return (f"\n\n**No model backend is reachable for the `{route}` route.**\n\n"
+                f"Crewe tried `{host or url}` and nothing answered.\n\n"
+                "- If your model server isn't running yet, start it.\n"
+                "- If it lives somewhere else, open **⚙ Settings** and point "
+                f"the `{route}` route at the right backend — *Scan localhost* "
+                "will find servers already running on this machine.\n\n"
+                f"*({kind})*")
+    return (f"\n\n**The `{route}` backend returned an error.**\n\n"
+            f"`{host or url}` — {kind}: {exc}\n\n"
+            "If you've just changed models, check the server is finished "
+            "loading; llama.cpp answers `/health` with 503 until it is.")
+
+
 def run_job(job_id: str, route: str, question: str, session_id: str,
             effort: str = DEFAULT_EFFORT):
     """Stream from the specialist, counting tokens as they arrive, store final answer."""
@@ -4871,7 +4900,7 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
                     except Exception:
                         pass
     except Exception as e:
-        answer_parts.append(f"\n\n[router error talking to '{route}' specialist: {e}]")
+        answer_parts.append(_specialist_error(route, url, e))
 
     final_answer = _scrub_tokens("".join(answer_parts))
     if _job_cancelled(job_id):

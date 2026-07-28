@@ -103,9 +103,10 @@ Word and Excel files (plain text and source files need nothing extra).
 - The classifier is a small model — routing quality degrades past ~9–10
   routes. The settings page warns you, and the routing test tells you the
   truth per route.
-- Server-side state: `crewe_userdata/<user-id>/` (documents, sheets, cookbook,
-  photos, uploads, conversation memory), plus `crewe_users.json`,
-  `crewe_secret` and `router_config.json` at the top level. **All personal or
+- Server-side state lives in your **home directory**, not the checkout:
+  `~/crewe_userdata/<user-id>/` (documents, sheets, cookbook, photos, uploads,
+  conversation memory), plus `~/crewe_users.json`, `~/crewe_secret` and
+  `~/router_config.json`. Back up `~/crewe_userdata/` to move a user's data. **All personal or
   secret — all gitignored.** `router_config.json` can hold API keys and
   `crewe_secret` signs sessions; never commit either.
 - Cookbook photos come from public web image search: fine for personal use.
