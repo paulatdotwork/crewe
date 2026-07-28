@@ -7104,6 +7104,24 @@ PAGE = r"""<!DOCTYPE html>
                transform:translateX(105%); transition:transform .25s ease;
                z-index:60; box-shadow:-8px 0 30px rgba(0,0,0,.25); }
     .sidebar.open { transform:none; }
+
+    /* The composer grew an attach button and an effort select, which squeezed
+       the textarea and pushed Send off the right edge. Give the textarea its
+       own row and let the controls sit underneath it. */
+    .bar { flex-wrap:wrap; gap:8px; }
+    .bar textarea { flex:1 1 100%; min-height:44px; }
+    #attach { order:2; padding:0 12px; }
+    #effort { order:3; flex:1 1 auto; min-width:0; }
+    #go     { order:4; padding:0 18px; }
+    .effort-help { text-align:center; }
+
+    /* Eight header links wrapped into a three-row block with the last one
+       clipped. Tighten them and drop the decorative arrows. */
+    .hdr-links { flex-wrap:wrap; gap:2px 12px; font-size:12.5px;
+                 max-width:100%; }
+    .hdr-links a { white-space:nowrap; }
+    .hdr-links .arr { display:none; }
+    .spend-tag { font-size:11px; padding:2px 7px; }
   }
 </style>
 <script>if(localStorage.getItem('creweTheme')==='dark')document.documentElement.dataset.theme='dark';</script>
@@ -7114,12 +7132,12 @@ PAGE = r"""<!DOCTYPE html>
     <h1>Crewe</h1>
     <span id="healthStrip" class="hstrip" title="route backend health"></span>
     <nav class="hdr-links">
-      <a href="/docs" target="_blank">docs ↗</a>
-      <a href="/sheets" target="_blank">sheets ↗</a>
-      <a href="/scratch" target="_blank">scratchpad ↗</a>
-      <a href="/shots" target="_blank">build checks ↗</a>
-      <a href="/panel" target="_blank">panel ↗</a>
-      <a href="/compare" target="_blank">compare ↗</a>
+      <a href="/docs" target="_blank">docs<span class="arr"> ↗</span></a>
+      <a href="/sheets" target="_blank">sheets<span class="arr"> ↗</span></a>
+      <a href="/scratch" target="_blank">scratchpad<span class="arr"> ↗</span></a>
+      <a href="/shots" target="_blank">build checks<span class="arr"> ↗</span></a>
+      <a href="/panel" target="_blank">panel<span class="arr"> ↗</span></a>
+      <a href="/compare" target="_blank">compare<span class="arr"> ↗</span></a>
       <a href="/admin" class="admin-only" style="display:none">👥 people</a>
       <a href="/settings" class="admin-only" style="display:none">⚙ settings</a>
       <span id="spendTag" class="spend-tag" style="display:none"></span>
