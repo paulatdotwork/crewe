@@ -1619,13 +1619,44 @@ def _merge_output_file(name, content, files, allowed, warnings, tag, mem=None):
 # with full context instead of blind regeneration. Lives inside SESSIONS and is
 # persisted to router_memory.json with the summaries.
 
-CODE_EXTS = {"html", "htm", "css", "js", "mjs", "ts", "tsx", "jsx", "py",
-             "json", "sql", "c", "h", "cpp", "rs", "sh"}
+# Extensions Crewe will treat as project source. This gates BOTH which files a
+# step may write and — via _plausible_filename — whether a name written above a
+# fence is recognised as a filename at all. A language missing here doesn't
+# degrade: the label is rejected, the block gets a generated name like
+# "index.xml", and the build ends with "produced no files". That is exactly how
+# a correct C# reply was thrown away, so keep this list generous.
+CODE_EXTS = {
+    # web
+    "html", "htm", "css", "scss", "less", "js", "mjs", "cjs", "ts", "tsx",
+    "jsx", "vue", "svelte", "astro",
+    # general purpose
+    "py", "rb", "php", "go", "rs", "java", "kt", "kts", "scala", "swift",
+    "cs", "fs", "vb", "c", "h", "cpp", "cc", "hpp", "m", "mm", "dart", "lua",
+    "pl", "r", "jl", "ex", "exs", "erl", "hs", "clj", "cljs", "zig", "nim",
+    # data / config / project files a build legitimately writes
+    "json", "sql", "sh", "bash", "ps1", "bat",
+    "csproj", "fsproj", "vbproj", "sln", "gradle", "sbt", "cmake",
+    "toml", "yaml", "yml", "xml", "ini", "cfg", "properties", "gemspec",
+}
 _CMD_LANGS = {"bash", "shell", "sh", "zsh", "console", "terminal", "cmd"}
-_EXT_BY_LANG = {"html": "html", "htm": "html", "css": "css", "javascript": "js",
-                "js": "js", "typescript": "ts", "ts": "ts", "python": "py",
-                "py": "py", "json": "json", "bash": "sh", "shell": "sh",
-                "sql": "sql", "c": "c", "cpp": "cpp", "rust": "rs"}
+# Fence tag -> extension, used to name a block the model didn't label. An
+# unmapped tag becomes the filename extension verbatim, which is how a
+# ```csharp block became "file2.csharp".
+_EXT_BY_LANG = {"html": "html", "htm": "html", "css": "css", "scss": "scss",
+                "javascript": "js", "js": "js", "jsx": "jsx",
+                "typescript": "ts", "ts": "ts", "tsx": "tsx",
+                "python": "py", "py": "py", "json": "json",
+                "bash": "sh", "shell": "sh", "sh": "sh", "powershell": "ps1",
+                "sql": "sql", "c": "c", "cpp": "cpp", "c++": "cpp",
+                "objectivec": "m", "rust": "rs", "rs": "rs",
+                "csharp": "cs", "c#": "cs", "cs": "cs", "fsharp": "fs",
+                "java": "java", "kotlin": "kt", "kt": "kt", "scala": "scala",
+                "go": "go", "golang": "go", "ruby": "rb", "rb": "rb",
+                "php": "php", "swift": "swift", "dart": "dart", "lua": "lua",
+                "perl": "pl", "r": "r", "julia": "jl", "elixir": "ex",
+                "erlang": "erl", "haskell": "hs", "clojure": "clj",
+                "xml": "xml", "yaml": "yml", "yml": "yml", "toml": "toml",
+                "ini": "ini", "vue": "vue", "svelte": "svelte"}
 _LANG_BY_EXT = {"html": "html", "htm": "html", "css": "css", "js": "javascript",
                 "mjs": "javascript", "ts": "typescript", "py": "python",
                 "json": "json", "sh": "bash", "sql": "sql", "c": "c",
