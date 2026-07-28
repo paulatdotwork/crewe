@@ -572,7 +572,33 @@ truth.</p>
 </div>
 
 <div class="card">
-<h2>6. Attaching documents</h2>
+<h2>6. Comparing models &mdash; panel and compare</h2>
+<p>Two pages put answers side by side, and they compare <i>different things</i>:</p>
+<ul>
+<li><b>&#9878; Panel</b> compares <b>routes</b> &mdash; model <i>plus</i> persona. This is
+what your users actually experience, so it answers "which of my setups handles
+this best?" Tick the routes you want; the choice is remembered per browser.</li>
+<li><b>&#9879; Compare</b> compares <b>backends</b> &mdash; the raw models, all given the
+same system prompt. Use it for "is this model better than that one?", with no
+persona differences muddying the result. It is also the only way to test a
+backend that no route points at.</li>
+</ul>
+<p class="note"><b>Every route in a panel needs a working backend.</b> A panel runs
+its routes simultaneously and only judges once they have <i>all</i> finished, so
+one dead or very slow backend holds up the whole thing. If a panel seems to hang,
+check the route health dots in the header first &mdash; and remember a model on
+CPU can legitimately take a minute or two for a long answer.</p>
+<p class="note"><b>A model can only appear in a panel if a route points at it.</b>
+Routes are what a panel picks from, so a backend wired only to a system role
+(a coder, the classifier) will never show up there. Compare it on the
+<b>&#9879; Compare</b> page instead, or point a route at it.</p>
+<p>Both pages finish with a judge, which runs on your <b>reasoning</b> route.
+Give that route a capable model &mdash; it reads every answer and has to justify
+a verdict.</p>
+</div>
+
+<div class="card">
+<h2>7. Attaching documents</h2>
 <p>The &#128206; button attaches a file to the conversation: PDF, Word, Excel,
 Markdown, CSV, plain text or source code. Crewe extracts the text &mdash; the
 model never sees the original file.</p>
@@ -5497,7 +5523,30 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
 # ---- panel ------------------------------------------------------------------
 PANEL_JOBS: dict = {}
 PANEL_JOBS_LOCK = threading.Lock()
+# Default panel line-up. A user may now pick any subset of their CONFIGURED
+# routes instead; this is only the fallback when none is chosen.
 PANEL_ROUTES = ["recipes", "creative", "code", "general", "reasoning"]
+PANEL_MAX_ROUTES = 8
+
+
+def panel_routes():
+    """Routes a panel may use, with the backend each one would reach.
+
+    Routes, not backends — a panel compares configured setups (model + persona),
+    which is the thing a user actually experiences. /compare picks raw backends
+    when you want the models themselves. Names only: no URLs, no keys, because
+    /panel is open to any logged-in user while /settings is admin-only."""
+    with CONFIG_LOCK:
+        routes = ROUTER_CONFIG.get("routes", {})
+        by_id = {b["id"]: b for b in ROUTER_CONFIG.get("backends", [])}
+        out = []
+        for name in sorted(routes):
+            b = by_id.get(routes[name].get("backend")) or {}
+            out.append({"route": name, "backend": b.get("id", ""),
+                        "model": b.get("model", ""),
+                        "paid": bool(b.get("paid")),
+                        "default": name in PANEL_ROUTES})
+    return out
 
 JUDGE_SYSTEM = (
     "You are a neutral judge evaluating multiple AI responses to the same question. "
@@ -5562,6 +5611,13 @@ def run_panel_specialist(job_id: str, route: str, question: str):
 def run_panel_judge(job_id: str, question: str):
     with PANEL_JOBS_LOCK:
         specialists = {k: dict(v) for k, v in PANEL_JOBS[job_id]["specialists"].items()}
+    if len(specialists) < 2:
+        with PANEL_JOBS_LOCK:
+            PANEL_JOBS[job_id]["judge"]["answer"] = (
+                "_Only one route was selected, so there is nothing to compare._")
+            PANEL_JOBS[job_id]["judge"]["done"] = True
+            PANEL_JOBS[job_id]["done"] = True
+        return
 
     responses_text = "\n\n".join(
         f"=== {route.upper()} ===\n{data['answer'][:1500]}"
@@ -6825,22 +6881,45 @@ def panel_ask():
     if not question:
         return jsonify({"error": "empty question"}), 400
 
+    wanted = body.get("routes")
+    if wanted is None:
+        chosen = [r for r in PANEL_ROUTES if r in SPECIALISTS]
+    else:
+        if not isinstance(wanted, list):
+            return jsonify({"error": "routes must be a list"}), 400
+        seen, chosen = set(), []
+        for r in wanted:                    # resolved against live routes only
+            if r in SPECIALISTS and r not in seen:
+                seen.add(r)
+                chosen.append(r)
+    if not chosen:
+        return jsonify({"error": "pick at least one route"}), 400
+    if len(chosen) > PANEL_MAX_ROUTES:
+        return jsonify({"error": f"at most {PANEL_MAX_ROUTES} at once"}), 400
+
     job_id = uuid.uuid4().hex
     with PANEL_JOBS_LOCK:
         PANEL_JOBS[job_id] = {
             "owner": _owner(),
-            "specialists": {r: {"tokens": 0, "done": False, "answer": ""} for r in PANEL_ROUTES},
+            "specialists": {r: {"tokens": 0, "done": False, "answer": ""} for r in chosen},
             "judge": {"tokens": 0, "done": False, "answer": ""},
-            "remaining": len(PANEL_ROUTES),
+            "remaining": len(chosen),
             "done": False,
+            "order": chosen,
         }
+        _prune_jobs(PANEL_JOBS)
 
-    for route in PANEL_ROUTES:
+    for route in chosen:
         spawn_owned(
             target=run_panel_specialist, args=(job_id, route, question), daemon=True
         ).start()
 
-    return jsonify({"job_id": job_id})
+    return jsonify({"job_id": job_id, "routes": chosen})
+
+
+@app.route("/panel/routes")
+def panel_routes_route():
+    return jsonify({"routes": panel_routes()})
 
 
 @app.route("/panel/progress/<job_id>")
@@ -10098,6 +10177,16 @@ PANEL_PAGE = r"""<!DOCTYPE html>
 
   .idle { text-align: center; padding: 70px 20px; color: var(--muted); font-size: 14px; }
   .idle .icon { font-size: 36px; margin-bottom: 14px; }
+  .pickrow { max-width:1200px; margin:10px auto 0; display:flex; flex-wrap:wrap;
+             gap:8px; align-items:center; }
+  .pickhint { color:var(--muted); font-size:12px; }
+  .pick { display:inline-flex; align-items:center; gap:7px; cursor:pointer;
+          border:1px solid var(--border); border-radius:999px; padding:5px 12px;
+          font-size:12.5px; background:var(--panel); user-select:none; }
+  .pick input { margin:0; cursor:pointer; }
+  .pick.on { border-color:var(--accent); }
+  .pick .mdl { color:var(--muted); font-size:11px; }
+  .pick .cost { color:var(--accent); font-size:11px; font-weight:600; }
 </style>
 </head>
 <body>
@@ -10114,6 +10203,7 @@ PANEL_PAGE = r"""<!DOCTYPE html>
     <textarea id="q" rows="1" placeholder="Ask the panel anything… (Enter to send, Shift+Enter for newline)"></textarea>
     <button id="go">Ask all ›</button>
   </div>
+  <div class="pickrow" id="pickRow"><span class="pickhint">loading routes…</span></div>
 </div>
 <div class="grid-wrap">
   <div id="content">
@@ -10238,6 +10328,42 @@ q.addEventListener('input', () => { q.style.height = 'auto'; q.style.height = Ma
 go.addEventListener('click', ask);
 q.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } });
 q.focus();
+
+// ---- route picker ----------------------------------------------------------
+// A panel compares configured ROUTES (model + persona) — that is what a user
+// actually experiences. /compare picks raw backends when you want to judge the
+// models themselves. Names only; URLs and keys stay admin-only.
+function panelPick(){
+  return [...document.querySelectorAll('#pickRow .pick input:checked')]
+           .map(i => i.dataset.route);
+}
+async function loadPanelRoutes(){
+  const row = document.getElementById('pickRow'); if(!row) return;
+  let list = [];
+  try { list = (await (await fetch('/panel/routes')).json()).routes || []; }
+  catch(e){ row.innerHTML = '<span class="pickhint">could not load routes</span>'; return; }
+  if(!list.length){
+    row.innerHTML = '<span class="pickhint">no routes configured — add some in Settings</span>';
+    return;
+  }
+  const savedRaw = localStorage.getItem('crewePanelPick');
+  const saved = savedRaw === null ? null : savedRaw.split(',').filter(Boolean);
+  row.innerHTML = '<span class="pickhint">panel:</span>' + list.map(r => {
+    const on = saved === null ? r.default : saved.includes(r.route);
+    return `<label class="pick${on ? ' on' : ''}">
+      <input type="checkbox" data-route="${r.route}"${on ? ' checked' : ''}>
+      <span>${r.route}</span>
+      ${r.backend ? `<span class="mdl">${r.backend}</span>` : ''}
+      ${r.paid ? '<span class="cost">&#128181;</span>' : ''}
+    </label>`;
+  }).join('');
+  row.querySelectorAll('.pick input').forEach(inp =>
+    inp.addEventListener('change', () => {
+      inp.closest('.pick').classList.toggle('on', inp.checked);
+      localStorage.setItem('crewePanelPick', panelPick().join(','));
+    }));
+}
+loadPanelRoutes();
 </script>
 </body>
 </html>"""
