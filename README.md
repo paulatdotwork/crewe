@@ -4,9 +4,7 @@
 
 > Named for Crewe, the Cheshire town that exists because railway lines met there.
 
-<!-- add a screenshot at docs/screenshot.png and uncomment:
-![Crewe](docs/screenshot.png)
--->
+![Crewe routing a question to the reasoning specialist](docs/screenshot.png)
 
 ## Features
 
