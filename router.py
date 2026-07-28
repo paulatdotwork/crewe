@@ -6857,6 +6857,15 @@ def panel_progress(job_id):
 COMPARE_JOBS: dict = {}
 COMPARE_JOBS_LOCK = threading.Lock()
 
+COMPARE_JUDGE_SYSTEM = (
+    "You are judging two code implementations of the same request. "
+    "Track A was coded directly by a code specialist. "
+    "Track B was first designed by a creative director (brief shown), then coded by an engineer. "
+    "Pick the better result on: visual quality, completeness, correctness, and wow factor. "
+    "In 3-5 sentences: name the winner clearly, explain the key difference, and note one weakness of each."
+)
+
+
 # (The old direct-vs-creative-brief A/B prompts lived here. /compare is now a
 # backend shoot-out; recover them from git history if that experiment returns.)
 
