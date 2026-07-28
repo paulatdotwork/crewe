@@ -1,0 +1,57 @@
+# --- Crewe .gitignore (rename to .gitignore in the release repo) -------------
+#
+# Rule of thumb: Crewe stores EVERYTHING in the directory it runs from, so the
+# default for a new store is "committed". Add new state here the day you add
+# the store, not the day you notice it in `git status`.
+
+# --- credentials & secrets — NEVER commit -----------------------------------
+crewe_users.json          # e-mail addresses + password hashes
+crewe_secret              # session signing key; leaking it lets anyone forge a login
+crewe_invites.json        # live single-use invite tokens
+crewe_agent_hosts.json    # SSH targets: hostnames, usernames, key paths
+router_config.json        # backend URLs AND API keys
+.env
+
+# --- per-user data — all of it personal -------------------------------------
+crewe_userdata/           # docs, sheets, cookbook, uploads, chat memory, agent runs
+
+# --- legacy single-user stores (pre-multi-tenancy; may still exist) ----------
+router_memory.json
+router_cookbook.json
+router_prefs.md           # operator-set build standards, often personal
+router_docs/
+router_sheets/
+router_books/
+router_photos/
+router_checks/
+router_audio/
+
+# --- runtime noise ----------------------------------------------------------
+llama_logs/
+llama_pids/
+router_runs/
+*.log
+
+# --- backups & scratch ------------------------------------------------------
+*.bak
+*.bak-*
+*.bak.*
+router.py.bak*
+*.damaged-*
+*.part
+*.tmp*
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- node (the pipeline's static-check helper) ------------------------------
+node_modules/
+package-lock.json
+
+# --- models & caches --------------------------------------------------------
+*.gguf
+.cache/
