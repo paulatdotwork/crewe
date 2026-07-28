@@ -544,6 +544,17 @@ other: base URL, plus an <b>API key</b>, plus the model name. Anything
 OpenAI-compatible works &mdash; OpenAI, OpenRouter, DeepSeek, Groq, Together.
 OpenRouter is the easiest single key if you want to reach many providers'
 models at once.</p>
+<p><b>Pick the right type when you add it.</b> llama.cpp and Ollama speak the
+same wire format as OpenAI, so they differ only in small details (Ollama needs
+a model name; llama.cpp doesn't). <b>Claude is genuinely different</b> &mdash;
+a different endpoint, different auth headers, and a different request and
+response shape &mdash; so select <b>Claude (Anthropic)</b> and Crewe translates
+for you. Use <code>https://api.anthropic.com</code> as the base URL, and name a
+model such as <code>claude-opus-5</code>. One quirk worth knowing: Claude
+ignores <code>temperature</code>, so steer it with the route's persona instead.</p>
+<p>In every case the base URL has <b>no <code>/v1</code></b> &mdash; Crewe
+appends the right path for the type you picked. A doubled <code>/v1/v1/</code>
+is the most common reason a new backend 404s.</p>
 <p>Tick <b>this backend costs money</b> and enter the per-million-token prices
 from your provider's pricing page. Then Crewe can tell you what you are
 spending, and the Effort dropdown will mark which option bills you.</p>
@@ -1388,7 +1399,7 @@ def _vision_critique(shot, goal, features, job_id=None):
         r = requests.post(url, json=_inject_model(payload, url),
                           headers=_hdrs(url), timeout=300)
         clean = _strip_think(
-            r.json()["choices"][0]["message"]["content"] or "").strip()
+            _resp_json(r)["choices"][0]["message"]["content"] or "").strip()
     except Exception as e:
         print(f"[code] vision critic error: {e}")
         return []
@@ -2220,8 +2231,34 @@ _CUSTOM_COLOR_POOL = ["#7a4ba0", "#8c2a5e", "#4a6b1f", "#1f6f8c",
                       "#96431c", "#5e5a1f", "#265e8c", "#8c264d"]
 
 
+# Backend kinds. "openai" is the generic OpenAI-compatible shape and the
+# default, so a config written before kinds existed behaves identically.
+# llama.cpp and Ollama both speak that shape — they differ only in how you ask
+# them their context size and whether a model name is required. Anthropic is
+# the genuinely different one: a different path, different auth headers, and a
+# different request AND response body.
+BACKEND_KINDS = ("openai", "llamacpp", "ollama", "anthropic")
+
+ANTHROPIC_VERSION = "2023-06-01"
+# Anthropic requires max_tokens on every request; OpenAI treats it as optional
+# and Crewe often omits it (or uses 0 to mean "uncapped"). Neither is legal
+# there, so an omitted cap becomes this.
+ANTHROPIC_DEFAULT_MAX_TOKENS = int(os.environ.get("CREWE_ANTHROPIC_MAX_TOKENS", "8192"))
+
+
+def _kind(backend_or_url):
+    if isinstance(backend_or_url, dict):
+        k = backend_or_url.get("kind") or "openai"
+    else:
+        k = (BACKEND_INFO.get(backend_or_url, {}) or {}).get("kind") or "openai"
+    return k if k in BACKEND_KINDS else "openai"
+
+
 def _chat_url(backend):
-    return backend["url"].rstrip("/") + "/v1/chat/completions"
+    base = backend["url"].rstrip("/")
+    if _kind(backend) == "anthropic":
+        return base + "/v1/messages"
+    return base + "/v1/chat/completions"
 
 
 def _default_router_config():
@@ -2342,6 +2379,7 @@ def _apply_router_config(cfg):
         for b in cfg["backends"]:
             binfo[_chat_url(b)] = {"key": b.get("key", ""),
                                    "model": b.get("model", ""),
+                                   "kind": b.get("kind") or "openai",
                                    "paid": bool(b.get("paid")),
                                    "price_in": b.get("price_in", 0),
                                    "price_out": b.get("price_out", 0)}
@@ -2382,8 +2420,17 @@ def _apply_router_config(cfg):
 
 
 def _hdrs(url):
-    """Auth headers for a chat URL, from its backend's stored API key."""
+    """Auth headers for a chat URL, from its backend's stored API key.
+
+    Anthropic does not use bearer auth — it wants x-api-key plus a version
+    header, and sending Authorization instead is a 401 with a confusing
+    message."""
     k = BACKEND_INFO.get(url, {}).get("key", "")
+    if _kind(url) == "anthropic":
+        h = {"anthropic-version": ANTHROPIC_VERSION}
+        if k:
+            h["x-api-key"] = k
+        return h
     return {"Authorization": f"Bearer {k}"} if k else {}
 
 
@@ -2424,7 +2471,8 @@ def _with_usage(payload, url):
     Only sent to paid backends: llama.cpp ignores unknown fields, but there is
     no reason to change the request shape for a local server we bill nothing
     for."""
-    if _is_paid(url) and payload.get("stream"):
+    # Anthropic reports usage unconditionally and rejects stream_options.
+    if _is_paid(url) and payload.get("stream") and _kind(url) != "anthropic":
         payload.setdefault("stream_options", {"include_usage": True})
     return payload
 
@@ -2492,13 +2540,63 @@ def spend_summary(uid=None):
     return out
 
 
+# Fields Crewe sends that Anthropic rejects outright. temperature/top_p/top_k
+# were REMOVED on the current Claude models (Opus 5, Opus 4.7/4.8, Sonnet 5,
+# Fable 5) — sending one is a 400, not a warning. Crewe sets temperature on
+# almost every call, so stripping these is what makes the route work at all.
+# Anthropic's guidance is to steer with prompting instead.
+_ANTHROPIC_DROP = ("temperature", "top_p", "top_k", "chat_template_kwargs",
+                   "stream_options", "presence_penalty", "frequency_penalty",
+                   "n", "stop", "logit_bias", "seed", "response_format")
+
+
+def _to_anthropic(payload):
+    """Translate an OpenAI-shaped chat payload into Anthropic's Messages shape.
+
+    Three things actually differ, and all three break the request if missed:
+      * system prompts are a TOP-LEVEL string, not a message with role=system
+      * max_tokens is REQUIRED (OpenAI treats it as optional; Crewe uses 0 to
+        mean uncapped, which is not a legal value here)
+      * sampling parameters are rejected — see _ANTHROPIC_DROP
+    """
+    out = {k: v for k, v in payload.items() if k not in _ANTHROPIC_DROP}
+
+    systems, msgs = [], []
+    for m in payload.get("messages") or []:
+        role = m.get("role")
+        content = m.get("content", "")
+        if role == "system":
+            if content:
+                systems.append(content if isinstance(content, str) else str(content))
+        else:
+            # Anthropic accepts only user/assistant here; anything else would
+            # 400, so an unknown role is treated as the user speaking.
+            msgs.append({"role": "assistant" if role == "assistant" else "user",
+                         "content": content})
+    # A conversation must start with a user turn.
+    while msgs and msgs[0]["role"] != "user":
+        msgs.pop(0)
+    if not msgs:
+        msgs = [{"role": "user", "content": " "}]
+    out["messages"] = msgs
+    if systems:
+        out["system"] = "\n\n".join(systems)
+
+    cap = payload.get("max_tokens")
+    out["max_tokens"] = int(cap) if cap else ANTHROPIC_DEFAULT_MAX_TOKENS
+    return out
+
+
 def _inject_model(payload, url, route=None):
-    """Add the model name a backend/route needs (Ollama, hosted APIs);
-    llama.cpp ignores it. Route override wins over backend default."""
+    """Add the model name a backend/route needs, then shape the body for the
+    backend's kind. Every backend POST in Crewe passes through here, which is
+    why the Anthropic translation hangs off it rather than off each caller."""
     m = (ROUTE_MODELS.get(route) if route else None) \
         or BACKEND_INFO.get(url, {}).get("model", "")
     if m and "model" not in payload:
         payload["model"] = m
+    if _kind(url) == "anthropic":
+        payload = _to_anthropic(payload)
     return payload
 
 
@@ -2507,10 +2605,35 @@ ROUTER_CONFIG = _load_router_config()
 _apply_router_config(ROUTER_CONFIG)
 
 
-def _backend_ctx(url, timeout=4):
-    """The coder's REAL context window, straight from the server."""
+def _backend_ctx(url, timeout=6):
+    """The backend's REAL context window, straight from the server.
+
+    Every kind answers this differently: llama.cpp has /props, Ollama has
+    /api/show, and Anthropic publishes max_input_tokens on /v1/models. Asking
+    the wrong one just returns None, which leaves the default budgets in
+    place — wrong numbers would be worse than no numbers."""
+    base = url.rsplit("/v1/", 1)[0]
+    kind = _kind(url)
     try:
-        base = url.rsplit("/v1/", 1)[0]
+        if kind == "anthropic":
+            model = (BACKEND_INFO.get(url, {}) or {}).get("model", "")
+            r = requests.get(f"{base}/v1/models", headers=_hdrs(url), timeout=timeout)
+            for m in (r.json().get("data") or []):
+                if not model or m.get("id") == model:
+                    n = m.get("max_input_tokens")
+                    if n:
+                        return int(n)
+            return None
+        if kind == "ollama":
+            model = (BACKEND_INFO.get(url, {}) or {}).get("model", "")
+            if model:
+                r = requests.post(f"{base}/api/show", json={"model": model},
+                                  timeout=timeout)
+                info = r.json().get("model_info") or {}
+                for k, v in info.items():
+                    if k.endswith(".context_length") and v:
+                        return int(v)
+            return None
         d = requests.get(f"{base}/props", timeout=timeout).json()
         n = (d.get("default_generation_settings") or {}).get("n_ctx") or d.get("n_ctx")
         return int(n) if n else None
@@ -2565,7 +2688,7 @@ def _classify_with(system, valid, question, timeout=60):
         r = requests.post(CLASSIFIER, json=_inject_model(payload, CLASSIFIER),
                           headers=_hdrs(CLASSIFIER), timeout=timeout)
         r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"] or ""
+        content = _resp_json(r)["choices"][0]["message"]["content"] or ""
         content = _strip_think(content)
         for word in reversed(re.findall(r"[a-z]+", content.lower())):
             if word in valid:
@@ -2604,7 +2727,7 @@ def classify(question: str, prev_q: str = "", prev_a: str = "", last_route: str 
         r = requests.post(CLASSIFIER, json=_inject_model(payload, CLASSIFIER),
                           headers=_hdrs(CLASSIFIER), timeout=120)
         r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"] or ""
+        content = _resp_json(r)["choices"][0]["message"]["content"] or ""
         # Reasoning models may leak think-text into content; the route is
         # whatever valid word appears last.
         content = _strip_think(content)
@@ -2641,7 +2764,7 @@ def summarize(session_id: str, question: str, answer: str):
         r = requests.post(SUMMARIZER, json=_inject_model(payload, SUMMARIZER),
                           headers=_hdrs(SUMMARIZER), timeout=60)
         r.raise_for_status()
-        new_summary = r.json()["choices"][0]["message"]["content"].strip()
+        new_summary = _resp_json(r)["choices"][0]["message"]["content"].strip()
         with SESSIONS_LOCK:
             # update in place — the session dict also carries project files
             sess = sessions().setdefault(session_id, {})
@@ -3235,6 +3358,124 @@ def _min_period(t):
     return n - f[n]
 
 
+# ---------------------------------------------------------------------------
+# Anthropic -> OpenAI stream adapter.
+#
+# Crewe has eight streaming loops, all of which parse OpenAI's shape
+# (`choices[0].delta.content`). Rather than rewrite every one of them, the
+# translation happens at the wire: Anthropic's events are converted into
+# OpenAI-shaped `data:` lines, so everything downstream — token counting,
+# cancellation, usage capture, the repetition detector — works unchanged.
+#
+# Anthropic's stream is a sequence of typed events rather than uniform chunks:
+#   message_start        carries input_tokens
+#   content_block_delta  text_delta (visible) or thinking_delta (reasoning)
+#   message_delta        carries stop_reason and output_tokens
+#   message_stop         end of stream
+# Only message_delta knows the output count, and only message_start knows the
+# input count, so usage has to be accumulated across the stream — which is why
+# this is a stateful generator rather than a per-line function.
+
+
+def _anthropic_to_openai_lines(raw_lines):
+    """Yield OpenAI-shaped `data: {...}` byte lines from an Anthropic stream."""
+    usage = {"prompt_tokens": 0, "completion_tokens": 0}
+
+    def pack(delta=None, finish=None, use=None):
+        chunk = {"choices": [{"delta": delta or {}, "finish_reason": finish,
+                              "index": 0}]}
+        if use:
+            chunk["usage"] = dict(use)
+        return b"data: " + json.dumps(chunk).encode()
+
+    for ln in raw_lines:
+        if not ln:
+            continue
+        s = ln.decode("utf-8", errors="replace") if isinstance(ln, bytes) else ln
+        if not s.startswith("data: "):
+            continue                      # `event:` lines carry no payload
+        body = s[6:].strip()
+        if body == "[DONE]":
+            yield b"data: [DONE]"
+            return
+        try:
+            ev = json.loads(body)
+        except Exception:
+            continue
+        t = ev.get("type")
+
+        if t == "message_start":
+            u = ((ev.get("message") or {}).get("usage") or {})
+            usage["prompt_tokens"] = int(u.get("input_tokens") or 0)
+        elif t == "content_block_delta":
+            d = ev.get("delta") or {}
+            dt = d.get("type")
+            if dt == "text_delta":
+                yield pack({"content": d.get("text", "")})
+            elif dt == "thinking_delta":
+                # keep the live token counter moving during thinking, exactly
+                # as it does for llama.cpp's reasoning_content
+                yield pack({"reasoning_content": d.get("thinking", "")})
+        elif t == "message_delta":
+            u = ev.get("usage") or {}
+            if u.get("output_tokens"):
+                usage["completion_tokens"] = int(u["output_tokens"])
+            if u.get("input_tokens"):
+                usage["prompt_tokens"] = int(u["input_tokens"])
+            stop = (ev.get("delta") or {}).get("stop_reason")
+            # A safety decline is a normal 200 with stop_reason "refusal" — it
+            # must not look like an empty successful answer.
+            if stop == "refusal":
+                yield pack({"content": "\n\n*(the model declined this request)*"})
+            yield pack(finish=stop, use=usage)
+        elif t == "error":
+            msg = (ev.get("error") or {}).get("message", "stream error")
+            yield pack({"content": f"\n\n[backend error: {msg}]"})
+        elif t == "message_stop":
+            yield b"data: [DONE]"
+            return
+
+
+def _resp_json(r):
+    """Normalise a non-streaming reply to the OpenAI shape.
+
+    Anthropic returns {"content": [{"type": "text", "text": ...}], "usage": ...}
+    where OpenAI returns {"choices": [{"message": {"content": ...}}]}. Callers
+    read the OpenAI shape, so translate here rather than at each call site."""
+    d = r.json()
+    try:
+        if _kind(r.request.url) != "anthropic":
+            return d
+    except Exception:
+        return d
+    parts = [b.get("text", "") for b in (d.get("content") or [])
+             if b.get("type") == "text"]
+    text = "".join(parts)
+    if d.get("stop_reason") == "refusal":
+        text = text or "*(the model declined this request)*"
+    u = d.get("usage") or {}
+    return {"choices": [{"message": {"role": "assistant", "content": text},
+                         "finish_reason": d.get("stop_reason"), "index": 0}],
+            "usage": {"prompt_tokens": u.get("input_tokens", 0),
+                      "completion_tokens": u.get("output_tokens", 0)},
+            "model": d.get("model", "")}
+
+
+def _maybe_translate(r, raw_lines):
+    """Wrap a response's line iterator in the adapter when the backend needs it."""
+    try:
+        if _kind(r.request.url) == "anthropic":
+            return _anthropic_to_openai_lines(raw_lines)
+    except Exception:
+        pass
+    return raw_lines
+
+
+def _lines(r):
+    """Line iterator for non-cancellable streams, kind-aware."""
+    return _maybe_translate(r, r.iter_lines())
+
+
 def _cancellable_lines(r, job_id):
     """Iterate a streaming response while honoring job cancellation within
     ~1 s even when the server sends NOTHING (long prompt processing). A
@@ -3248,7 +3489,7 @@ def _cancellable_lines(r, job_id):
 
     def _reader():
         try:
-            for ln in r.iter_lines():
+            for ln in _maybe_translate(r, r.iter_lines()):
                 q.put(ln)
             q.put(DONE)
         except Exception as e:
@@ -5254,7 +5495,7 @@ def run_panel_specialist(job_id: str, route: str, question: str):
         with requests.post(url, json=payload, headers=_hdrs(url),
                            stream=True, timeout=600) as r:
             r.raise_for_status()
-            for line in r.iter_lines():
+            for line in _lines(r):
                 if not line:
                     continue
                 line = line.decode("utf-8")
@@ -5309,7 +5550,7 @@ def run_panel_judge(job_id: str, question: str):
         with requests.post(_rurl, json=_inject_model(payload, _rurl, "reasoning"),
                            headers=_hdrs(_rurl), stream=True, timeout=300) as r:
             r.raise_for_status()
-            for line in r.iter_lines():
+            for line in _lines(r):
                 if not line:
                     continue
                 line = line.decode("utf-8")
@@ -5341,6 +5582,14 @@ _health_lock = threading.Lock()
 
 def _backend_alive(url):
     base = url.rsplit("/v1/", 1)[0]
+    if _kind(url) == "anthropic":
+        # Anthropic has no /health; /v1/models needs the key, and a 401 still
+        # proves the endpoint is up — only a connection failure means dead.
+        try:
+            return requests.get(base + "/v1/models", headers=_hdrs(url),
+                                timeout=4).status_code in (200, 401, 403)
+        except Exception:
+            return False
     for probe in ("/health", "/v1/models"):   # llama.cpp /health; /v1/models fallback
         try:
             if requests.get(base + probe, headers=_hdrs(url),
@@ -5393,6 +5642,10 @@ def settings_save():
             b["key"] = old.get("key", "") if old else ""
         # Cost settings. Prices are advisory only — they never gate a request,
         # they only feed the spend estimate, so bad input is coerced not rejected.
+        b["kind"] = b.get("kind") if b.get("kind") in BACKEND_KINDS else "openai"
+        if b["kind"] == "anthropic" and not b.get("model"):
+            errs.append(f"backend '{b.get('id')}': Anthropic needs a model name "
+                        "(e.g. claude-opus-5) — it has no default")
         b["paid"] = bool(b.get("paid"))
         for k in ("price_in", "price_out"):
             try:
@@ -5444,9 +5697,18 @@ def settings_backend_check():
             b = next((x for x in ROUTER_CONFIG["backends"]
                       if x["url"].rstrip("/") == url), None)
         key = b.get("key", "") if b else ""
-    hdr = {"Authorization": f"Bearer {key}"} if key else {}
+    kind = body.get("kind") if body.get("kind") in BACKEND_KINDS else "openai"
+    if kind == "anthropic":
+        hdr = {"anthropic-version": ANTHROPIC_VERSION}
+        if key:
+            hdr["x-api-key"] = key
+    else:
+        hdr = {"Authorization": f"Bearer {key}"} if key else {}
     try:
-        r = requests.get(url + "/v1/models", headers=hdr, timeout=6)
+        r = requests.get(url + "/v1/models", headers=hdr, timeout=8)
+        if r.status_code in (401, 403) and kind == "anthropic":
+            return jsonify({"alive": False,
+                            "error": "reachable, but the API key was rejected"})
         r.raise_for_status()
         models = [m.get("id", "?") for m in r.json().get("data", [])][:20]
         return jsonify({"alive": True, "models": models})
@@ -5495,7 +5757,7 @@ def settings_draft_route():
         u = SPECIALISTS.get("general", CLASSIFIER)
         r = requests.post(u, json=_inject_model(payload, u, "general"),
                           headers=_hdrs(u), timeout=90)
-        content = r.json()["choices"][0]["message"]["content"] or ""
+        content = _resp_json(r)["choices"][0]["message"]["content"] or ""
         content = _strip_think(content)
         m = re.search(r"\{[\s\S]*\}", content)
         d = json.loads(m.group(0)) if m else {}
@@ -6043,7 +6305,7 @@ def _classify_card(card):
         u = SPECIALISTS.get("general", CLASSIFIER)
         r = requests.post(u, json=_inject_model(payload, u, "general"),
                           headers=_hdrs(u), timeout=60)
-        content = r.json()["choices"][0]["message"]["content"] or ""
+        content = _resp_json(r)["choices"][0]["message"]["content"] or ""
         content = _strip_think(content)
         m = re.search(r"\{[\s\S]*?\}", content)
         d = json.loads(m.group(0)) if m else {}
@@ -6615,7 +6877,7 @@ def _stream_into(url: str, payload: dict, job_id: str, field: str) -> str:
         with requests.post(url, json=payload, headers=_hdrs(url),
                            stream=True, timeout=600) as r:
             r.raise_for_status()
-            for line in r.iter_lines():
+            for line in _lines(r):
                 if not line:
                     continue
                 line = line.decode("utf-8")
@@ -6727,7 +6989,7 @@ def _check_compare_judge(job_id: str, question: str):
         with requests.post(_rurl, json=_inject_model(payload, _rurl, "reasoning"),
                            headers=_hdrs(_rurl), stream=True, timeout=300) as r:
             r.raise_for_status()
-            for line in r.iter_lines():
+            for line in _lines(r):
                 if not line:
                     continue
                 line = line.decode("utf-8")
@@ -9324,6 +9586,11 @@ function render(){
     const c=document.createElement('div'); c.className='card';
     c.innerHTML=`<div class="row">
       <span class="dot" id="bdot-${i}"></span>
+      <div><label class="f">type</label>
+        <select data-k="kind">${['openai','llamacpp','ollama','anthropic'].map(k=>
+          `<option value="${k}"${(b.kind||'openai')===k?' selected':''}>${
+            {openai:'OpenAI-compatible',llamacpp:'llama.cpp',ollama:'Ollama',anthropic:'Claude (Anthropic)'}[k]
+          }</option>`).join('')}</select></div>
       <div><label class="f">name</label><input type="text" size="13" value="${esc(b.id)}" data-k="id"></div>
       <div class="grow"><label class="f">base URL</label><input type="text" style="width:100%" value="${esc(b.url)}" data-k="url"></div>
       <div><label class="f">API key</label><input type="password" size="12" value="${esc(b.key||'')}" placeholder="${b.has_key?'(saved)':'none'}" data-k="key"></div>
@@ -9341,7 +9608,21 @@ function render(){
         <span class="paidonly f" style="${b.paid?'':'display:none'};opacity:.7">
           from your provider's pricing page — used only to estimate spend</span>
       </div>
+      <div class="kindhint f" style="opacity:.75;margin-top:6px"></div>
       <div class="status" id="bst-${i}"></div>`;
+    const KIND_HINT={
+      openai:"Any OpenAI-compatible server or hosted API. Base URL WITHOUT /v1 — Crewe appends it. Most hosted APIs need an API key and a model name.",
+      llamacpp:"llama.cpp server. Base URL WITHOUT /v1 (e.g. http://127.0.0.1:8080). No key or model name needed — it serves one model. Crewe reads its context size from /props.",
+      ollama:"Ollama. Base URL WITHOUT /v1 (e.g. http://127.0.0.1:11434). No key, but the model name is REQUIRED (e.g. qwen3:8b) — Ollama serves many.",
+      anthropic:"Claude, direct. Base URL https://api.anthropic.com — Crewe uses /v1/messages, sends x-api-key, and translates the request and response for you. Model name is REQUIRED (e.g. claude-opus-5). Note: Claude ignores temperature — steer it with the route persona instead."};
+    const hintEl=c.querySelector('.kindhint');
+    const paintHint=()=>{hintEl.textContent=KIND_HINT[b.kind||'openai'];};
+    paintHint();
+    c.querySelector('[data-k="kind"]').addEventListener('change',e=>{
+      b.kind=e.target.value; paintHint();
+      if(b.kind==='anthropic'&&!b.url) { b.url='https://api.anthropic.com';
+        const u=c.querySelector('[data-k="url"]'); if(u) u.value=b.url; }
+    });
     c.querySelectorAll('input').forEach(inp=>inp.addEventListener('input',()=>{
       const k=inp.dataset.k;
       if(k==='paid'){
@@ -9427,7 +9708,8 @@ async function checkBackend(i,quiet){
   try{
     const r=await(await fetch('/settings/backend_check',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({url:b.url,key:b.has_key?'__KEEP__':(b.key||'')})})).json();
+      body:JSON.stringify({url:b.url,kind:b.kind||'openai',
+        key:b.has_key?'__KEEP__':(b.key||'')})})).json();
     if(r.alive){dot.className='dot ok';
       st.className='status ok';
       st.textContent='online — serving: '+(r.models.join(', ')||'(no model list)');}

@@ -10,7 +10,7 @@
 
 **Routing**
 - A lightweight classifier picks the specialist per question; short continuations ("no", "keep going") stick with the previous route
-- **Settings UI** (`/settings`): register backends (llama.cpp, Ollama, vLLM, LM Studio, or hosted OpenAI-compatible APIs with keys), point any route at any backend, add custom routes — with an AI helper that drafts the routing rule and a **live routing test** that runs your example questions through the real classifier before you commit. Changes apply live, no restart.
+- **Settings UI** (`/settings`): register backends by type — **llama.cpp**, **Ollama**, **Claude (Anthropic)**, or any OpenAI-compatible server or hosted API — and point any route at any backend, add custom routes — with an AI helper that drafts the routing rule and a **live routing test** that runs your example questions through the real classifier before you commit. Changes apply live, no restart.
 - Route health dots in the header — see a dead backend at a glance
 - **Effort levels for coding**: register a fast model and a capable one, then
   pick per question. Budgets are sized automatically from each backend's real
