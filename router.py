@@ -449,6 +449,146 @@ def _esc(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;")
             .replace(">", "&gt;").replace('"', "&quot;"))
 
+HELP_BODY = """
+<div class="card">
+<h2>How Crewe works</h2>
+<p>Crewe does not have one model. It has <b>routes</b> &mdash; recipes, code,
+search, and so on &mdash; and each route points at a <b>backend</b>, which is
+any OpenAI-compatible server: llama.cpp, Ollama, LM Studio, vLLM, or a hosted
+API. A small, fast <b>classifier</b> reads every question and picks the route.</p>
+<p>So there are two separate questions to answer when you set Crewe up:
+<i>what servers do I have?</i> (backends) and <i>what should each kind of
+question go to?</i> (routes). You do both on the
+<a href="/settings">&#9881; Settings</a> page, and changes apply live &mdash;
+no restart.</p>
+</div>
+
+<div class="card">
+<h2>1. Adding your model</h2>
+<p>Open <a href="/settings">Settings</a> and either:</p>
+<ul>
+<li><b>Scan localhost</b> &mdash; finds servers already running on this machine
+(it checks the usual ports, including Ollama's 11434), or</li>
+<li><b>Add backend</b> and type the base URL yourself, e.g.
+<code>http://192.168.1.50:8080</code> or <code>http://localhost:11434</code>.</li>
+</ul>
+<p>Give it a name you will recognise, then press <b>Check</b>. Crewe asks the
+server what models it has; if that works, you are connected.</p>
+<p class="note"><b>The "default model" field.</b> llama.cpp serves one model and
+ignores this. Ollama and hosted APIs serve many and need to be told which
+&mdash; put the exact name there, e.g. <code>qwen3:8b</code>. If Check lists
+models but answers fail, this is almost always why.</p>
+</div>
+
+<div class="card">
+<h2>2. Pointing routes at backends</h2>
+<p>Under <b>Routes</b>, each route has a backend dropdown. Pick one per route.
+Several routes can share a backend &mdash; that is normal, they just queue.</p>
+<p>Below that, <b>system roles</b> are the jobs that are not routes:</p>
+<ul>
+<li><b>classifier</b> &mdash; picks the route for every question. Wants small and
+fast; it runs on every single request.</li>
+<li><b>summarizer</b> &mdash; condenses older conversation turns in the
+background. Small and fast is fine.</li>
+<li><b>easy coder</b> / <b>hard coder</b> &mdash; the two coders the Effort
+switch chooses between.</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>3. Effort: two coders</h2>
+<p>Coding questions are the expensive ones, so they get a switch. The
+<b>Effort</b> dropdown next to the message box picks between your
+<b>easy coder</b> and your <b>hard coder</b>. It is ignored for every other
+kind of question.</p>
+<p>Effort changes more than the model. Crewe asks each coder how big its
+context window is and sizes the prompt budgets to match, so a small model is
+never handed a prompt it cannot hold &mdash; the classic way a capable little
+model is made to look stupid.</p>
+<p class="note">Whichever level you pick, planning, writing and checking all
+happen on <b>one</b> model. Mixing two models inside a single build produces
+worse results than either one alone.</p>
+</div>
+
+<div class="card">
+<h2>4. Custom routes</h2>
+<p><b>Add route</b> creates your own. Three fields matter, and they do
+completely different jobs:</p>
+<ul>
+<li><b>subject</b> &mdash; the <i>only</i> thing the classifier ever sees about
+your route. It decides whether a question comes here. Describe the territory
+plainly: <i>"D&amp;D 5e character builds, combat encounters, monster statistics,
+and rules clarifications"</i>.</li>
+<li><b>persona</b> &mdash; the system prompt used to <i>answer</i>, once the
+question has arrived. It has no effect on routing.</li>
+<li><b>backend</b> &mdash; which server answers.</li>
+</ul>
+<p>A brilliant persona with a vague subject means the route never fires. A sharp
+subject with no persona means it fires and then answers like a generic
+assistant.</p>
+<p>Two buttons help: <b>&#10024; draft</b> writes a subject and persona from a
+one-line description, and <b>&#129514; test</b> runs your <i>real</i>
+classifier over example questions with the candidate route in place, so you can
+see what it actually decides before you commit.</p>
+<p class="note"><b>Test a counter-example, not just the obvious hits.</b> The
+classifier is a small model and its accuracy degrades past roughly nine or ten
+routes. The useful test for a D&amp;D route is not "build me a rogue" &mdash;
+it is "beef stew for my character's tavern", which should still go to
+recipes.</p>
+</div>
+
+<div class="card">
+<h2>5. Paid models, and choosing when to spend</h2>
+<p>A backend can be a hosted API instead of your own hardware. Add it like any
+other: base URL, plus an <b>API key</b>, plus the model name. Anything
+OpenAI-compatible works &mdash; OpenAI, OpenRouter, DeepSeek, Groq, Together.
+OpenRouter is the easiest single key if you want to reach many providers'
+models at once.</p>
+<p>Tick <b>this backend costs money</b> and enter the per-million-token prices
+from your provider's pricing page. Then Crewe can tell you what you are
+spending, and the Effort dropdown will mark which option bills you.</p>
+<p>Neither level means "paid" &mdash; both coders can be local, both can be
+hosted, or one of each, whichever way round suits you. A common arrangement is
+a small local model on easy and a large one on hard, with nothing billed at
+all. But if one of them <i>is</i> a paid API, Effort becomes a per-question
+decision about whether this particular answer is worth money, and Crewe marks
+the option that bills you with a &#128181;.</p>
+<p class="note"><b>Spend figures are estimates.</b> They use the prices you
+typed and the token counts your provider reported &mdash; or a rough
+four-characters-per-token guess if it reported none. Useful as a running
+indication. Never treat them as a bill; your provider's dashboard is the
+truth.</p>
+</div>
+
+<div class="card">
+<h2>6. Attaching documents</h2>
+<p>The &#128206; button attaches a file to the conversation: PDF, Word, Excel,
+Markdown, CSV, plain text or source code. Crewe extracts the text &mdash; the
+model never sees the original file.</p>
+<p>An attachment belongs to the <i>conversation</i>, not to one question, so you
+can keep asking about the same document. Ask for a summary and the
+<b>summarize</b> route handles it; ask a specific question and it goes wherever
+it belongs.</p>
+<p>Documents too large for the model's context window are summarised in passes
+rather than cut off, so the end of a long report still counts.</p>
+</div>
+
+<div class="card">
+<h2>Where your data lives</h2>
+<p>Everything is on your own machine, in your home directory:
+<code>~/crewe_userdata/&lt;your-id&gt;/</code> holds documents, sheets, recipes,
+uploads and conversation memory. Back up that folder and you have backed up
+everything of yours. Your API keys live in <code>~/router_config.json</code>
+&mdash; never commit that file anywhere.</p>
+</div>
+"""
+
+
+@app.route("/help")
+def help_page():
+    return Response(_shell("Help", HELP_BODY), mimetype="text/html")
+
+
 @app.route("/account", methods=["GET"])
 def account():
     u = current_user()
@@ -702,6 +842,7 @@ def books_dir(uid=None):    return _ustore("books", uid)
 def photos_dir(uid=None):   return _ustore("photos", uid)
 def audio_dir(uid=None):    return _ustore("audio", uid)
 def uploads_dir(uid=None):  return _ustore("uploads", uid)
+def spend_file(uid=None):   return _ufile("spend.jsonl", uid)
 def checks_dir(uid=None):   return _ustore("checks", uid)
 def cookbook_file(uid=None): return _ufile("cookbook.json", uid)
 def memory_file(uid=None):   return _ufile("memory.json", uid)
@@ -2200,7 +2341,10 @@ def _apply_router_config(cfg):
         spec, binfo, rmodels = {}, {}, {}
         for b in cfg["backends"]:
             binfo[_chat_url(b)] = {"key": b.get("key", ""),
-                                   "model": b.get("model", "")}
+                                   "model": b.get("model", ""),
+                                   "paid": bool(b.get("paid")),
+                                   "price_in": b.get("price_in", 0),
+                                   "price_out": b.get("price_out", 0)}
         for name, r in cfg["routes"].items():
             b = b_by_id.get(r.get("backend"))
             if not b:
@@ -2241,6 +2385,111 @@ def _hdrs(url):
     """Auth headers for a chat URL, from its backend's stored API key."""
     k = BACKEND_INFO.get(url, {}).get("key", "")
     return {"Authorization": f"Bearer {k}"} if k else {}
+
+
+# ---------------------------------------------------------------------------
+# Cost tracking for paid backends.
+#
+# Crewe has always been able to talk to hosted APIs — a backend has a key and a
+# model name. What it could not do is tell you that a question was about to
+# spend money, or how much it had spent. That is the whole point of this
+# module: make "is this request free?" a visible property rather than something
+# you have to remember about your own config.
+#
+# Prices are per MILLION tokens, in whatever currency you type, because every
+# provider quotes them that way. Crewe does not know or fetch prices — you set
+# them per backend, and they are only ever used for an ESTIMATE.
+SPEND_LOCK = threading.Lock()
+
+
+def _bmeta(url):
+    return BACKEND_INFO.get(url, {}) or {}
+
+
+def _is_paid(url):
+    return bool(_bmeta(url).get("paid"))
+
+
+def _prices(url):
+    b = _bmeta(url)
+    try:
+        return float(b.get("price_in") or 0), float(b.get("price_out") or 0)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+
+
+def _with_usage(payload, url):
+    """Ask a paid backend to report token usage on the final stream chunk.
+
+    Only sent to paid backends: llama.cpp ignores unknown fields, but there is
+    no reason to change the request shape for a local server we bill nothing
+    for."""
+    if _is_paid(url) and payload.get("stream"):
+        payload.setdefault("stream_options", {"include_usage": True})
+    return payload
+
+
+def _rough_tokens(text):
+    """~4 chars per token. Only used when a provider reports no usage."""
+    return max(1, len(text or "") // 4)
+
+
+def record_spend(url, route, usage, prompt_text="", answer_text=""):
+    """Append one spend record. Returns the estimated cost (0.0 if free).
+
+    Never raises: a billing-log failure must not lose the user's answer."""
+    try:
+        if not _is_paid(url):
+            return 0.0
+        p_in, p_out = _prices(url)
+        estimated = not usage
+        if usage:
+            tin = int(usage.get("prompt_tokens") or 0)
+            tout = int(usage.get("completion_tokens") or 0)
+        else:
+            tin, tout = _rough_tokens(prompt_text), _rough_tokens(answer_text)
+        cost = (tin * p_in + tout * p_out) / 1_000_000.0
+        rec = {"ts": time.time(), "route": route, "url": url,
+               "model": _bmeta(url).get("model", ""), "in": tin, "out": tout,
+               "cost": round(cost, 6), "estimated": estimated}
+        with SPEND_LOCK:
+            with open(spend_file(), "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        return cost
+    except Exception as e:
+        print(f"[spend] could not record: {e}")
+        return 0.0
+
+
+def spend_summary(uid=None):
+    """Totals for the current user. Cheap enough to call per page load."""
+    now = time.time()
+    day, month = now - 86400, now - 30 * 86400
+    out = {"day": 0.0, "month": 0.0, "all": 0.0, "requests": 0,
+           "estimated_any": False, "recent": []}
+    try:
+        with open(spend_file(uid), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                c = float(r.get("cost") or 0)
+                out["all"] += c
+                out["requests"] += 1
+                if r.get("estimated"):
+                    out["estimated_any"] = True
+                if r["ts"] >= month:
+                    out["month"] += c
+                if r["ts"] >= day:
+                    out["day"] += c
+                out["recent"].append(r)
+    except OSError:
+        return out
+    out["recent"] = out["recent"][-20:][::-1]
+    for k in ("day", "month", "all"):
+        out[k] = round(out[k], 4)
+    return out
 
 
 def _inject_model(payload, url, route=None):
@@ -3065,7 +3314,8 @@ def _stream_chat(url, messages, job_id, temperature=None, max_tokens=None,
     finish_reason = None
     parts = []
     think_n = content_n = 0
-    payload = _inject_model(payload, url)
+    payload = _with_usage(_inject_model(payload, url), url)
+    _usage = None
     with requests.post(url, json=payload, headers=_hdrs(url),
                        stream=True, timeout=timeout) as r:
         r.raise_for_status()
@@ -3080,6 +3330,11 @@ def _stream_chat(url, messages, job_id, temperature=None, max_tokens=None,
                 break
             try:
                 chunk = json.loads(data)
+                # usage arrives on a final chunk whose choices list is EMPTY
+                if chunk.get("usage"):
+                    _usage = chunk["usage"]
+                if not chunk.get("choices"):
+                    continue
                 finish_reason = (chunk["choices"][0].get("finish_reason")
                                  or finish_reason)
                 d = chunk["choices"][0]["delta"]
@@ -3181,6 +3436,10 @@ def _stream_chat(url, messages, job_id, temperature=None, max_tokens=None,
                 if j is not None:
                     j.setdefault("notes", []).append(msg)
     out = "".join(parts)
+    # Every pipeline step is a separate billable call, so record each one —
+    # a code build on a paid coder is many requests, not one.
+    record_spend(url, label or "code", _usage,
+                 "".join(m.get("content", "") for m in messages), out)
     el = max(0.1, time.time() - t0)
     shape = _output_shape(out)
     _trace_blob(job_id, seq, label, "reply", out)
@@ -4873,8 +5132,9 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
 
     payload = {"messages": messages, "stream": True}
     answer_parts = []
+    usage = None
     try:
-        payload = _inject_model(payload, url, route)
+        payload = _with_usage(_inject_model(payload, url, route), url)
         with requests.post(url, json=payload, headers=_hdrs(url),
                            stream=True, timeout=600) as r:
             r.raise_for_status()
@@ -4888,6 +5148,13 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
                         break
                     try:
                         chunk = json.loads(data)
+                        # The usage-bearing final chunk has an EMPTY choices
+                        # list, so read it before touching choices[0] — the
+                        # except below would otherwise swallow it silently.
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+                        if not chunk.get("choices"):
+                            continue
                         d = chunk["choices"][0]["delta"]
                         delta = d.get("content", "")
                         if delta:
@@ -4903,6 +5170,10 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
         answer_parts.append(_specialist_error(route, url, e))
 
     final_answer = _scrub_tokens("".join(answer_parts))
+    cost = record_spend(url, route, usage, user_content, final_answer)
+    if cost:
+        with JOBS_LOCK:
+            JOBS[job_id]["cost"] = round(cost, 6)
     if _job_cancelled(job_id):
         final_answer += "\n\n*(stopped by user)*"
 
@@ -5120,6 +5391,17 @@ def settings_save():
                 old = next((x for x in ROUTER_CONFIG["backends"]
                             if x["id"] == b["id"]), None)
             b["key"] = old.get("key", "") if old else ""
+        # Cost settings. Prices are advisory only — they never gate a request,
+        # they only feed the spend estimate, so bad input is coerced not rejected.
+        b["paid"] = bool(b.get("paid"))
+        for k in ("price_in", "price_out"):
+            try:
+                b[k] = max(0.0, float(b.get(k) or 0))
+            except (TypeError, ValueError):
+                b[k] = 0.0
+        if b["paid"] and not (b["price_in"] or b["price_out"]):
+            errs.append(f"backend '{b.get('id')}': marked paid but both prices "
+                        "are 0 — spend would always estimate as free")
         b.pop("has_key", None)
     for n in _BUILTIN_ROUTES:
         if n not in routes:
@@ -5324,6 +5606,25 @@ def upload():
             del ups[:-MAX_SESSION_UPLOADS]
     _save_memory()
     return jsonify({"ok": True, "upload": meta})
+
+
+@app.route("/spend")
+def spend():
+    """Estimated spend for the logged-in user, plus which routes cost money.
+
+    Estimates only: they use the prices YOU entered and the token counts the
+    provider reported (or a 4-chars-per-token guess when it reported none).
+    Treat them as a running indication, never as a bill."""
+    with CONFIG_LOCK:
+        paid_routes = sorted(r for r, u in SPECIALISTS.items() if _is_paid(u))
+        any_paid = any(_is_paid(u) for u in set(SPECIALISTS.values())) \
+            or _is_paid(CODE_AGENT_URL) or _is_paid(CODE_AGENT_URL_FAST)
+    s = spend_summary()
+    s["paid_routes"] = paid_routes
+    s["any_paid"] = bool(any_paid)
+    s["coder_paid"] = {"easy": _is_paid(CODE_AGENT_URL_FAST),
+                       "hard": _is_paid(CODE_AGENT_URL)}
+    return jsonify(s)
 
 
 @app.route("/uploads/<session_id>")
@@ -6654,6 +6955,10 @@ PAGE = r"""<!DOCTYPE html>
   button:disabled { opacity:.3; cursor:default; }
   #go { color:var(--btn-ink); }
 
+  .spend-tag { font:500 11.5px 'DM Sans',sans-serif; color:var(--muted);
+               border:1px solid var(--border); border-radius:999px;
+               padding:3px 9px; cursor:default; }
+
   /* ---- attachments ---- */
   .attach-row { max-width:820px; margin:0 auto 8px; display:flex; flex-wrap:wrap;
                 gap:6px; }
@@ -6817,6 +7122,8 @@ PAGE = r"""<!DOCTYPE html>
       <a href="/compare" target="_blank">compare ↗</a>
       <a href="/admin" class="admin-only" style="display:none">👥 people</a>
       <a href="/settings" class="admin-only" style="display:none">⚙ settings</a>
+      <span id="spendTag" class="spend-tag" style="display:none"></span>
+      <a href="/help">? help</a>
       <a href="/account">👤 account</a>
       <a href="__SOURCE_URL__" target="_blank" rel="noopener"
          title="Crewe is AGPL-3.0 — this links to the source of the version you are using">&lt;/&gt; source</a>
@@ -6883,7 +7190,7 @@ PAGE = r"""<!DOCTYPE html>
         </select>
         <button id="go">Send</button>
       </div>
-      <div class="effort-help">Effort applies only to coding answers — more effort takes longer</div>
+      <div class="effort-help" id="effortHelp">Effort applies only to coding answers — more effort takes longer</div>
     </footer>
   </div>
   <div class="sidebar">
@@ -7385,6 +7692,48 @@ if(effortSel){
     localStorage.setItem('creweEffort', effortSel.value);
   });
 }
+
+// ---- cost awareness ---------------------------------------------------------
+// The effort switch is only an honest money control if it SAYS so, and only
+// when the backend behind it actually bills. Everything here is driven by
+// /spend, never hardcoded — a local-only install should never mention money.
+let spendState=null;
+function money(n){ return (n<0.01&&n>0) ? '<$0.01' : '$'+n.toFixed(2); }
+
+async function refreshSpend(){
+  try{
+    const s=await(await fetch('/spend')).json();
+    spendState=s;
+    const help=document.getElementById('effortHelp');
+    const sel=document.getElementById('effort');
+    if(sel&&s.coder_paid){
+      [...sel.options].forEach(o=>{
+        const paid=s.coder_paid[o.value];
+        o.textContent='Effort: '+(o.value==='hard'?'Hard':'Easy')+(paid?' 💵':'');
+      });
+      // Either coder can be local or paid — neither level implies cost.
+      // Say only what this install's config actually is.
+      if(help){
+        const ph=s.coder_paid.hard, pe=s.coder_paid.easy;
+        const base='Effort applies only to coding answers — ';
+        if(ph&&pe)       help.innerHTML=base+'<b>both coders cost money</b>';
+        else if(ph)      help.innerHTML=base+'Easy is free, <b>Hard costs money</b>';
+        else if(pe)      help.innerHTML=base+'<b>Easy costs money</b>, Hard is free';
+        else             help.textContent=base+'more effort takes longer';
+      }
+    }
+    const tag=document.getElementById('spendTag');
+    if(tag){
+      if(s.any_paid){
+        tag.style.display='';
+        tag.textContent='💵 '+money(s.month)+' / 30d';
+        tag.title=s.requests+' paid requests · '+money(s.day)+' today · '+money(s.all)+' all time'
+                  +(s.estimated_any?' · some figures estimated from text length':'');
+      } else tag.style.display='none';
+    }
+  }catch(e){}
+}
+refreshSpend(); setInterval(refreshSpend,60000);
 
 // ---- route health dots ------------------------------------------------------
 async function pollHealth(){
@@ -8963,10 +9312,27 @@ function render(){
       <div><label class="f">default model</label><input type="text" size="14" value="${esc(b.model||'')}" data-k="model"></div>
       <button data-chk="${i}">Check</button>
       <button class="danger" data-del="${i}">✕</button></div>
+      <div class="row" style="margin-top:8px;align-items:center">
+        <label class="f" style="display:flex;gap:6px;align-items:center;cursor:pointer">
+          <input type="checkbox" data-k="paid"${b.paid?' checked':''}> this backend costs money
+        </label>
+        <div class="paidonly" style="${b.paid?'':'display:none'}"><label class="f">price in / 1M tokens</label>
+          <input type="number" step="0.01" min="0" size="7" value="${b.price_in||0}" data-k="price_in"></div>
+        <div class="paidonly" style="${b.paid?'':'display:none'}"><label class="f">price out / 1M tokens</label>
+          <input type="number" step="0.01" min="0" size="7" value="${b.price_out||0}" data-k="price_out"></div>
+        <span class="paidonly f" style="${b.paid?'':'display:none'};opacity:.7">
+          from your provider's pricing page — used only to estimate spend</span>
+      </div>
       <div class="status" id="bst-${i}"></div>`;
     c.querySelectorAll('input').forEach(inp=>inp.addEventListener('input',()=>{
-      b[inp.dataset.k]=inp.value;
-      if(inp.dataset.k==='key') b.has_key=false;
+      const k=inp.dataset.k;
+      if(k==='paid'){
+        b.paid=inp.checked;
+        c.querySelectorAll('.paidonly').forEach(e=>e.style.display=inp.checked?'':'none');
+        return;
+      }
+      b[k]=(k==='price_in'||k==='price_out')?parseFloat(inp.value||0):inp.value;
+      if(k==='key') b.has_key=false;
     }));
     c.querySelector('[data-chk]').addEventListener('click',()=>checkBackend(i));
     c.querySelector('[data-del]').addEventListener('click',()=>{
