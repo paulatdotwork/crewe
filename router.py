@@ -5573,7 +5573,10 @@ def run_panel_judge(job_id: str, question: str):
             {"role": "user",   "content": f"Question: {question}\n\n{responses_text}"},
         ],
         "stream": True,
-        "max_tokens": 500,
+        "max_tokens": 1200,
+        # See the compare judge: thinking on burns the whole budget and returns
+        # nothing visible.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     parts = []
     try:
@@ -7000,7 +7003,13 @@ def _check_compare_judge(job_id: str, question: str):
             )},
         ],
         "stream": True,
-        "max_tokens": 700,
+        "max_tokens": 1200,
+        # Thinking OFF. The judge is a structured writer like the doc/sheet
+        # writers, and on a reasoning model it will otherwise spend the ENTIRE
+        # token budget on reasoning_content and emit no visible answer at all:
+        # measured 697 thinking deltas and 0 content deltas on a realistic
+        # payload. The page then sat on "deliberating" forever.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     parts = []
     try:
@@ -7028,8 +7037,16 @@ def _check_compare_judge(job_id: str, question: str):
     except Exception as e:
         parts = [f"[judge error: {e}]"]
 
+    verdict = "".join(parts).strip()
+    if not verdict:
+        # Defence in depth: an empty verdict used to render as an eternal
+        # "deliberating…" because the UI only swapped in text when the answer
+        # was non-empty. Say what happened instead.
+        verdict = ("_The judge returned nothing. This usually means its backend "
+                   "spent the whole token budget on hidden reasoning — check "
+                   "that the reasoning route has thinking disabled._")
     with COMPARE_JOBS_LOCK:
-        COMPARE_JOBS[job_id]["judge"]["answer"] = "".join(parts)
+        COMPARE_JOBS[job_id]["judge"]["answer"] = verdict
         COMPARE_JOBS[job_id]["judge"]["done"] = True
         COMPARE_JOBS[job_id]["done"] = True
 
