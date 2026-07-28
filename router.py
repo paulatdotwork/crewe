@@ -572,26 +572,25 @@ truth.</p>
 </div>
 
 <div class="card">
-<h2>6. Comparing models &mdash; panel and compare</h2>
-<p>Two pages put answers side by side, and they compare <i>different things</i>:</p>
+<h2>6. Comparing models &mdash; the Compare page</h2>
+<p>One page puts answers side by side, with a <b>models / routes</b> switch that
+changes what is being compared:</p>
 <ul>
-<li><b>&#9878; Panel</b> compares <b>routes</b> &mdash; model <i>plus</i> persona. This is
-what your users actually experience, so it answers "which of my setups handles
-this best?" Tick the routes you want; the choice is remembered per browser.</li>
-<li><b>&#9879; Compare</b> compares <b>backends</b> &mdash; the raw models, all given the
-same system prompt. Use it for "is this model better than that one?", with no
-persona differences muddying the result. It is also the only way to test a
-backend that no route points at.</li>
+<li><b>models</b> gives every entrant the <i>same</i> system prompt, so the only
+thing that differs is the model. Use it for "is this model better than that
+one?" &mdash; and note it is the only way to test a backend that no route points
+at, such as one wired only to a coder role.</li>
+<li><b>routes</b> gives each entrant its own persona, so you are judging your
+configured setups rather than raw models. That is closer to what your users
+actually experience.</li>
 </ul>
-<p class="note"><b>Every route in a panel needs a working backend.</b> A panel runs
-its routes simultaneously and only judges once they have <i>all</i> finished, so
-one dead or very slow backend holds up the whole thing. If a panel seems to hang,
-check the route health dots in the header first &mdash; and remember a model on
+<p>Tick two or more, ask once, and every entrant answers the same prompt side by
+side. Your selection is remembered per browser, separately for each mode.</p>
+<p class="note"><b>Every entrant needs a working backend.</b> They run
+simultaneously and the judge only starts once they have <i>all</i> finished, so
+one dead or very slow backend holds up the whole comparison. If it seems to
+hang, check the route health dots in the header &mdash; and remember a model on
 CPU can legitimately take a minute or two for a long answer.</p>
-<p class="note"><b>A model can only appear in a panel if a route points at it.</b>
-Routes are what a panel picks from, so a backend wired only to a system role
-(a coder, the classifier) will never show up there. Compare it on the
-<b>&#9879; Compare</b> page instead, or point a route at it.</p>
 <p>Both pages finish with a judge, which runs on your <b>reasoning</b> route.
 Give that route a capable model &mdash; it reads every answer and has to justify
 a verdict.</p>
@@ -5521,8 +5520,6 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
 
 
 # ---- panel ------------------------------------------------------------------
-PANEL_JOBS: dict = {}
-PANEL_JOBS_LOCK = threading.Lock()
 # Default panel line-up. A user may now pick any subset of their CONFIGURED
 # routes instead; this is only the fallback when none is chosen.
 PANEL_ROUTES = ["recipes", "creative", "code", "general", "reasoning"]
@@ -5556,56 +5553,11 @@ JUDGE_SYSTEM = (
 )
 
 
-def run_panel_specialist(job_id: str, route: str, question: str):
-    url = SPECIALISTS[route]
-    system = SYSTEM_PROMPTS.get(route, SYSTEM_PROMPTS["general"])
-    payload = {
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": question},
-        ],
-        "stream": True,
-        # comparable-length answers, and a hard stop before a small-ctx
-        # backend can run off the end of its window and degenerate
-        "max_tokens": 1400,
-    }
-    parts = []
-    try:
-        payload = _inject_model(payload, url)
-        with requests.post(url, json=payload, headers=_hdrs(url),
-                           stream=True, timeout=600) as r:
-            r.raise_for_status()
-            for line in _lines(r):
-                if not line:
-                    continue
-                line = line.decode("utf-8")
-                if line.startswith("data: "):
-                    data = line[6:]
-                    if data.strip() == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk["choices"][0]["delta"].get("content", "")
-                        if delta:
-                            parts.append(delta)
-                            with PANEL_JOBS_LOCK:
-                                PANEL_JOBS[job_id]["specialists"][route]["tokens"] += 1
-                    except Exception:
-                        pass
-        answer = _scrub_tokens("".join(parts))
-    except Exception as e:
-        answer = f"[error: {e}]"
-
-    should_judge = False
-    with PANEL_JOBS_LOCK:
-        PANEL_JOBS[job_id]["specialists"][route]["answer"] = answer
-        PANEL_JOBS[job_id]["specialists"][route]["done"] = True
-        PANEL_JOBS[job_id]["remaining"] -= 1
-        if PANEL_JOBS[job_id]["remaining"] == 0:
-            should_judge = True
-
-    if should_judge:
-        spawn_owned(target=run_panel_judge, args=(job_id, question), daemon=True).start()
+# Retained for the panel endpoints that outlived the panel page (/panel now
+# redirects to /compare). Left working rather than half-removed; delete the
+# whole panel surface in one deliberate pass if it is ever worth the churn.
+PANEL_JOBS: dict = {}
+PANEL_JOBS_LOCK = threading.Lock()
 
 
 def run_panel_judge(job_id: str, question: str):
@@ -6870,51 +6822,11 @@ def docs_write():
 
 
 @app.route("/panel")
-def panel_page():
-    return Response(PANEL_PAGE, mimetype="text/html")
-
-
-@app.route("/panel/ask", methods=["POST"])
-def panel_ask():
-    body = request.json or {}
-    question = body.get("question", "").strip()
-    if not question:
-        return jsonify({"error": "empty question"}), 400
-
-    wanted = body.get("routes")
-    if wanted is None:
-        chosen = [r for r in PANEL_ROUTES if r in SPECIALISTS]
-    else:
-        if not isinstance(wanted, list):
-            return jsonify({"error": "routes must be a list"}), 400
-        seen, chosen = set(), []
-        for r in wanted:                    # resolved against live routes only
-            if r in SPECIALISTS and r not in seen:
-                seen.add(r)
-                chosen.append(r)
-    if not chosen:
-        return jsonify({"error": "pick at least one route"}), 400
-    if len(chosen) > PANEL_MAX_ROUTES:
-        return jsonify({"error": f"at most {PANEL_MAX_ROUTES} at once"}), 400
-
-    job_id = uuid.uuid4().hex
-    with PANEL_JOBS_LOCK:
-        PANEL_JOBS[job_id] = {
-            "owner": _owner(),
-            "specialists": {r: {"tokens": 0, "done": False, "answer": ""} for r in chosen},
-            "judge": {"tokens": 0, "done": False, "answer": ""},
-            "remaining": len(chosen),
-            "done": False,
-            "order": chosen,
-        }
-        _prune_jobs(PANEL_JOBS)
-
-    for route in chosen:
-        spawn_owned(
-            target=run_panel_specialist, args=(job_id, route, question), daemon=True
-        ).start()
-
-    return jsonify({"job_id": job_id, "routes": chosen})
+def panel_page_route():
+    """Merged into /compare. The panel compared a fixed list of routes; compare
+    does that as its "routes" mode, alongside raw-model comparison, with one
+    picker and one judge. Kept as a redirect so bookmarks keep working."""
+    return redirect("/compare", code=302)
 
 
 @app.route("/panel/routes")
@@ -6953,14 +6865,14 @@ COMPARE_JUDGE_SYSTEM = (
 
 
 def _stream_into(url: str, payload: dict, job_id: str, field: str,
-                 jobs=None, lock=None) -> str:
+                 jobs=None, lock=None, route: str = None) -> str:
     """Stream into a COMPARE_JOBS-shaped pane. `jobs`/`lock` default to the
     compare tables; passing them lets other pages reuse this."""
     jobs = COMPARE_JOBS if jobs is None else jobs
     lock = COMPARE_JOBS_LOCK if lock is None else lock
     parts, usage = [], None
     try:
-        payload = _with_usage(_inject_model(payload, url), url)
+        payload = _with_usage(_inject_model(payload, url, route), url)
         with requests.post(url, json=payload, headers=_hdrs(url),
                            stream=True, timeout=600) as r:
             r.raise_for_status()
@@ -7034,11 +6946,17 @@ def compare_backends():
     return out
 
 
-def run_compare_backend(job_id: str, bid: str, url: str, question: str):
-    payload = {"messages": [{"role": "system", "content": COMPARE_SYSTEM},
+def run_compare_backend(job_id: str, bid: str, url: str, question: str,
+                        system: str = None, route: str = None):
+    """One entrant in a comparison.
+
+    `system` differs by mode and is the whole point of having two: comparing
+    MODELS gives every entrant the same system prompt so you judge the models;
+    comparing ROUTES gives each its own persona so you judge the setups."""
+    payload = {"messages": [{"role": "system", "content": system or COMPARE_SYSTEM},
                             {"role": "user", "content": question}],
-               "stream": True}
-    answer = _stream_into(url, payload, job_id, bid)
+               "stream": True, "max_tokens": 1400}
+    answer = _stream_into(url, payload, job_id, bid, route=route)
     with COMPARE_JOBS_LOCK:
         pane = COMPARE_JOBS.get(job_id, {}).get(bid)
         if pane is not None:
@@ -7135,9 +7053,29 @@ def compare_page_route():
     return Response(COMPARE_PAGE, mimetype="text/html")
 
 
+COMPARE_MODES = ("backends", "routes")
+
+
 @app.route("/compare/backends")
 def compare_backends_route():
+    """Superseded by /compare/targets; kept so an older page still works."""
     return jsonify({"backends": compare_backends()})
+
+
+@app.route("/compare/targets")
+def compare_targets_route():
+    mode = request.args.get("mode", "backends")
+    if mode not in COMPARE_MODES:
+        mode = "backends"
+    if mode == "routes":
+        items = [{"id": r["route"], "label": r["route"], "sub": r["backend"],
+                  "paid": r["paid"], "default": r["default"]}
+                 for r in panel_routes()]
+    else:
+        items = [{"id": b["id"], "label": b["id"], "sub": b["model"],
+                  "paid": b["paid"], "default": False}
+                 for b in compare_backends()]
+    return jsonify({"mode": mode, "targets": items})
 
 
 COMPARE_MAX_BACKENDS = 6
@@ -7150,40 +7088,55 @@ def compare_ask():
     if not question:
         return jsonify({"error": "empty question"}), 400
 
-    wanted = body.get("backends") or []
+    mode = body.get("mode", "backends")
+    if mode not in COMPARE_MODES:
+        return jsonify({"error": "unknown mode"}), 400
+
+    wanted = body.get("targets") or body.get("backends") or []
     if not isinstance(wanted, list):
-        return jsonify({"error": "backends must be a list"}), 400
-    # Resolve names to URLs SERVER-SIDE. The browser never sends a URL, so a
-    # crafted request can't turn this into an SSRF gadget.
-    with CONFIG_LOCK:
-        by_id = {b["id"]: b for b in ROUTER_CONFIG.get("backends", [])}
+        return jsonify({"error": "targets must be a list"}), 400
+
+    # Names in, URLs resolved SERVER-SIDE — the browser never supplies a URL,
+    # so a crafted request cannot aim a run at an arbitrary host.
     chosen, seen = [], set()
-    for bid in wanted:
-        b = by_id.get(bid)
-        if b and bid not in seen:
-            seen.add(bid)
-            chosen.append((bid, _chat_url(b)))
+    if mode == "routes":
+        for name in wanted:
+            if name in SPECIALISTS and name not in seen:
+                seen.add(name)
+                chosen.append((name, SPECIALISTS[name],
+                               SYSTEM_PROMPTS.get(name, SYSTEM_PROMPTS["general"]),
+                               name))
+    else:
+        with CONFIG_LOCK:
+            by_id = {b["id"]: b for b in ROUTER_CONFIG.get("backends", [])}
+        for bid in wanted:
+            b = by_id.get(bid)
+            if b and bid not in seen:
+                seen.add(bid)
+                chosen.append((bid, _chat_url(b), COMPARE_SYSTEM, None))
     if not chosen:
-        return jsonify({"error": "pick at least one backend"}), 400
+        return jsonify({"error": "pick at least one"}), 400
     if len(chosen) > COMPARE_MAX_BACKENDS:
         return jsonify({"error": f"at most {COMPARE_MAX_BACKENDS} at once"}), 400
 
     job_id = uuid.uuid4().hex
     with COMPARE_JOBS_LOCK:
-        job = {"owner": _owner(), "order": [b for b, _ in chosen],
+        job = {"owner": _owner(), "order": [k for k, _u, _s, _r in chosen],
+               "mode": mode,
                "judge": {"tokens": 0, "done": False, "answer": "",
                          "started": False},
                "done": False}
-        for bid, _u in chosen:
-            job[bid] = {"tokens": 0, "done": False, "answer": "",
-                        "stage": "drafting"}
+        for k, _u, _s, _r in chosen:
+            job[k] = {"tokens": 0, "done": False, "answer": "",
+                      "stage": "drafting"}
         COMPARE_JOBS[job_id] = job
         _prune_jobs(COMPARE_JOBS)
 
-    for bid, u in chosen:
-        spawn_owned(target=run_compare_backend, args=(job_id, bid, u, question),
-                    daemon=True).start()
-    return jsonify({"job_id": job_id, "backends": [b for b, _ in chosen]})
+    for k, u, sysp, rt in chosen:
+        spawn_owned(target=run_compare_backend,
+                    args=(job_id, k, u, question, sysp, rt), daemon=True).start()
+    return jsonify({"job_id": job_id, "mode": mode,
+                    "targets": [k for k, _u, _s, _r in chosen]})
 
 
 @app.route("/compare/progress/<job_id>")
@@ -10042,333 +9995,6 @@ SCRATCH_PAGE = r"""<!DOCTYPE html>
 </html>"""
 
 
-PANEL_PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ask the Panel</title>
-<script>if(localStorage.getItem('creweTheme')==='dark')document.documentElement.dataset.theme='dark';</script>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%238b4a18'/%3E%3Cpath d='M32 57V34M32 34 16 13M32 34 48 13' stroke='%23faf6f0' stroke-width='7' stroke-linecap='round' fill='none'/%3E%3Ccircle cx='32' cy='34' r='6' fill='%23faf6f0'/%3E%3C/svg%3E">
-<link href="/static/fonts.css" rel="stylesheet">
-<script src="/static/marked.min.js"></script>
-<style>
-  :root {
-    --bg:        #faf6f0;
-    --panel:     #ffffff;
-    --panel2:    #f2ebe0;
-    --ink:       #1e160a;
-    --muted:     #8a7560;
-    --border:    #ddd0b8;
-    --recipes:   #a85e20;
-    --creative:  #903828;
-    --code:      #2e6e2a;
-    --general:   #226660;
-    --reasoning: #2a4e8c;
-    --accent:    #8b4a18;
-    --btn-ink:   #fff;
-  }
-  :root[data-theme="dark"] {
-    --bg:#191410; --panel:#221c15; --panel2:#2b241b; --ink:#ece2d3;
-    --muted:#9c8a75; --border:#3a3125; --recipes:#d99a5b; --creative:#d98276;
-    --code:#7cbf72; --general:#63b8ab; --reasoning:#8aaee8;
-    --accent:#d29a62; --btn-ink:#241b11; color-scheme:dark; }
-  .theme-toggle { display:inline-flex; align-items:center; gap:5px;
-                  cursor:pointer; user-select:none; flex:0 0 auto; }
-  .theme-toggle input { position:absolute; opacity:0; pointer-events:none; }
-  .tt-track { width:34px; height:18px; border-radius:999px; background:var(--bg);
-              border:1px solid var(--border); position:relative; }
-  .tt-knob { position:absolute; top:1px; left:1px; width:14px; height:14px;
-             border-radius:50%; background:var(--accent); transition:left .2s; }
-  .theme-toggle input:checked + .tt-track .tt-knob { left:17px; }
-  .tt-icon { font-size:11px; color:var(--muted); }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { min-height: 100%; }
-  body { font: 15px/1.6 'DM Sans', system-ui, sans-serif;
-         background: var(--bg); color: var(--ink); }
-
-  header { padding: 16px 28px; border-bottom: 1px solid var(--border);
-           background: var(--panel); display: flex; align-items: center; gap: 16px; }
-  header h1 { font-family: 'Lora', Georgia, serif; font-size: 20px;
-              font-weight: 600; color: var(--accent); }
-  header .sub { color: var(--muted); font-size: 12px; flex: 1; }
-  header a { color: var(--reasoning); text-decoration: none; font-size: 13px; }
-  header a:hover { text-decoration: underline; }
-
-  .ask-bar { background: var(--panel); border-bottom: 1px solid var(--border); padding: 16px 28px; }
-  .ask-inner { max-width: 1100px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
-  textarea { flex: 1; resize: none; background: var(--bg); color: var(--ink);
-             border: 1px solid var(--border); border-radius: 12px;
-             padding: 12px 16px; font: 15px/1.5 'DM Sans', sans-serif;
-             outline: none; transition: border-color .2s; max-height: 120px; min-height: 46px; }
-  textarea:focus { border-color: var(--accent); }
-  textarea::placeholder { color: var(--muted); }
-  #go { background: var(--accent); color: var(--btn-ink); border: 0; border-radius: 12px;
-        padding: 0 24px; height: 46px; font: 600 14px 'DM Sans', sans-serif;
-        cursor: pointer; transition: opacity .15s; white-space: nowrap; }
-  #go:hover { opacity: .85; }
-  #go:disabled { opacity: .35; cursor: default; }
-
-  .grid-wrap { max-width: 1100px; margin: 0 auto; padding: 28px; }
-  .section-label { font-size: 11px; font-weight: 700; text-transform: uppercase;
-                   letter-spacing: .1em; color: var(--muted); margin-bottom: 14px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
-
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
-          display: flex; flex-direction: column;
-          box-shadow: 0 1px 4px rgba(80,50,20,.06); }
-  .card-head { padding: 11px 15px; border-bottom: 1px solid var(--border);
-               display: flex; align-items: center; justify-content: space-between;
-               border-radius: 14px 14px 0 0; }
-  .badge { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 700;
-           text-transform: uppercase; letter-spacing: .08em; padding: 3px 10px; border-radius: 999px; }
-  .badge::before { content: ''; width: 5px; height: 5px; border-radius: 50%;
-                   background: currentColor; opacity: .7; flex: 0 0 auto; }
-  .badge.recipes  { background: rgba(168,94,32,.10);  color: var(--recipes); }
-  .badge.creative { background: rgba(144,56,40,.10);  color: var(--creative); }
-  .badge.code     { background: rgba(46,110,42,.10);  color: var(--code); }
-  .badge.general  { background: rgba(34,102,96,.10);  color: var(--general); }
-  .badge.reasoning{ background: rgba(42,78,140,.10);  color: var(--reasoning); }
-  .tok { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
-
-  .card-body { padding: 16px; flex: 1; overflow-y: auto; max-height: 380px; min-height: 100px; }
-
-  .pending { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
-  .spinner { width: 14px; height: 14px; border: 2px solid var(--border);
-             border-top-color: var(--accent); border-radius: 50%;
-             animation: spin .7s linear infinite; flex: 0 0 auto; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  .md { font-size: 13.5px; line-height: 1.75; word-wrap: break-word; }
-  .md p { margin-bottom: .8em; }
-  .md p:last-child { margin-bottom: 0; }
-  .md h1,.md h2,.md h3 { font-family: 'Lora', Georgia, serif; font-weight: 600;
-    margin: 1em 0 .4em; line-height: 1.3; }
-  .md h1 { font-size: 1.2em; color: var(--accent); }
-  .md h2 { font-size: 1.08em; color: var(--recipes); }
-  .md h3 { font-size: 1em; color: var(--general); }
-  .md ul,.md ol { padding-left: 1.4em; margin-bottom: .8em; }
-  .md li { margin-bottom: .3em; }
-  .md li::marker { color: var(--code); font-weight: 700; }
-  .md strong { font-weight: 600; color: var(--recipes); }
-  .md em { font-style: italic; color: var(--creative); }
-  .md code { font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-             font-size: .84em; background: var(--panel2); padding: 2px 5px;
-             border-radius: 4px; color: var(--code); }
-  .md pre { background: var(--panel2); border: 1px solid var(--border);
-            border-radius: 8px; padding: 12px 14px; overflow-x: auto; margin-bottom: .8em; }
-  .md pre code { background: none; padding: 0; color: var(--ink); }
-  .md blockquote { border-left: 3px solid var(--creative); margin: .8em 0;
-                   padding-left: 1em; color: var(--muted); font-style: italic; }
-  .md table { border-collapse: collapse; width: 100%; margin-bottom: .8em; font-size: 13px; }
-  .md th,.md td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; }
-  .md th { background: var(--panel2); font-weight: 600; color: var(--accent); }
-
-  .judge-wrap { margin-top: 28px; }
-  .judge-card { background: var(--panel); border: 2px solid var(--reasoning);
-                border-radius: 14px; box-shadow: 0 2px 14px rgba(42,78,140,.10); }
-  .judge-head { padding: 14px 20px; border-bottom: 1px solid var(--border);
-                display: flex; align-items: center; gap: 10px; border-radius: 12px 12px 0 0; }
-  .judge-title { font-family: 'Lora', Georgia, serif; font-size: 15px;
-                 font-weight: 600; color: var(--reasoning); }
-  .judge-sub { font-size: 12px; color: var(--muted); margin-left: auto;
-               font-variant-numeric: tabular-nums; }
-  .judge-body { padding: 20px; }
-
-  .idle { text-align: center; padding: 70px 20px; color: var(--muted); font-size: 14px; }
-  .idle .icon { font-size: 36px; margin-bottom: 14px; }
-  .pickrow { max-width:1200px; margin:10px auto 0; display:flex; flex-wrap:wrap;
-             gap:8px; align-items:center; }
-  .pickhint { color:var(--muted); font-size:12px; }
-  .pick { display:inline-flex; align-items:center; gap:7px; cursor:pointer;
-          border:1px solid var(--border); border-radius:999px; padding:5px 12px;
-          font-size:12.5px; background:var(--panel); user-select:none; }
-  .pick input { margin:0; cursor:pointer; }
-  .pick.on { border-color:var(--accent); }
-  .pick .mdl { color:var(--muted); font-size:11px; }
-  .pick .cost { color:var(--accent); font-size:11px; font-weight:600; }
-</style>
-</head>
-<body>
-<header>
-  <h1>Ask the Panel</h1>
-  <label class="theme-toggle" title="Dark mode"><span class="tt-icon">☀</span><input type="checkbox" id="themeSw"><span class="tt-track"><span class="tt-knob"></span></span><span class="tt-icon">🌙</span></label>
-  <script>(function(){const t=document.getElementById('themeSw');t.checked=localStorage.getItem('creweTheme')==='dark';t.addEventListener('change',()=>{if(t.checked){document.documentElement.dataset.theme='dark';localStorage.setItem('creweTheme','dark');}else{delete document.documentElement.dataset.theme;localStorage.setItem('creweTheme','light');}});})();</script>
-  <span class="sub">One question · all specialists · one verdict</span>
-  <a href="/">← Crewe</a>
-  <a href="/compare" target="_blank">compare ↗</a>
-</header>
-<div class="ask-bar">
-  <div class="ask-inner">
-    <textarea id="q" rows="1" placeholder="Ask the panel anything… (Enter to send, Shift+Enter for newline)"></textarea>
-    <button id="go">Ask all ›</button>
-  </div>
-  <div class="pickrow" id="pickRow"><span class="pickhint">loading routes…</span></div>
-</div>
-<div class="grid-wrap">
-  <div id="content">
-    <div class="idle">
-      <div class="icon">⚖️</div>
-      Ask a question above — all five specialists answer simultaneously,<br>
-      then a judge picks the best response.
-    </div>
-  </div>
-</div>
-<script>
-const q = document.getElementById('q');
-const go = document.getElementById('go');
-const content = document.getElementById('content');
-
-marked.use({ breaks: true, gfm: true });
-marked.use({ renderer: {
-  html(token){ const s = typeof token === 'string' ? token : (token && token.text) || '';
-    const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-}});
-
-const ROUTES = ['recipes', 'creative', 'code', 'general', 'reasoning'];
-const LABELS = { recipes: 'Recipes', creative: 'Creative', code: 'Code', general: 'General', reasoning: 'Reasoning' };
-
-let pollTimer = null;
-
-function buildGrid() {
-  content.innerHTML = `
-    <div class="section-label">Panelists</div>
-    <div class="cards" id="cards"></div>
-    <div class="judge-wrap" id="judgeWrap" style="display:none">
-      <div class="judge-card">
-        <div class="judge-head">
-          <span class="judge-title">⚖️ Judge's Verdict</span>
-          <span class="judge-sub" id="judgeSub"></span>
-        </div>
-        <div class="judge-body" id="judgeBody">
-          <div class="pending"><div class="spinner"></div><span>waiting for panelists…</span></div>
-        </div>
-      </div>
-    </div>`;
-
-  const cards = document.getElementById('cards');
-  ROUTES.forEach(r => {
-    const el = document.createElement('div');
-    el.className = 'card'; el.id = 'card-' + r;
-    el.innerHTML = `
-      <div class="card-head">
-        <span class="badge ${r}">${LABELS[r]}</span>
-        <span class="tok" id="tok-${r}">—</span>
-      </div>
-      <div class="card-body" id="body-${r}">
-        <div class="pending"><div class="spinner"></div><span>generating…</span></div>
-      </div>`;
-    cards.appendChild(el);
-  });
-}
-
-function updateCard(route, data) {
-  const tokEl = document.getElementById('tok-' + route);
-  const bodyEl = document.getElementById('body-' + route);
-  if (!tokEl || !bodyEl) return;
-  tokEl.textContent = data.tokens ? data.tokens + ' tok' : '—';
-  if (data.done && data.answer) {
-    bodyEl.innerHTML = `<div class="md">${marked.parse(data.answer)}</div>`;
-  }
-}
-
-function updateJudge(judgeData, specialists) {
-  const allSpecsDone = ROUTES.every(r => specialists[r].done);
-  const wrap = document.getElementById('judgeWrap');
-  const body = document.getElementById('judgeBody');
-  const sub  = document.getElementById('judgeSub');
-  if (!wrap || !body) return;
-  if (!allSpecsDone) return;
-
-  wrap.style.display = 'block';
-  if (judgeData.done && judgeData.answer) {
-    sub.textContent = judgeData.tokens + ' tokens';
-    body.innerHTML = `<div class="md">${marked.parse(judgeData.answer)}</div>`;
-  } else if (judgeData.tokens > 0) {
-    sub.textContent = judgeData.tokens + ' tokens…';
-    body.innerHTML = `<div class="pending"><div class="spinner"></div><span>deliberating… ${judgeData.tokens} tokens</span></div>`;
-  } else {
-    body.innerHTML = `<div class="pending"><div class="spinner"></div><span>deliberating…</span></div>`;
-  }
-}
-
-async function ask() {
-  const question = q.value.trim();
-  if (!question) return;
-  go.disabled = true;
-  buildGrid();
-
-  let res;
-  try {
-    res = await (await fetch('/panel/ask', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question }),
-    })).json();
-  } catch (e) {
-    content.innerHTML = `<div class="idle"><div class="icon">⚠️</div>Router unreachable: ${e}</div>`;
-    go.disabled = false; return;
-  }
-
-  const jobId = res.job_id;
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(async () => {
-    let p;
-    try { p = await (await fetch('/panel/progress/' + jobId)).json(); } catch (e) { return; }
-    ROUTES.forEach(r => updateCard(r, p.specialists[r]));
-    updateJudge(p.judge, p.specialists);
-    if (p.done) {
-      clearInterval(pollTimer); pollTimer = null;
-      go.disabled = false; q.focus();
-    }
-  }, 400);
-}
-
-q.addEventListener('input', () => { q.style.height = 'auto'; q.style.height = Math.min(q.scrollHeight, 120) + 'px'; });
-go.addEventListener('click', ask);
-q.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } });
-q.focus();
-
-// ---- route picker ----------------------------------------------------------
-// A panel compares configured ROUTES (model + persona) — that is what a user
-// actually experiences. /compare picks raw backends when you want to judge the
-// models themselves. Names only; URLs and keys stay admin-only.
-function panelPick(){
-  return [...document.querySelectorAll('#pickRow .pick input:checked')]
-           .map(i => i.dataset.route);
-}
-async function loadPanelRoutes(){
-  const row = document.getElementById('pickRow'); if(!row) return;
-  let list = [];
-  try { list = (await (await fetch('/panel/routes')).json()).routes || []; }
-  catch(e){ row.innerHTML = '<span class="pickhint">could not load routes</span>'; return; }
-  if(!list.length){
-    row.innerHTML = '<span class="pickhint">no routes configured — add some in Settings</span>';
-    return;
-  }
-  const savedRaw = localStorage.getItem('crewePanelPick');
-  const saved = savedRaw === null ? null : savedRaw.split(',').filter(Boolean);
-  row.innerHTML = '<span class="pickhint">panel:</span>' + list.map(r => {
-    const on = saved === null ? r.default : saved.includes(r.route);
-    return `<label class="pick${on ? ' on' : ''}">
-      <input type="checkbox" data-route="${r.route}"${on ? ' checked' : ''}>
-      <span>${r.route}</span>
-      ${r.backend ? `<span class="mdl">${r.backend}</span>` : ''}
-      ${r.paid ? '<span class="cost">&#128181;</span>' : ''}
-    </label>`;
-  }).join('');
-  row.querySelectorAll('.pick input').forEach(inp =>
-    inp.addEventListener('change', () => {
-      inp.closest('.pick').classList.toggle('on', inp.checked);
-      localStorage.setItem('crewePanelPick', panelPick().join(','));
-    }));
-}
-loadPanelRoutes();
-</script>
-</body>
-</html>"""
-
-
 COMPARE_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10459,6 +10085,12 @@ COMPARE_PAGE = r"""<!DOCTYPE html>
   .pick.on { border-color:var(--accent); }
   .pick .mdl { color:var(--muted); font-size:11px; }
   .pick .cost { color:var(--accent); font-size:11px; font-weight:600; }
+  .pickinner { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .modesw { display:inline-flex; border:1px solid var(--border);
+            border-radius:999px; overflow:hidden; }
+  .modebtn { background:var(--panel); border:0; color:var(--muted);
+             cursor:pointer; font:600 12px 'DM Sans',sans-serif; padding:6px 14px; }
+  .modebtn.on { background:var(--accent); color:var(--btn-ink); }
 
   /* ---- track card ---- */
   .track { background: var(--panel); border: 1px solid var(--border);
@@ -10559,19 +10191,24 @@ COMPARE_PAGE = r"""<!DOCTYPE html>
   <span class="sub">Direct code vs creative brief → code · judge picks the winner</span>
   <a href="/">← Crewe</a>
   <a href="/scratch" target="_blank">scratchpad ↗</a>
-  <a href="/panel" target="_blank">panel ↗</a>
+  
 </header>
 <div class="ask-bar">
   <div class="ask-inner">
     <textarea id="q" rows="1" placeholder="Ask anything — every selected model gets the same prompt (Enter to run, Shift+Enter for newline)"></textarea>
     <button id="go">Compare ›</button>
   </div>
-  <div class="pickrow" id="pickRow"><span class="pickhint">loading backends…</span></div>
+  <div class="pickrow">
+    <span class="modesw"><button class="modebtn on" data-mode="backends" title="Same system prompt for everyone — judges the models">models</button><button class="modebtn" data-mode="routes" title="Each route brings its own persona — judges your configured setups">routes</button></span>
+    <span id="pickRow" class="pickinner"><span class="pickhint">loading…</span></span>
+  </div>
 </div>
 <div class="page" id="page">
   <div class="idle">
     <div class="icon">⚗️</div>
-    Pick two or more backends above and ask a question.<br>
+    Pick two or more above and ask a question. <b>models</b> gives everyone the
+    same system prompt, so you judge the models; <b>routes</b> gives each its own
+    persona, so you judge your setups.<br>
     They all get the <b>same prompt and the same system prompt</b>, so what you
     are comparing is the models themselves. A judge reads the answers afterwards.
   </div>
@@ -10788,10 +10425,9 @@ function poll(jobId, ids) {
 
 async function run() {
   const question = q.value.trim(); if (!question) return;
-  const ids = [...document.querySelectorAll('.pick input:checked')]
-                .map(i => i.dataset.id);
+  const ids = currentPick();
   if (ids.length < 2) {
-    page.innerHTML = '<div class="idle">Pick at least two backends to compare.</div>';
+    page.innerHTML = `<div class="idle">Pick at least two ${pickMode === 'routes' ? 'routes' : 'models'} to compare.</div>`;
     return;
   }
   go.disabled = true;
@@ -10801,7 +10437,7 @@ async function run() {
   try {
     res = await (await fetch('/compare/ask', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, backends: ids }),
+      body: JSON.stringify({ question, mode: pickMode, targets: ids }),
     })).json();
   } catch (e) {
     page.innerHTML = `<div class="idle">⚠️ Router unreachable: ${esc(String(e))}</div>`;
@@ -10811,37 +10447,55 @@ async function run() {
     page.innerHTML = `<div class="idle">⚠️ ${esc(res.error)}</div>`;
     go.disabled = false; return;
   }
-  poll(res.job_id, res.backends || ids);
+  poll(res.job_id, res.targets || ids);
 }
 
-// ---- backend picker -------------------------------------------------------
-// Names only — /compare is open to any logged-in user, while backend URLs and
-// keys are admin-only, so the server never sends them here.
-async function loadBackends() {
+// ---- target picker ---------------------------------------------------------
+// Two modes because they answer different questions. "models" gives every
+// entrant the SAME system prompt, so what differs is the model. "routes" gives
+// each its own persona, so what differs is your configured setup. Names only —
+// backend URLs and keys are admin-only and never reach this page.
+let pickMode = localStorage.getItem('creweCompareMode') || 'backends';
+function currentPick(){
+  return [...document.querySelectorAll('#pickRow .pick input:checked')]
+           .map(i => i.dataset.id);
+}
+function saveKey(){ return 'creweComparePick:' + pickMode; }
+async function loadTargets(){
   const row = document.getElementById('pickRow');
+  document.querySelectorAll('.modebtn').forEach(b =>
+    b.classList.toggle('on', b.dataset.mode === pickMode));
   let list = [];
-  try { list = (await (await fetch('/compare/backends')).json()).backends || []; }
-  catch (e) { row.innerHTML = '<span class="pickhint">could not load backends</span>'; return; }
+  try { list = (await (await fetch('/compare/targets?mode=' + pickMode)).json()).targets || []; }
+  catch (e) { row.innerHTML = '<span class="pickhint">could not load</span>'; return; }
   if (!list.length) {
-    row.innerHTML = '<span class="pickhint">no backends configured — add some in Settings</span>';
+    row.innerHTML = '<span class="pickhint">nothing configured — see Settings</span>';
     return;
   }
-  const saved = (localStorage.getItem('creweComparePick') || '').split(',').filter(Boolean);
-  row.innerHTML = '<span class="pickhint">compare:</span>' + list.map(b => `
-    <label class="pick${saved.includes(b.id) ? ' on' : ''}">
-      <input type="checkbox" data-id="${esc(b.id)}"${saved.includes(b.id) ? ' checked' : ''}>
-      <span>${esc(b.id)}</span>
-      ${b.model ? `<span class="mdl">${esc(b.model)}</span>` : ''}
-      ${b.paid ? '<span class="cost">💵</span>' : ''}
-    </label>`).join('');
+  const savedRaw = localStorage.getItem(saveKey());
+  const saved = savedRaw === null ? null : savedRaw.split(',').filter(Boolean);
+  row.innerHTML = list.map(t => {
+    const on = saved === null ? !!t.default : saved.includes(t.id);
+    return `<label class="pick${on ? ' on' : ''}">
+      <input type="checkbox" data-id="${esc(t.id)}"${on ? ' checked' : ''}>
+      <span>${esc(t.label)}</span>
+      ${t.sub ? `<span class="mdl">${esc(t.sub)}</span>` : ''}
+      ${t.paid ? '<span class="cost">&#128181;</span>' : ''}
+    </label>`;
+  }).join('');
   row.querySelectorAll('.pick input').forEach(inp =>
     inp.addEventListener('change', () => {
       inp.closest('.pick').classList.toggle('on', inp.checked);
-      localStorage.setItem('creweComparePick',
-        [...row.querySelectorAll('.pick input:checked')].map(i => i.dataset.id).join(','));
+      localStorage.setItem(saveKey(), currentPick().join(','));
     }));
 }
-loadBackends();
+document.querySelectorAll('.modebtn').forEach(b =>
+  b.addEventListener('click', () => {
+    pickMode = b.dataset.mode;
+    localStorage.setItem('creweCompareMode', pickMode);
+    loadTargets();
+  }));
+loadTargets();
 
 q.addEventListener('input', () => { q.style.height='auto'; q.style.height=Math.min(q.scrollHeight,120)+'px'; });
 go.addEventListener('click', run);
