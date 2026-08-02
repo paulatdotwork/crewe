@@ -601,7 +601,9 @@ a verdict.</p>
 <p>The &#128206; button attaches a file to the conversation: PDF, Word, Excel,
 Markdown, CSV, plain text or source code. Crewe extracts the text &mdash; the
 model never sees the original file.</p>
-<p>The &#128230; button attaches a <b>public GitHub repository</b>: paste
+<p><b>Or just paste a GitHub link into your message</b> — "review
+https://github.com/you/repo" fetches and attaches it automatically. The
+&#128230; button does the same thing explicitly: paste
 <code>https://github.com/owner/repo</code> (a <code>/tree/branch</code> suffix
 works too) and Crewe fetches the source, skips binaries, lockfiles and
 <code>node_modules</code>, and attaches it like any document. Then ask for a
@@ -2293,9 +2295,14 @@ _BUILTIN_RULES = {
     "review": ("- 'review': the user wants EXISTING code REVIEWED — 'suggest "
                "improvements', 'code review', 'critique this code', 'audit', "
                "'how would you refactor this', especially about an attached "
-               "repository or pasted code. They want FINDINGS about code that "
-               "already exists, not something new built and not a specific "
-               "reported bug fixed in a live build (those are 'code').\n"),
+               "repository or pasted code. ALSO choose review whenever the "
+               "message contains a github.com repository link together with a "
+               "request to read, review, document, or improve it (e.g. write "
+               "a README, suggest changes) — the repository is fetched and "
+               "attached automatically, so this is NEVER 'search'. They want "
+               "FINDINGS about code that already exists, not something new "
+               "built and not a specific reported bug fixed in a live build "
+               "(those are 'code').\n"),
     "summarize": ("- 'summarize': the user wants EXISTING material condensed — "
                   "'summarise this', 'tl;dr', 'key points', 'what does this "
                   "say', 'brief me on this'. Choose summarize when the user "
@@ -3170,6 +3177,50 @@ def _github_repo_text(url):
             "FILE TREE:\n" + "\n".join(f"  {t}" for t in tree[:GH_MAX_FILES]))
     body = "\n\n".join(f"=== FILE: {rel} ===\n{text}" for rel, text in kept)
     return name, (head + "\n\n" + body)[:MAX_UPLOAD_TEXT]
+
+
+_GH_IN_TEXT = re.compile(r"https?://github\.com/[^\s)\]>'\"]+")
+
+
+def _maybe_attach_github(question: str, session_id: str):
+    """Attach a repo the user linked in their MESSAGE, once per session.
+
+    The 📦 button already existed, but the first thing a real user did was
+    paste the URL straight into the chat — where it routed to web search and
+    produced a review of markdown-viewer spam. A repository link in the
+    question is the clearest possible statement of intent, so honour it.
+    Returns a user-visible note string on failure, None otherwise."""
+    m = _GH_IN_TEXT.search(question or "")
+    if not m or not _github_parse(m.group(0)):
+        return None
+    owner, repo, ref = _github_parse(m.group(0))
+    name = f"{owner}/{repo}" + (f"@{ref}" if ref else "")
+    if any(u.get("name") == name for u in session_uploads(session_id)):
+        return None                      # already attached this session
+    try:
+        name, text = _github_repo_text(m.group(0))
+    except ValueError as e:
+        return (f"[Note for the assistant: the linked GitHub repository "
+                f"could not be attached — {e}. Tell the user this plainly "
+                f"before answering from general knowledge.]")
+    up_id = uuid.uuid4().hex[:16]
+    try:
+        with open(os.path.join(uploads_dir(), f"{up_id}.txt"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as e:
+        print(f"[upload] auto-attach write failed: {e}")
+        return None
+    meta = {"id": up_id, "name": name, "ext": "repo",
+            "chars": len(text), "ts": time.time()}
+    with SESSIONS_LOCK:
+        sess = sessions().setdefault(session_id, {})
+        ups = sess.setdefault("uploads", [])
+        ups.append(meta)
+        if len(ups) > MAX_SESSION_UPLOADS:
+            del ups[:-MAX_SESSION_UPLOADS]
+    _save_memory()
+    return None
 
 
 def session_uploads(session_id: str) -> list:
@@ -5560,6 +5611,18 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
 
     user_content = question
     search_sources: list = []
+
+    # A GitHub repo linked in the message attaches itself before anything is
+    # read — pasting the URL into chat and pressing the 📦 button now mean the
+    # same thing. Runs here (in the job thread) so /ask stays instant.
+    gh_note = None
+    if "github.com/" in question:
+        with JOBS_LOCK:
+            JOBS[job_id]["stage"] = "fetching repository"
+        JOBS[job_id]["stage_ts"] = time.time()
+        gh_note = _maybe_attach_github(question, session_id)
+        if gh_note:
+            user_content = gh_note + "\n\n" + user_content
 
     # Attached documents go to WHATEVER route the question landed on — the file
     # belongs to the session, not to one question, so "summarise this" and
