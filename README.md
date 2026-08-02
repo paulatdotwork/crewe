@@ -1,5 +1,7 @@
 # Crewe
 
+[![tests](https://github.com/paulatdotwork/crewe/actions/workflows/tests.yml/badge.svg)](https://github.com/paulatdotwork/crewe/actions/workflows/tests.yml)
+
 **A self-hosted junction for your local LLMs.** Crewe reads each question, classifies it with a small fast model, and routes it to the right specialist — cooking, creative writing, a dedicated coder, reasoning, live web search — running on your own hardware, hosted APIs, or any mix.
 
 > Named for Crewe, the Cheshire town that exists because railway lines met there.
@@ -115,6 +117,12 @@ Word and Excel files (plain text and source files need nothing extra).
   secret — all gitignored.** `router_config.json` can hold API keys and
   `crewe_secret` signs sessions; never commit either.
 - Cookbook photos come from public web image search: fine for personal use.
+
+## Testing
+
+384 contract-based tests run without any model server — see
+[docs/TESTING.md](docs/TESTING.md). CI runs the same suite on every push and
+pull request.
 
 ## Licence
 
