@@ -12,9 +12,11 @@
 - A lightweight classifier picks the specialist per question; short continuations ("no", "keep going") stick with the previous route
 - **Settings UI** (`/settings`): register backends by type — **llama.cpp**, **Ollama**, **Claude (Anthropic)**, or any OpenAI-compatible server or hosted API — and point any route at any backend, add custom routes — with an AI helper that drafts the routing rule and a **live routing test** that runs your example questions through the real classifier before you commit. Changes apply live, no restart.
 - Route health dots in the header — see a dead backend at a glance
-- **Effort levels for coding**: register a fast model and a capable one, then
-  pick per question. Budgets are sized automatically from each backend's real
-  context window, so a small model is never handed a prompt it cannot hold
+- **Effort tiers for coding** — *fast*, *normal* and *extra*: register your
+  quickest model, your everyday one, and your strongest (often a paid API),
+  then pick per question. Budgets are sized automatically from each backend's
+  real context window, so a small model is never handed a prompt it cannot
+  hold, and any tier you skip falls back to the one above it
 
 **Coding that proves itself**
 - Agentic code pipeline: plan → per-step build → foreman check → delivery inspection → real-browser runtime gate

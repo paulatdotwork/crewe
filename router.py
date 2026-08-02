@@ -496,11 +496,12 @@ switch chooses between.</li>
 </div>
 
 <div class="card">
-<h2>3. Effort: two coders</h2>
+<h2>3. Effort: three coders</h2>
 <p>Coding questions are the expensive ones, so they get a switch. The
 <b>Effort</b> dropdown next to the message box picks between your
-<b>easy coder</b> and your <b>hard coder</b>. It is ignored for every other
-kind of question.</p>
+<b>fast</b>, <b>normal</b> and <b>extra</b> coders — quickest, everyday, and
+strongest. It is ignored for every other kind of question. A tier you have
+not wired up simply falls back to the one above it.</p>
 <p>Effort changes more than the model. Crewe asks each coder how big its
 context window is and sizes the prompt budgets to match, so a small model is
 never handed a prompt it cannot hold &mdash; the classic way a capable little
@@ -558,12 +559,11 @@ is the most common reason a new backend 404s.</p>
 <p>Tick <b>this backend costs money</b> and enter the per-million-token prices
 from your provider's pricing page. Then Crewe can tell you what you are
 spending, and the Effort dropdown will mark which option bills you.</p>
-<p>Neither level means "paid" &mdash; both coders can be local, both can be
-hosted, or one of each, whichever way round suits you. A common arrangement is
-a small local model on easy and a large one on hard, with nothing billed at
-all. But if one of them <i>is</i> a paid API, Effort becomes a per-question
-decision about whether this particular answer is worth money, and Crewe marks
-the option that bills you with a &#128181;.</p>
+<p>No tier means "paid" &mdash; each of the three can be local or hosted,
+whichever suits you. A common arrangement is a tiny local model on fast, a
+solid local model on normal, and a paid API on extra, so nothing bills unless
+you choose it per question. Crewe marks any tier that costs money with a
+&#128181; in the dropdown.</p>
 <p class="note"><b>Spend figures are estimates.</b> They use the prices you
 typed and the token counts your provider reported &mdash; or a rough
 four-characters-per-token guess if it reported none. Useful as a running
@@ -1191,7 +1191,8 @@ def _prune_jobs(jobs, keep_done=50):
 #   the budgets must follow the model, which is what _budgets_for() does.
 #   Docs: code-pipeline-A.md / code-pipeline-B.md.
 CODE_AGENT_URL      = SPECIALISTS["code"]        # remote Qwen3.6-35B coder, 128k ctx
-CODE_AGENT_URL_FAST = CODE_AGENT_URL             # easy effort; _apply_router_config sets it
+CODE_AGENT_URL_FAST  = CODE_AGENT_URL   # "normal" tier; _apply_router_config sets it
+CODE_AGENT_URL_QUICK = CODE_AGENT_URL   # "fast" tier; falls back down the chain
 _BUDGETS_READY = False   # True once _refresh_budgets() exists (defined below)
 # CODE_AGENT_URL    = SPECIALISTS["reasoning"]   # local 26B on 8087 (drop STEP_FILE_CHARS back to 24000)
 STEP_TEMP           = 0.2    # explicit low temp — never write code at the server's default (1.0)
@@ -2359,7 +2360,8 @@ def _default_router_config():
             "roles": {"classifier": "classifier-e2b",
                       "summarizer": "summarizer-e4b",
                       "coder": "coder-qwen",
-                      "coder_fast": "code-e4b"}}
+                      "coder_fast": "code-e4b",
+                      "coder_quick": "code-e4b"}}
 
 
 def _load_router_config():
@@ -2447,7 +2449,7 @@ def _apply_router_config(cfg):
     """Swap the live routing tables to match cfg. Called at import and on
     every settings save — readers pick up the new dicts atomically."""
     global SPECIALISTS, VALID, CLASSIFIER, SUMMARIZER, CODE_AGENT_URL, \
-        CODE_AGENT_URL_FAST, \
+        CODE_AGENT_URL_FAST, CODE_AGENT_URL_QUICK, \
         CLASSIFIER_SYSTEM, BACKEND_INFO, ROUTER_CONFIG, ROUTE_MODELS
     with CONFIG_LOCK:
         b_by_id = {b["id"]: b for b in cfg["backends"]}
@@ -2485,6 +2487,9 @@ def _apply_router_config(cfg):
         # Easy-effort coder. Absent in configs written before effort existed,
         # in which case both levels use the deep coder -> identical behaviour.
         CODE_AGENT_URL_FAST = role_url("coder_fast", CODE_AGENT_URL)
+        # The fast tier falls back to normal, which falls back to extra — an
+        # older config with fewer coder roles keeps working at every level.
+        CODE_AGENT_URL_QUICK = role_url("coder_quick", CODE_AGENT_URL_FAST)
         CLASSIFIER_SYSTEM = _build_classifier_system(cfg)
         BACKEND_INFO = binfo
         ROUTE_MODELS = rmodels
@@ -3256,23 +3261,35 @@ STEP_MAX_TOKENS = int(os.environ.get("CREWE_STEP_MAX_TOKENS", "0"))
 # NOTE: whichever level is active, plan/execute/check all run on ONE model.
 # Never split them across the two coders -- mixing models inside a single
 # pipeline has produced worse output than either model alone, twice.
-EFFORTS        = ("easy", "hard")
-DEFAULT_EFFORT = "hard"     # an absent param == the behaviour before effort
+EFFORTS        = ("fast", "normal", "extra")
+# Old names stay valid forever: browsers persist the choice in localStorage
+# and older clients send it in requests, so a rename must never break them.
+EFFORT_ALIASES = {"easy": "normal", "hard": "extra"}
+# "normal", NOT "extra": an absent parameter must never silently select the
+# paid tier. (Before the three-tier rename the absent default was the deep
+# coder; anyone relying on that sends the value explicitly anyway — the UI
+# always does.)
+DEFAULT_EFFORT = "normal"
 
 # Non-budget knobs. Put stage toggles here if the easy path should later SKIP
 # verification stages rather than just run them smaller -- then it stays a
 # constant change, not a code change.
 EFFORT_TUNING = {
-    "hard": {"label": "Hard",
-             "max_plan_steps":  MAX_PLAN_STEPS,
-             "extra_steps":     EXTRA_STEPS,
-             "step_max_tokens": STEP_MAX_TOKENS,
-             "step_fix_rounds": STEP_FIX_ROUNDS},
-    "easy": {"label": "Easy",
+    "extra": {"label": "Extra",
+              "max_plan_steps":  MAX_PLAN_STEPS,
+              "extra_steps":     EXTRA_STEPS,
+              "step_max_tokens": STEP_MAX_TOKENS,
+              "step_fix_rounds": STEP_FIX_ROUNDS},
+    "normal": {"label": "Normal",
+               "max_plan_steps":  16,
+               "extra_steps":     6,
+               # 0 = uncapped on EVERY tier: a cap that binds mid-file lets a
+               # truncated rewrite pass the elision guard and destroy the file.
+               "step_max_tokens": 0,
+               "step_fix_rounds": 2},
+    "fast": {"label": "Fast",
              "max_plan_steps":  10,
              "extra_steps":     4,
-             # 0 = uncapped, on ANY model: a cap that binds mid-file lets a
-             # truncated rewrite pass the elision guard and destroy the file.
              "step_max_tokens": 0,
              "step_fix_rounds": 2},
 }
@@ -3282,16 +3299,19 @@ EFFORT_BUDGETS = {}    # level -> budget dict; filled by _refresh_budgets()
 def _refresh_budgets():
     """Re-probe both coders and size each level's budgets to its own window."""
     global EFFORT_BUDGETS, CODER_CTX
-    hard, n_hard = _budgets_for(CODE_AGENT_URL)
-    if CODE_AGENT_URL_FAST == CODE_AGENT_URL:
-        easy, n_easy = dict(hard), n_hard          # one coder, one probe
-    else:
-        easy, n_easy = _budgets_for(CODE_AGENT_URL_FAST)
-    EFFORT_BUDGETS = {"hard": hard, "easy": easy}
-    CODER_CTX = n_hard
-    print(f"[code] effort budgets — hard: {hard['small_project_chars']:,} chars "
-          f"(ctx {n_hard or '?'}), easy: {easy['small_project_chars']:,} chars "
-          f"(ctx {n_easy or '?'})")
+    urls = {"extra": CODE_AGENT_URL, "normal": CODE_AGENT_URL_FAST,
+            "fast": CODE_AGENT_URL_QUICK}
+    probed = {}                                  # one probe per distinct URL
+    out = {}
+    for lvl, u in urls.items():
+        if u not in probed:
+            probed[u] = _budgets_for(u)
+        out[lvl] = probed[u]
+    EFFORT_BUDGETS = {lvl: b for lvl, (b, _n) in out.items()}
+    CODER_CTX = out["extra"][1]
+    print("[code] effort budgets — " + ", ".join(
+        f"{lvl}: {b['small_project_chars']:,} chars (ctx {n or '?'})"
+        for lvl, (b, n) in out.items()))
 
 
 # Thread-local, mirroring set_owner/_owner: the pipeline reads these budgets at
@@ -3306,6 +3326,7 @@ _EFFORT = threading.local()
 
 
 def set_effort(level):
+    level = EFFORT_ALIASES.get(level, level)
     _EFFORT.level = level if level in EFFORTS else DEFAULT_EFFORT
 
 
@@ -3315,7 +3336,12 @@ def _effort():
 
 def coder_url():
     """The coder backend for the ACTIVE effort level."""
-    return CODE_AGENT_URL_FAST if _effort() == "easy" else CODE_AGENT_URL
+    lvl = _effort()
+    if lvl == "fast":
+        return CODE_AGENT_URL_QUICK
+    if lvl == "normal":
+        return CODE_AGENT_URL_FAST
+    return CODE_AGENT_URL
 
 
 def _budget(key):
@@ -5754,6 +5780,8 @@ def settings_save():
     # Optional: absent means "use the deep coder for both effort levels".
     if roles.get("coder_fast") and roles["coder_fast"] not in set(ids):
         errs.append("role 'coder_fast': unknown backend")
+    if roles.get("coder_quick") and roles["coder_quick"] not in set(ids):
+        errs.append("role 'coder_quick': unknown backend")
     if errs:
         return jsonify({"ok": False, "errors": errs}), 400
     clean = {"backends": backends, "routes": routes, "roles": roles}
@@ -5955,12 +5983,14 @@ def spend():
     with CONFIG_LOCK:
         paid_routes = sorted(r for r, u in SPECIALISTS.items() if _is_paid(u))
         any_paid = any(_is_paid(u) for u in set(SPECIALISTS.values())) \
-            or _is_paid(CODE_AGENT_URL) or _is_paid(CODE_AGENT_URL_FAST)
+            or _is_paid(CODE_AGENT_URL) or _is_paid(CODE_AGENT_URL_FAST) \
+            or _is_paid(CODE_AGENT_URL_QUICK)
     s = spend_summary()
     s["paid_routes"] = paid_routes
     s["any_paid"] = bool(any_paid)
-    s["coder_paid"] = {"easy": _is_paid(CODE_AGENT_URL_FAST),
-                       "hard": _is_paid(CODE_AGENT_URL)}
+    s["coder_paid"] = {"fast": _is_paid(CODE_AGENT_URL_QUICK),
+                       "normal": _is_paid(CODE_AGENT_URL_FAST),
+                       "extra": _is_paid(CODE_AGENT_URL)}
     return jsonify(s)
 
 
@@ -6051,6 +6081,7 @@ def ask():
     # The UI always sends effort, but it is only ever consulted for the code
     # route — every other specialist has exactly one backend to go to.
     effort = str(body.get("effort", "")).lower()
+    effort = EFFORT_ALIASES.get(effort, effort)
     effort = effort if effort in EFFORTS else DEFAULT_EFFORT
 
     job_id = uuid.uuid4().hex
@@ -7627,9 +7658,10 @@ PAGE = r"""<!DOCTYPE html>
         <textarea id="q" rows="1" placeholder="Ask anything…  (Enter to send, Shift+Enter for newline)"></textarea>
         <input type="file" id="fileIn" hidden>
         <button id="attach" class="attach-btn" title="Attach a document — pdf, docx, xlsx, txt, md, csv…">&#128206;</button>
-        <select id="effort" title="Only applies to coding answers. Hard uses the larger, slower coder.">
-          <option value="hard">Effort: Hard</option>
-          <option value="easy">Effort: Easy</option>
+        <select id="effort" title="Only applies to coding answers. Higher tiers use larger, slower models.">
+          <option value="fast">Effort: Fast</option>
+          <option value="normal" selected>Effort: Normal</option>
+          <option value="extra">Effort: Extra</option>
         </select>
         <button id="go">Send</button>
       </div>
@@ -8130,7 +8162,12 @@ if(attachBtn){
 // code — every other specialist has exactly one backend.
 const effortSel=document.getElementById('effort');
 if(effortSel){
-  effortSel.value = localStorage.getItem('creweEffort') || 'hard';
+  // Browsers that saved a choice before the rename hold "easy"/"hard".
+  const _alias={easy:'normal',hard:'extra'};
+  let _saved=localStorage.getItem('creweEffort')||'normal';
+  effortSel.value=_alias[_saved]||_saved;
+  if(!effortSel.value||![...effortSel.options].some(o=>o.value===effortSel.value))
+    effortSel.value='normal';
   effortSel.addEventListener('change',()=>{
     localStorage.setItem('creweEffort', effortSel.value);
   });
@@ -8150,19 +8187,19 @@ async function refreshSpend(){
     const help=document.getElementById('effortHelp');
     const sel=document.getElementById('effort');
     if(sel&&s.coder_paid){
+      const LBL={fast:'Fast',normal:'Normal',extra:'Extra'};
       [...sel.options].forEach(o=>{
-        const paid=s.coder_paid[o.value];
-        o.textContent='Effort: '+(o.value==='hard'?'Hard':'Easy')+(paid?' 💵':'');
+        o.textContent='Effort: '+(LBL[o.value]||o.value)+(s.coder_paid[o.value]?' 💵':'');
       });
-      // Either coder can be local or paid — neither level implies cost.
-      // Say only what this install's config actually is.
+      // Any tier can be local or paid — no level implies cost. Say only what
+      // this install's config actually is.
       if(help){
-        const ph=s.coder_paid.hard, pe=s.coder_paid.easy;
+        const paid=Object.keys(LBL).filter(k=>s.coder_paid[k]);
         const base='Effort applies only to coding answers — ';
-        if(ph&&pe)       help.innerHTML=base+'<b>both coders cost money</b>';
-        else if(ph)      help.innerHTML=base+'Easy is free, <b>Hard costs money</b>';
-        else if(pe)      help.innerHTML=base+'<b>Easy costs money</b>, Hard is free';
-        else             help.textContent=base+'more effort takes longer';
+        if(!paid.length)             help.textContent=base+'higher tiers take longer';
+        else if(paid.length===3)     help.innerHTML=base+'<b>every tier costs money</b>';
+        else help.innerHTML=base+'<b>'+paid.map(k=>LBL[k]).join(' and ')+
+                            (paid.length>1?' cost':' costs')+' money</b>, the rest are free';
       }
     }
     const tag=document.getElementById('spendTag');
@@ -9844,18 +9881,22 @@ function render(){
   // ---- add-route backend select + roles
   document.getElementById('nrBackend').innerHTML=backendOptions(null);
   const rr=document.getElementById('rolesRow');
-  // Older configs have no coder_fast — seed it from the deep coder so the
+  // Older configs may lack the newer coder roles — seed each missing one from
+  // the tier above it, mirroring the server's own fallback chain, so the
   // select and the saved config never disagree about what is selected.
-  if(!cfg.roles.coder_fast) cfg.roles.coder_fast = cfg.roles.coder;
+  if(!cfg.roles.coder_fast)  cfg.roles.coder_fast  = cfg.roles.coder;
+  if(!cfg.roles.coder_quick) cfg.roles.coder_quick = cfg.roles.coder_fast;
   const ROLE_INFO=[
     ['classifier','classifier',
      'Reads every question and picks the route. Small and fast — this one runs on each request.'],
     ['summarizer','summarizer',
      'Condenses older conversation turns. Small and fast is fine.'],
-    ['coder_fast','easy coder',
-     'Used when Effort is set to Easy. Put a SMALL, FAST model here — it trades depth for a quick answer.'],
-    ['coder','hard coder',
-     'Used when Effort is set to Hard. Put a LARGER, SLOWER, more capable model here. Budgets are sized automatically from whatever you choose.'],
+    ['coder_quick','fast coder',
+     'Used when Effort is Fast. Put your SMALLEST, QUICKEST model here — instant drafts, simple asks.'],
+    ['coder_fast','normal coder',
+     'Used when Effort is Normal — the everyday default. A solid mid-size model belongs here.'],
+    ['coder','extra coder',
+     'Used when Effort is Extra. Your STRONGEST model — often a paid API. Budgets are sized automatically from whatever you choose.'],
   ];
   rr.innerHTML=ROLE_INFO.map(([role,label,help])=>`
     <div><label class="f">${label}</label>
