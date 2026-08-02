@@ -509,6 +509,14 @@ model is made to look stupid.</p>
 <p class="note">Whichever level you pick, planning, writing and checking all
 happen on <b>one</b> model. Mixing two models inside a single build produces
 worse results than either one alone.</p>
+<p>Every build is checked after it is written: it is loaded in a real
+browser, its behaviour is tested, and a vision model looks at a screenshot.
+What happens to the findings is the <code>CREWE_AUTOFIX</code> environment
+variable: <code>doa</code> (the default) repairs only builds that are dead on
+arrival and reports everything else as warnings under the answer;
+<code>full</code> spends extra rounds fixing what the checks and the
+screenshot reviewer flag; <code>off</code> never repairs. A reply that gets
+cut off mid-file is resumed with a continuation call at any setting.</p>
 </div>
 
 <div class="card">
@@ -1328,7 +1336,10 @@ VISION_SYSTEM = (
     "styling where a designed interface was expected.\n"
     "Judge ONLY what is visible in the image. Never guess about behaviour you "
     "cannot see (clicks, saving, drag), and never ask for anything that was not "
-    "requested.\n"
+    "requested. States that only appear after interaction — a toggled button's "
+    "other state, open menus, hover effects, filled-in data — are INVISIBLE "
+    "here; never report them as missing. Zeroed counters and empty lists on a "
+    "freshly loaded app are its correct empty state, not defects.\n"
     "If the page looks built, styled and coherent, reply with exactly: LOOKS GOOD\n"
     "Otherwise list ONLY what is visibly wrong or missing, one per line, most "
     "important first, at most 5 lines. No commentary, no code, no headings."
@@ -1429,7 +1440,11 @@ def _vision_critique(shot, goal, features, job_id=None):
         {"role": "user", "content": [
             {"type": "text",
              "text": f"The build was asked for:\n{want}\n\n"
-                     f"Overall goal: {goal}\n\nReview the screenshot."},
+                     f"Overall goal: {goal}\n\n"
+                     "The screenshot is a full-page capture of the app at "
+                     "FIRST LOAD in a fresh browser profile: storage is "
+                     "empty and nothing has been clicked or typed yet.\n\n"
+                     "Review the screenshot."},
             {"type": "image_url",
              "image_url": {"url": f"data:image/png;base64,{b64}"}}]}],
         "stream": False, "temperature": 0.2, "max_tokens": 600,
@@ -1454,6 +1469,57 @@ def _vision_critique(shot, goal, features, job_id=None):
             continue
         out.append(m)
     return out[:5]
+
+
+def _overlap_trim(head, cont):
+    """Drop from `cont` any prefix that repeats the tail of `head` — a model
+    asked to continue usually re-emits the last line or two before new text."""
+    for k in range(min(len(head), len(cont), 2000), 19, -1):
+        if cont.startswith(head[-k:]):
+            return cont[k:]
+    return cont
+
+
+_CONTINUE_PROMPT = (
+    "Your reply above was cut off mid-file — the final code fence never "
+    "closed. Continue from EXACTLY where it stopped: output ONLY the "
+    "remaining text of that file, then its closing ``` fence, then any files "
+    "you had not started yet (in the standard format). Do NOT repeat "
+    "anything already written, do NOT restart the interrupted file, do NOT "
+    "open a new fence for it, no commentary.")
+
+
+def _continue_truncated(job_id, out, step_system, user, idx, mem):
+    """One continuation call to finish a reply whose last fence never closed.
+
+    Redoing a 4k-token file because the stream died at 90% costs a whole
+    fresh call and often just truncates again; resuming from the cut point
+    recovers the work already done. The splice is kept only when it actually
+    closes the fence — a continuation that restarts the file or truncates
+    again leaves `out` unchanged, and _drop_truncated handles it as before."""
+    if not out or "```" not in out or out.count("```") % 2 == 0:
+        return out
+    try:
+        cont = _strip_think(_stream_chat(
+            coder_url(),
+            [{"role": "system", "content": step_system},
+             {"role": "user", "content": user},
+             {"role": "assistant", "content": out},
+             {"role": "user", "content": _CONTINUE_PROMPT}], job_id,
+            temperature=0.2, label=f"step{idx}-continue"))
+    except Exception as e:
+        _mem_note(mem, f"Step {idx}: reply was cut off mid-file and the "
+                       f"continuation call failed ({e})")
+        return out
+    merged = out + _overlap_trim(out, cont)
+    if merged.count("```") % 2 == 0:
+        _mem_note(mem, f"Step {idx}: reply was cut off mid-file; a "
+                       f"continuation call recovered the rest")
+        _trace(job_id, "continue", step=idx, ok=True,
+               added=len(merged) - len(out))
+        return merged
+    _trace(job_id, "continue", step=idx, ok=False, added=len(cont))
+    return out
 
 
 def _drop_truncated(new, out, idx, warnings, mem):
@@ -4247,6 +4313,18 @@ def _browser_check(files):
                 pass
         shot = os.path.join(run_dir, "screenshot.png")
         try:
+            # Full-page capture: the default viewport crops anything below
+            # the fold and the vision critic then reports it "cut off at the
+            # bottom". Height is capped so an infinite feed can't produce a
+            # PNG the vision model chokes on.
+            h = driver.execute_script(
+                "return Math.max(document.documentElement.scrollHeight,"
+                "document.body.scrollHeight, 700)")
+            driver.set_window_size(1100, min(int(h) + 130, 4000))
+            time.sleep(0.4)
+        except Exception:
+            pass
+        try:
             driver.save_screenshot(shot)
         except Exception:
             shot = None
@@ -4833,6 +4911,7 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
                  {"role": "user", "content": user}], job_id,
                 temperature=temp or STEP_TEMP, label=f"step{idx}-needfiles")
             out = _strip_think(out)
+        out = _continue_truncated(job_id, out, step_system, user, idx, mem)
         new = _extract_files(out, existing=files, default_name=step_target)
         # Merge, and if NOTHING survives the guards, retry ONCE with the real
         # reason fed back. Testing only `new` (files PARSED) was a bug: a
@@ -4886,6 +4965,8 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
                 max_tokens=step_max_tokens() * 2 if capped else None,
                 label=f"step{idx}-retry")
             out = _strip_think(out)
+            out = _continue_truncated(job_id, out, step_system,
+                                      _retry_note(why, fixable) + user, idx, mem)
             new = _extract_files(out, existing=files, default_name=step_target)
     except Exception as e:
         warnings.append(f"step {idx} ({step['title']}): aborted — {e}")
