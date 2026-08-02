@@ -107,9 +107,11 @@ Word and Excel files (plain text and source files need nothing extra).
 - Auth is real, but the exposure is yours to judge: the code route executes
   model-written code on the host (headless browser + node) and is admin-only
   for that reason. Think before opening it to people you don't know.
-- The classifier is a small model — routing quality degrades past ~9–10
-  routes. The settings page warns you, and the routing test tells you the
-  truth per route.
+- The classifier is a small model, but route count is not the limit it looks
+  like: benchmarked on a fixed question set it held its accuracy through
+  eleven routes. What hurts it is a vague subject overlapping another
+  route's territory — the routing test on the settings page tells you the
+  truth per route before you commit.
 - Server-side state lives in your **home directory**, not the checkout:
   `~/crewe_userdata/<user-id>/` (documents, sheets, cookbook, photos, uploads,
   conversation memory), plus `~/crewe_users.json`, `~/crewe_secret` and

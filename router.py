@@ -540,10 +540,11 @@ one-line description, and <b>&#129514; test</b> runs your <i>real</i>
 classifier over example questions with the candidate route in place, so you can
 see what it actually decides before you commit.</p>
 <p class="note"><b>Test a counter-example, not just the obvious hits.</b> The
-classifier is a small model and its accuracy degrades past roughly nine or ten
-routes. The useful test for a D&amp;D route is not "build me a rogue" &mdash;
-it is "beef stew for my character's tavern", which should still go to
-recipes.</p>
+classifier is a small model, but measured on a fixed question set it held its
+accuracy through eleven routes — what actually hurts it is not the number of
+routes but a vague subject that overlaps another route's territory. The
+useful test for a D&amp;D route is not "build me a rogue" &mdash; it is "beef
+stew for my character's tavern", which should still go to recipes.</p>
 </div>
 
 <div class="card">
@@ -2350,7 +2351,9 @@ _BUILTIN_RULES = {
                "latest', or any fact likely to have changed since training or "
                "that you can't be sure of. Choose search whenever fresh or "
                "verifiable web information would matter.\n"),
-    "recipes": "- 'recipes': food, cooking, baking, drinks, meal planning.\n",
+    "recipes": "- 'recipes': food, cooking, baking, drinks, meal planning — "
+               "including why a dish or bake came out wrong and what pairs "
+               "well with a food or meal.\n",
     "code": ("- 'code': ANYTHING asking to build, create, make, generate, "
              "write, or fix something that produces a working artifact — "
              "website, app, program, function, HTML, CSS, JSON, SQL, etc. "
