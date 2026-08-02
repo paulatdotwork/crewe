@@ -12,8 +12,39 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
       - name: Install dependencies
         run: pip install flask requests pypdf python-docx openpyxl
-      - name: Run the suite
-        run: bash tests/run_all.sh
+      # One step per suite so a failure names its suite in the run summary.
+      - name: auth
+        run: python3 tests/test_auth.py
+      - name: tenancy
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_tenancy.py
+      - name: invite
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_invite.py
+      - name: harden
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_harden.py
+      - name: effort
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_effort.py
+      - name: summarize
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_summarize.py
+      - name: cost
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_cost.py
+      - name: backend-kinds
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_backend_kinds.py
+      - name: compare
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_compare.py
+      - name: compare-thinking
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_compare_thinking.py
+      - name: truncation
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_truncation.py

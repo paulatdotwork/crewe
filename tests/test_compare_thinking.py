@@ -62,7 +62,7 @@ finally:
         router.COMPARE_JOBS.pop("j1", None)
 
 # both judges must keep theirs too (they already had it — guard against regress)
-src = open(os.path.expanduser("~/router.py")).read()
+src = open(router.__file__).read()
 check("compare judge keeps thinking off",
       src.count("enable_thinking") >= 10, src.count("enable_thinking"))
 
