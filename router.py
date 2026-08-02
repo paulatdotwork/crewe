@@ -1573,18 +1573,31 @@ def _merge_output_file(name, content, files, allowed, warnings, tag, mem=None):
         # one-line new file (`let a=1;`) must still be accepted.
         warnings.append(f"{tag}: refused {name} — it contains no actual code "
                         f"(looks like an echoed format example)")
+        _mem_note(mem, f"{tag}: a block named {name} held no code (an echoed "
+                       f"format example) and was REFUSED. Never repeat the "
+                       f"format example back — emit only real project files.")
         return None
     if files and re.fullmatch(r"file\d+\.\w+", name):
         # an auto-named fallback file means the model forgot the path line —
-        # in an existing project that's a mislabeled duplicate, never a file
+        # in an existing project that's a mislabeled duplicate, never a file.
+        # This used to reject SILENTLY, so the model repeated the mistake in
+        # the same step — twice in one observed run. Tell it what went wrong.
         warnings.append(f"{tag}: rejected an unlabeled code block "
                         f"(would have become junk file '{name}')")
+        _mem_note(mem, f"{tag}: a code block had NO filename line above its "
+                       f"fence and was THROWN AWAY as '{name}'. Every fenced "
+                       f"block must have its file path on the line directly "
+                       f"above the fence — re-emit that work with the path.")
         return None
     if _DIFF_BLOCK.search(content):
         base = files.get(name)
         if base is None:
             warnings.append(f"{tag}: {name} arrived as edits to a file "
                             f"that doesn't exist")
+            _mem_note(mem, f"{tag}: you sent SEARCH/REPLACE edits for {name}, "
+                           f"which does not exist, so they were DROPPED. New "
+                           f"files must be written IN FULL — path line, then a "
+                           f"fenced block with the whole content.")
             return None
         patched, ok, tot, failed = _apply_diff(base, content)
         if tot and ok == tot:
@@ -2299,7 +2312,14 @@ ANTHROPIC_VERSION = "2023-06-01"
 # Anthropic requires max_tokens on every request; OpenAI treats it as optional
 # and Crewe often omits it (or uses 0 to mean "uncapped"). Neither is legal
 # there, so an omitted cap becomes this.
-ANTHROPIC_DEFAULT_MAX_TOKENS = int(os.environ.get("CREWE_ANTHROPIC_MAX_TOKENS", "8192"))
+# 32768, not 8192: this fills in when Crewe would send no cap (its 0 means
+# "uncapped", which Anthropic does not allow). A whole-file rewrite can pass
+# 8k output tokens, and this project already learned the hard way that a cap
+# binding MID-FILE destroys work — the truncated file passes the elision
+# guard and overwrites the good version. Anthropic bills actual tokens, not
+# the cap, so the higher ceiling costs nothing; every current Claude model
+# allows at least 64k out.
+ANTHROPIC_DEFAULT_MAX_TOKENS = int(os.environ.get("CREWE_ANTHROPIC_MAX_TOKENS", "32768"))
 
 
 def _kind(backend_or_url):
@@ -2697,6 +2717,9 @@ def _backend_ctx(url, timeout=6):
         return None
 
 
+BUDGET_CAP_CHARS = int(os.environ.get("CREWE_BUDGET_CAP_CHARS", "160000"))
+
+
 def _budgets_for(url):
     """Size the file budgets to whatever coder is plugged into `url`.
 
@@ -2724,8 +2747,18 @@ def _budgets_for(url):
     # ~30% of the window for project files (~4 chars/token), leaving room for
     # the plan, working memory, the step text and the whole generation.
     chars = int(n * 0.30) * 4
-    print(f"[code] coder ctx {n:,} tokens -> whole-project budget "
-          f"{chars:,} chars (~{chars // 4:,} tokens), hard {chars * 2:,}")
+    # CAPPED. The 30% rule was written for local models, where context is
+    # free. Fed Claude's 1,000,000-token window it produced a 1.2M-char
+    # budget — ~300k tokens of prompt PER STEP on a metered API. Past ~40k
+    # tokens of project text more context stops helping anyway. The cap is
+    # the long-standing 160k default, tunable for whoever disagrees.
+    if chars > BUDGET_CAP_CHARS:
+        print(f"[code] coder ctx {n:,} tokens -> autosized budget "
+              f"{chars:,} chars CAPPED at {BUDGET_CAP_CHARS:,}")
+        chars = BUDGET_CAP_CHARS
+    else:
+        print(f"[code] coder ctx {n:,} tokens -> whole-project budget "
+              f"{chars:,} chars (~{chars // 4:,} tokens), hard {chars * 2:,}")
     return {"small_project_chars": chars,
             "step_file_chars":     chars,
             "step_file_hard":      chars * 2}, n
@@ -6871,6 +6904,7 @@ def _stream_into(url: str, payload: dict, job_id: str, field: str,
     jobs = COMPARE_JOBS if jobs is None else jobs
     lock = COMPARE_JOBS_LOCK if lock is None else lock
     parts, usage = [], None
+    think_n = 0
     try:
         payload = _with_usage(_inject_model(payload, url, route), url)
         with requests.post(url, json=payload, headers=_hdrs(url),
@@ -6890,9 +6924,16 @@ def _stream_into(url: str, payload: dict, job_id: str, field: str,
                             usage = chunk["usage"]
                         if not chunk.get("choices"):
                             continue
-                        delta = chunk["choices"][0]["delta"].get("content", "")
+                        d = chunk["choices"][0]["delta"]
+                        delta = d.get("content", "")
+                        if d.get("reasoning_content"):
+                            think_n += 1
                         if delta:
                             parts.append(delta)
+                        # count hidden reasoning too, so the pane's counter
+                        # moves during a thinking model's think phase instead
+                        # of sitting at 0 looking like a dead backend
+                        if delta or d.get("reasoning_content"):
                             with lock:
                                 jobs[job_id][field]["tokens"] += 1
                     except Exception:
@@ -6900,6 +6941,15 @@ def _stream_into(url: str, payload: dict, job_id: str, field: str,
     except Exception as e:
         parts.append(_specialist_error(field, url, e))
     out = "".join(parts)
+    # Belt and braces: some chat templates ignore enable_thinking:false. When
+    # that happens the whole budget goes to reasoning_content and this pane is
+    # blank (or one truncated sentence), which reads as a broken backend. Say
+    # what actually happened rather than showing an empty box.
+    if think_n and len(out.strip()) < 200:
+        out += (f"\n\n*(this backend spent its budget on hidden reasoning "
+                f"({think_n} thinking chunks) and returned little or no visible "
+                f"answer — its chat template appears to ignore "
+                f"`enable_thinking: false`)*")
     # A shoot-out can include paid backends — bill them like anything else.
     record_spend(url, f"compare:{field}", usage,
                  json.dumps(payload.get("messages", ""))[:20000], out)
@@ -6953,9 +7003,15 @@ def run_compare_backend(job_id: str, bid: str, url: str, question: str,
     `system` differs by mode and is the whole point of having two: comparing
     MODELS gives every entrant the same system prompt so you judge the models;
     comparing ROUTES gives each its own persona so you judge the setups."""
+    # Thinking OFF, same as both judges. An entrant is capped at max_tokens, and
+    # a reasoning model spends that entire budget on reasoning_content — the
+    # pane then shows nothing, or the one sentence it managed before the cap.
+    # Measured on Qwen3.6-27B (.53): 800-token budget → 800 thinking tokens and
+    # a half-finished opening sentence; with the flag → a complete answer in 243.
     payload = {"messages": [{"role": "system", "content": system or COMPARE_SYSTEM},
                             {"role": "user", "content": question}],
-               "stream": True, "max_tokens": 1400}
+               "stream": True, "max_tokens": COMPARE_MAX_TOKENS,
+               "chat_template_kwargs": {"enable_thinking": False}}
     answer = _stream_into(url, payload, job_id, bid, route=route)
     with COMPARE_JOBS_LOCK:
         pane = COMPARE_JOBS.get(job_id, {}).get(bid)
@@ -6988,7 +7044,7 @@ def _check_compare_judge(job_id: str, question: str):
         return
 
     blocks = "\n\n".join(
-        f"=== {bid} ===\n{ans[:2500]}" for bid, ans in answers)
+        f"=== {bid} ===\n{ans[:COMPARE_JUDGE_EXCERPT]}" for bid, ans in answers)
     payload = {
         "messages": [
             {"role": "system", "content": COMPARE_JUDGE_SYSTEM},
@@ -7079,6 +7135,17 @@ def compare_targets_route():
 
 
 COMPARE_MAX_BACKENDS = 6
+# Output budget per entrant. 1400 was too tight: anything asking for code or a
+# structured multi-part answer stopped mid-sentence (measured — a "design a rate
+# limiter, then implement it" prompt hit the cap with the answer half-written).
+# Env-tunable because the picker can include PAID backends, where a bigger budget
+# is real money: +2600 tokens on a $10/Mtok model is ~2.6c per entrant per run.
+COMPARE_MAX_TOKENS = int(os.environ.get("CREWE_COMPARE_MAX_TOKENS", "4000"))
+# How much of each answer the judge is shown. Must scale WITH the budget above —
+# raising the entrant cap alone would just mean the judge grades a smaller
+# fraction of what it is comparing. 6 entrants x 6000 chars is ~9k tokens, well
+# inside the judge backend's context (the 26B on 8087 reports n_ctx 65536).
+COMPARE_JUDGE_EXCERPT = int(os.environ.get("CREWE_COMPARE_JUDGE_EXCERPT", "6000"))
 
 
 @app.route("/compare/ask", methods=["POST"])
