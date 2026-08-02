@@ -601,6 +601,16 @@ a verdict.</p>
 <p>The &#128206; button attaches a file to the conversation: PDF, Word, Excel,
 Markdown, CSV, plain text or source code. Crewe extracts the text &mdash; the
 model never sees the original file.</p>
+<p>The &#128230; button attaches a <b>public GitHub repository</b>: paste
+<code>https://github.com/owner/repo</code> (a <code>/tree/branch</code> suffix
+works too) and Crewe fetches the source, skips binaries, lockfiles and
+<code>node_modules</code>, and attaches it like any document. Then ask for a
+<b>code review</b> &mdash; "suggest improvements", "audit this" &mdash; and the
+<b>review</b> route reads whole files and reports findings, telling you which
+files it could not fit. Private repositories are not supported. One thing to
+know: <i>"review this code"</i> gets a review, while <i>"fix the login bug"</i>
+goes to the code route and builds &mdash; ask for findings when you want
+findings.</p>
 <p>An attachment belongs to the <i>conversation</i>, not to one question, so you
 can keep asking about the same document. Ask for a summary and the
 <b>summarize</b> route handles it; ask a specific question and it goes wherever
@@ -1156,6 +1166,7 @@ SYSTEM_PROMPTS = {
     "creative": "You are an imaginative creative-writing partner. Write vivid, characterful prose. Favor strong imagery, varied sentence rhythm, and emotional texture. Continue collaboratively and keep the established tone, characters, and plot consistent across turns.",
     "code":     "You are an expert software engineer. Return correct, idiomatic, production-quality code with minimal preamble. Prefer complete, runnable solutions. Explain only when asked or when a non-obvious decision needs justifying. Default to the user's language/framework if evident.",
     "general":   "You are a knowledgeable, helpful general assistant. Answer questions clearly and accurately across any topic. Be concise but complete, and say when you are unsure rather than inventing facts.",
+    "review": "You are a senior software engineer performing a code review. Ground every finding in the actual code shown — quote the file path and the relevant lines, say what is wrong or could be better, and show the improved version where it fits in a few lines. Order findings by impact: correctness first, then security, then performance, then clarity. Be specific enough that the author can act without asking follow-ups, and say clearly when something is already good or when you could not review a file because it was omitted. Never invent files or line numbers that were not shown to you.",
     "summarize": "You condense material the user already has. Be faithful above all: keep names, numbers, dates, decisions and conclusions exactly as written, never infer a fact that is not present, and say so plainly when the source does not cover something. Lead with the single most important point, then structure the rest to match the material — bullets for lists of findings, short prose for an argument. Match the requested length if one is given; otherwise aim for roughly a tenth of the original. Do not add opinion, praise, or advice unless asked.",
     "reasoning": "You are a precise analytical reasoner. Work through problems step by step, showing your reasoning clearly. Handle math, logic, science, and multi-step analysis. Check your work before giving a final answer. Acknowledge uncertainty rather than guessing.",
     "search":    "You are a research assistant answering with the help of live web search results supplied in the user message. Base your answer on those results and synthesize across them — do not rely on a single source when several are given. Cite sources inline as [n] matching the numbered results, and attach a date to any fact that can change over time (prices, rankings, counts, 'latest' anything). When the question compares things across several items, present the comparison as a markdown table with a source/date column. Prefer recent, agreeing sources; when sources disagree or a figure is uncertain, say so explicitly rather than averaging silently. If the results don't actually answer the question, state that plainly instead of guessing. Never fabricate URLs, numbers, or facts beyond what the sources support.",
@@ -2279,6 +2290,12 @@ _BUILTIN_RULES = {
              "even if the topic sounds creative. Also choose code when the "
              "user reports errors, stack traces, or that something previously "
              "built is broken or needs fixing.\n"),
+    "review": ("- 'review': the user wants EXISTING code REVIEWED — 'suggest "
+               "improvements', 'code review', 'critique this code', 'audit', "
+               "'how would you refactor this', especially about an attached "
+               "repository or pasted code. They want FINDINGS about code that "
+               "already exists, not something new built and not a specific "
+               "reported bug fixed in a live build (those are 'code').\n"),
     "summarize": ("- 'summarize': the user wants EXISTING material condensed — "
                   "'summarise this', 'tl;dr', 'key points', 'what does this "
                   "say', 'brief me on this'. Choose summarize when the user "
@@ -2295,7 +2312,7 @@ _BUILTIN_RULES = {
                 "conversational exchanges.\n"),
 }
 _BUILTIN_ROUTES = ("recipes", "creative", "code", "general", "reasoning",
-                   "search", "summarize")
+                   "search", "summarize", "review")
 _ROUTE_NAME_RE = re.compile(r"^[a-z][a-z0-9]{1,15}$")
 _CUSTOM_COLOR_POOL = ["#7a4ba0", "#8c2a5e", "#4a6b1f", "#1f6f8c",
                       "#96431c", "#5e5a1f", "#265e8c", "#8c264d"]
@@ -2353,7 +2370,9 @@ def _default_router_config():
           "code": "coder-qwen", "general": "brain-26b",
           "reasoning": "brain-26b", "search": "brain-26b",
           # the biggest local window — documents are long
-          "summarize": "brain-26b"}
+          "summarize": "brain-26b",
+          # code review wants the strongest reader you have
+          "review": "brain-26b"}
     routes = {n: {"backend": rb[n], "model": "", "subject": "", "persona": "",
                   "custom": False, "color": ""} for n in _BUILTIN_ROUTES}
     return {"backends": backends, "routes": routes,
@@ -2418,9 +2437,16 @@ def _save_router_config(cfg):
 
 def _build_classifier_system(cfg):
     names = [n for n in cfg["routes"]] + ["audio"]
-    order = (["audio", "search", "recipes", "code"]
-             + [n for n in cfg["routes"] if cfg["routes"][n].get("custom")]
-             + ["reasoning", "creative", "general"])
+    # Priority-ordered, then customs, then EVERY remaining configured route.
+    # This used to be a fixed list, so a built-in added later (summarize,
+    # review) appeared in the answer-word list but its RULE line was silently
+    # dropped — the classifier was guessing from the route's name alone.
+    head = ["audio", "search", "recipes", "code"]
+    customs = [n for n in cfg["routes"] if cfg["routes"][n].get("custom")]
+    tail = ["reasoning", "creative", "general"]
+    middle = [n for n in cfg["routes"]
+              if n not in head + customs + tail]
+    order = head + customs + sorted(middle) + tail
     lines = ""
     for n in order:
         if n != "audio" and n not in cfg["routes"]:
@@ -3023,6 +3049,127 @@ def _upload_text(name: str, raw: bytes) -> str:
     if not text.strip():
         raise ValueError("that file contains no readable text")
     return text[:MAX_UPLOAD_TEXT]
+
+
+# ---------------------------------------------------------------------------
+# GitHub repositories as attachments.
+#
+# A pasted repo URL is NEVER fetched directly. The owner/repo/ref are parsed
+# out with a strict pattern and the tarball URL is built from constants, so
+# the only host this feature can ever contact is codeload.github.com — a
+# crafted "github.com@evil.host/..." URL has nothing to grab onto. Public
+# repositories only; that is a feature statement, not a TODO.
+_GH_URL = re.compile(
+    r"^https?://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/"
+    r"([A-Za-z0-9._-]{1,100}?)(?:\.git)?"
+    r"(?:/(?:tree|commit|releases/tag)/([A-Za-z0-9._/-]{1,120}))?/?"
+    r"(?:[?#].*)?$")
+GH_TARBALL_CAP = int(os.environ.get("CREWE_GH_TARBALL_CAP", str(60 * 1024 * 1024)))
+GH_FILE_CHARS = 60_000          # per file; a 200k-char bundle is not "a file"
+GH_MAX_FILES = 400
+_GH_SKIP_DIRS = {"node_modules", ".git", "dist", "build", "vendor", "target",
+                 "__pycache__", ".next", ".venv", "venv", "coverage"}
+_GH_SKIP_FILES = ("package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+                  "poetry.lock", "Cargo.lock", "go.sum", ".min.js", ".min.css",
+                  ".map", ".lock")
+
+
+def _github_parse(url):
+    """(owner, repo, ref-or-None) from a github.com URL, else None."""
+    m = _GH_URL.match((url or "").strip())
+    if not m:
+        return None
+    owner, repo, ref = m.group(1), m.group(2), m.group(3)
+    if repo.startswith(".") or owner.startswith("-"):
+        return None
+    return owner, repo, ref
+
+
+def _github_repo_text(url):
+    """Fetch a public repo as one reviewable text bundle.
+
+    Returns (display_name, text). Raises ValueError with a user-facing message
+    — same contract as _upload_text. The bundle is a file tree followed by
+    each kept file under an '=== FILE: path ===' header; that marker is what
+    the review route's whole-file packing splits on, so change them together.
+    """
+    parsed = _github_parse(url)
+    if not parsed:
+        raise ValueError("that doesn't look like a GitHub repository URL — "
+                         "expected https://github.com/owner/repo")
+    owner, repo, ref = parsed
+    tar_url = (f"https://codeload.github.com/{owner}/{repo}/tar.gz/"
+               f"{ref or 'HEAD'}")
+    try:
+        r = requests.get(tar_url, stream=True, timeout=60,
+                         headers={"User-Agent": "crewe-repo-attach"})
+    except Exception as e:
+        raise ValueError(f"could not reach GitHub ({e.__class__.__name__})")
+    if r.status_code == 404:
+        raise ValueError(f"GitHub returned 404 for {owner}/{repo}"
+                         + (f"@{ref}" if ref else "")
+                         + " — private repos and typos both look like this; "
+                           "only public repositories can be attached")
+    if r.status_code != 200:
+        raise ValueError(f"GitHub returned {r.status_code} for {owner}/{repo}")
+
+    buf, total = io.BytesIO(), 0
+    for chunk in r.iter_content(65536):
+        total += len(chunk)
+        if total > GH_TARBALL_CAP:
+            r.close()
+            raise ValueError(f"repository archive exceeds "
+                             f"{GH_TARBALL_CAP // (1024*1024)} MB — too large "
+                             "to attach")
+        buf.write(chunk)
+    buf.seek(0)
+
+    import tarfile
+    kept, skipped, tree = [], 0, []
+    used = 0
+    try:
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            for m in tar:                       # members read in memory only —
+                if not m.isfile():              # nothing is extracted to disk,
+                    continue                    # so tar paths can't traverse
+                parts = m.name.split("/")[1:]   # strip the repo-ref top dir
+                if not parts:
+                    continue
+                rel = "/".join(parts)
+                if any(p in _GH_SKIP_DIRS for p in parts[:-1]):
+                    continue
+                base = parts[-1]
+                ext = base.rsplit(".", 1)[-1].lower() if "." in base else ""
+                if any(base.endswith(sfx) for sfx in _GH_SKIP_FILES):
+                    continue
+                if ext not in _KNOWN_EXTS and base not in (
+                        "Dockerfile", "Makefile", "LICENSE", "README"):
+                    continue
+                tree.append(rel)
+                if len(kept) >= GH_MAX_FILES or used >= MAX_UPLOAD_TEXT:
+                    skipped += 1
+                    continue
+                raw = tar.extractfile(m).read(GH_FILE_CHARS * 4)
+                text = raw.decode("utf-8", errors="replace")
+                if "\x00" in text[:1000]:
+                    continue                    # binary wearing a text suffix
+                if len(text) > GH_FILE_CHARS:
+                    text = text[:GH_FILE_CHARS] + "\n… (file truncated)\n"
+                kept.append((rel, text))
+                used += len(text)
+    except tarfile.TarError:
+        raise ValueError("GitHub's archive could not be read — try again, and "
+                         "check the branch name if you gave one")
+
+    if not kept:
+        raise ValueError("no readable source files found in that repository")
+    name = f"{owner}/{repo}" + (f"@{ref}" if ref else "")
+    head = (f"GitHub repository {name} — {len(tree)} source files, "
+            f"{len(kept)} included below"
+            + (f", {skipped} omitted for size" if skipped else "") + ".\n\n"
+            "FILE TREE:\n" + "\n".join(f"  {t}" for t in tree[:GH_MAX_FILES]))
+    body = "\n\n".join(f"=== FILE: {rel} ===\n{text}" for rel, text in kept)
+    return name, (head + "\n\n" + body)[:MAX_UPLOAD_TEXT]
 
 
 def session_uploads(session_id: str) -> list:
@@ -5433,12 +5580,34 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
             if not body:
                 continue
             if len(body) > per_doc:
-                # Too big for the window: condense it rather than truncate it,
-                # so the tail of a long document is represented at all.
-                with JOBS_LOCK:
-                    JOBS[job_id]["stage"] = "condensing"
-                JOBS[job_id]["stage_ts"] = time.time()
-                body = _condense(body, per_doc, url, job_id)
+                if route == "review" and "=== FILE: " in body:
+                    # A summary of code cannot be reviewed. Keep WHOLE files
+                    # until the budget is spent and say which were left out —
+                    # a reviewer told what it has not seen beats one working
+                    # from a paraphrase of everything.
+                    head, _, rest = body.partition("\n\n=== FILE: ")
+                    parts = ("=== FILE: " + rest).split("\n\n=== FILE: ")
+                    kept, omitted, used = [], [], len(head)
+                    for p in parts:
+                        p = p if p.startswith("=== FILE: ") else "=== FILE: " + p
+                        fname = p.split("===")[1].replace("FILE:", "").strip()
+                        if used + len(p) <= per_doc:
+                            kept.append(p)
+                            used += len(p)
+                        else:
+                            omitted.append(fname)
+                    note = (f"\n\n[{len(omitted)} files omitted for size: "
+                            + ", ".join(omitted[:40])
+                            + ("…" if len(omitted) > 40 else "") + "]"
+                            if omitted else "")
+                    body = head + "\n\n" + "\n\n".join(kept) + note
+                else:
+                    # Too big for the window: condense rather than truncate,
+                    # so the tail of a long document is represented at all.
+                    with JOBS_LOCK:
+                        JOBS[job_id]["stage"] = "condensing"
+                    JOBS[job_id]["stage_ts"] = time.time()
+                    body = _condense(body, per_doc, url, job_id)
             blocks.append(f"--- attached file: {up['name']} ---\n{body}")
         if blocks:
             joined = "\n\n".join(blocks)
@@ -5936,6 +6105,35 @@ def upload():
     so the user can download back what they sent. Both live under the caller's
     own crewe_userdata root, named by a generated id — the client's filename is
     never used as a path."""
+    if request.is_json:
+        body = request.json or {}
+        session_id = (body.get("session_id") or "anonymous").strip()
+        gh = (body.get("github_url") or "").strip()
+        if not gh:
+            return jsonify({"error": "no github_url"}), 400
+        try:
+            name, text = _github_repo_text(gh)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        up_id = uuid.uuid4().hex[:16]
+        try:
+            with open(os.path.join(uploads_dir(), f"{up_id}.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError as e:
+            print(f"[upload] repo write failed: {e}")
+            return jsonify({"error": "could not store that repository"}), 500
+        meta = {"id": up_id, "name": name, "ext": "repo",
+                "chars": len(text), "ts": time.time()}
+        with SESSIONS_LOCK:
+            sess = sessions().setdefault(session_id, {})
+            ups = sess.setdefault("uploads", [])
+            ups.append(meta)
+            if len(ups) > MAX_SESSION_UPLOADS:
+                del ups[:-MAX_SESSION_UPLOADS]
+        _save_memory()
+        return jsonify({"ok": True, "upload": meta})
+
     session_id = (request.form.get("session_id") or "anonymous").strip()
     f = request.files.get("file")
     if not f or not f.filename:
@@ -7567,6 +7765,7 @@ PAGE = r"""<!DOCTYPE html>
     .bar { flex-wrap:wrap; gap:8px; }
     .bar textarea { flex:1 1 100%; min-height:44px; }
     #attach { order:2; padding:0 12px; }
+    #attachRepo { order:2; padding:0 12px; }
     #effort { order:3; flex:1 1 auto; min-width:0; }
     #go     { order:4; padding:0 18px; }
     .effort-help { text-align:center; }
@@ -7658,6 +7857,7 @@ PAGE = r"""<!DOCTYPE html>
         <textarea id="q" rows="1" placeholder="Ask anything…  (Enter to send, Shift+Enter for newline)"></textarea>
         <input type="file" id="fileIn" hidden>
         <button id="attach" class="attach-btn" title="Attach a document — pdf, docx, xlsx, txt, md, csv…">&#128206;</button>
+        <button id="attachRepo" class="attach-btn" title="Attach a public GitHub repository for review">&#128230;</button>
         <select id="effort" title="Only applies to coding answers. Higher tiers use larger, slower models.">
           <option value="fast">Effort: Fast</option>
           <option value="normal" selected>Effort: Normal</option>
@@ -8154,6 +8354,27 @@ if(attachBtn){
       attachBtn.classList.remove('busy'); attachBtn.disabled=false;
       fileIn.value='';
     }
+  });
+}
+
+const repoBtn=document.getElementById('attachRepo');
+if(repoBtn){
+  repoBtn.addEventListener('click',async()=>{
+    const gh=prompt('Public GitHub repository URL:\n(e.g. https://github.com/owner/repo — a /tree/branch suffix works too)');
+    if(!gh) return;
+    repoBtn.classList.add('busy'); repoBtn.disabled=true;
+    try{
+      const r=await(await fetch('/upload',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({session_id:sessionId,github_url:gh})})).json();
+      if(r.error){
+        attachRow.insertAdjacentHTML('beforeend',
+          `<span class="chip err">${escapeHtml(r.error)}</span>`);
+      } else refreshAttachments();
+    }catch(e){
+      attachRow.insertAdjacentHTML('beforeend',
+        `<span class="chip err">repo attach failed: ${escapeHtml(String(e))}</span>`);
+    }finally{ repoBtn.classList.remove('busy'); repoBtn.disabled=false; }
   });
 }
 
