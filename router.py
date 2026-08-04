@@ -7938,7 +7938,6 @@ PAGE = r"""<!DOCTYPE html>
       <a href="/sheets" target="_blank">sheets<span class="arr"> ↗</span></a>
       <a href="/scratch" target="_blank">scratchpad<span class="arr"> ↗</span></a>
       <a href="/shots" target="_blank">build checks<span class="arr"> ↗</span></a>
-      <a href="/panel" target="_blank">panel<span class="arr"> ↗</span></a>
       <a href="/compare" target="_blank">compare<span class="arr"> ↗</span></a>
       <a href="/admin" class="admin-only" style="display:none">👥 people</a>
       <a href="/settings" class="admin-only" style="display:none">⚙ settings</a>
