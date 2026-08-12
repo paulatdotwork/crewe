@@ -10,7 +10,8 @@ FILES=(test_auth.py test_tenancy.py test_invite.py test_harden.py
        test_backend_kinds.py test_compare.py test_compare_thinking.py
        test_truncation.py
        test_agent_loop.py test_agent_routes.py test_agent_ssh.py
-       test_agent_coder.py test_agent_preview.py test_agent_projects.py)
+       test_agent_coder.py test_agent_preview.py test_agent_projects.py
+       test_agent_local.py)
 
 fail=0
 for t in "${FILES[@]}"; do

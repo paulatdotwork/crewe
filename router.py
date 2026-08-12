@@ -11308,6 +11308,13 @@ AGENT_MAX_STEPS = int(os.environ.get("CREWE_AGENT_MAX_STEPS", "15"))
 AGENT_HOSTS_FILE = os.path.expanduser(
     os.environ.get("CREWE_AGENT_HOSTS", "~/crewe_agent_hosts.json"))
 
+def _agent_local_ok():
+    """The Docker-free target: commands run UNSANDBOXED on this host as the
+    router's user. Opt-in only — it never appears unless the operator set
+    CREWE_AGENT_ALLOW_LOCAL=1. Read per call so a restartless env change in
+    tests (and `.env`-style launchers) behaves predictably."""
+    return os.environ.get("CREWE_AGENT_ALLOW_LOCAL", "") == "1"
+
 def _load_agent_hosts():
     try:
         with open(AGENT_HOSTS_FILE) as f:
@@ -11486,7 +11493,7 @@ async function loadTargets(){
   try{ const t=await(await fetch('/agent/hosts')).json();
     const sel=$('target'); sel.innerHTML='';
     (t.targets||[]).forEach(x=>{ const o=document.createElement('option');
-      const icon = x.kind==='ssh'?'🖥 ':'📦 ';
+      const icon = x.kind==='ssh'?'🖥 ':x.kind==='local'?'⚠ ':'📦 ';
       o.value=x.name; o.textContent=icon+x.name;
       o.dataset.kind=x.kind; sel.appendChild(o); });
     const cs=$('coder'); cs.innerHTML='';
@@ -11498,8 +11505,11 @@ async function loadTargets(){
 }
 function targetNote(){
   const sel=$('target'), opt=sel.options[sel.selectedIndex];
-  const isSSH=opt && opt.dataset.kind==='ssh';
-  $('targetWarn').classList.toggle('hidden', !isSSH);
+  const kind=opt ? opt.dataset.kind : '';
+  const isSSH=kind==='ssh';
+  $('targetWarn').classList.toggle('hidden', !(isSSH||kind==='local'));
+  if(isSSH) $('targetWarn').innerHTML='⚠ This target is a real machine over SSH — it is <b>not</b> sandboxed. Commands run for real, as that host&#39;s user.';
+  else if(kind==='local') $('targetWarn').innerHTML='⚠ local runs <b>UNSANDBOXED on this server</b> — commands run for real as the router&#39;s own user, with its permissions.';
   $('fsCard').classList.toggle('hidden', !isSSH);
   if(isSSH){ $('fsHost').textContent=opt.value; fsPath='~'; fsLoad(); }
 }
@@ -11878,7 +11888,10 @@ def _run_agent_job(job_id, task, uid, target="sandbox", plan=True, plan_text=Non
     _gc_orphan_runs(uid)
     snapshot = os.path.join(agent_runs_dir(uid), job_id)
     backend = None
-    if target != "sandbox":
+    if target == "local" and _agent_local_ok():
+        import local_workspace
+        backend = local_workspace.LocalWorkspace(run_id=job_id)
+    elif target != "sandbox":
         h = _agent_host(target)          # re-resolved server-side; never client host
         if not h:
             with AGENT_JOBS_LOCK:
@@ -11991,9 +12004,14 @@ def agent_run():
     plan_text = (body.get("plan_text") or "").strip() or None
     if not task:
         return jsonify({"error": "empty task"}), 400
-    # validate the target BEFORE starting anything ('sandbox' is the built-in;
-    # anything else must be a name on the SSH allowlist)
-    if target != "sandbox" and not _agent_host(target):
+    # validate the target BEFORE starting anything ('sandbox' is the built-in,
+    # 'local' only exists when the operator opted in; anything else must be a
+    # name on the SSH allowlist)
+    if target == "local":
+        if not _agent_local_ok():
+            return jsonify({"error": "local (unsandboxed) mode is disabled — "
+                                     "set CREWE_AGENT_ALLOW_LOCAL=1"}), 400
+    elif target != "sandbox" and not _agent_host(target):
         return jsonify({"error": f"unknown target '{target}'"}), 400
     coder_id = (body.get("coder") or "default").strip()
     coder = None
@@ -12067,6 +12085,8 @@ def agent_plan():
 def agent_hosts():
     # only NAMES reach the client — never host/user/key
     targets = [{"name": "sandbox", "kind": "sandbox"}]
+    if _agent_local_ok():
+        targets.append({"name": "local", "kind": "local"})
     targets += [{"name": h["name"], "kind": "ssh"}
                 for h in _load_agent_hosts() if h.get("name")]
     # coder choices: backend IDS only (resolved server-side in _agent_coder)
@@ -12374,11 +12394,25 @@ def agent_test(run_id):
     if not AGENT_ACTIVE.acquire(blocking=False):
         return jsonify({"error": "An agent run is in progress — test after it "
                                  "finishes."}), 429
+    tmp_ws = None
     try:
         import agent as _agent
-        from sandbox import Sandbox
-        _reap_sandbox_containers()
-        with Sandbox(network="egress") as sb:
+        import shutil as _sh
+        if _sh.which("docker"):
+            from sandbox import Sandbox
+            _reap_sandbox_containers()
+            ws = Sandbox(network="egress")
+        elif _agent_local_ok():
+            # Docker-free install: test in a throwaway UNSANDBOXED dir
+            import tempfile
+            import local_workspace
+            tmp_ws = tempfile.mkdtemp(prefix="crewe-test-")
+            ws = local_workspace.LocalWorkspace(run_id="t", workdir_base=tmp_ws)
+        else:
+            return jsonify({"error": "Docker is not available; enable local "
+                                     "mode (CREWE_AGENT_ALLOW_LOCAL=1) or "
+                                     "install Docker"}), 500
+        with ws as sb:
             if not sb.restore(base):
                 return jsonify({"error": "could not seed the workspace from "
                                          "this run's snapshot"}), 500
@@ -12388,6 +12422,9 @@ def agent_test(run_id):
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 500
     finally:
+        if tmp_ws:
+            import shutil as _sh
+            _sh.rmtree(tmp_ws, ignore_errors=True)
         AGENT_ACTIVE.release()
 
 

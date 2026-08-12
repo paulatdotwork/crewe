@@ -96,7 +96,10 @@ Docker; run as root so the egress firewall rule installs too:
 sudo bash crewe-sandbox/setup.sh
 ```
 
-Full agent setup and security model: [docs/AGENT.md](docs/AGENT.md).
+No Docker? The agent can also run unsandboxed on the host
+(`CREWE_AGENT_ALLOW_LOCAL=1`, explicit opt-in with a UI warning) or on any
+machine over SSH. Full agent setup, all modes, and the security model:
+[docs/AGENT.md](docs/AGENT.md).
 
 Configuration lives in `router_config.json` (created on first save — **it can
 contain API keys; never commit it**). `CREWE_HOST` / `CREWE_CODER_HOST` env

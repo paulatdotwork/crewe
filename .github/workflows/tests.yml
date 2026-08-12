@@ -66,3 +66,6 @@ jobs:
       - name: agent-projects
         if: ${{ !cancelled() }}
         run: python3 tests/test_agent_projects.py
+      - name: agent-local
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_local.py

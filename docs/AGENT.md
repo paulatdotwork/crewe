@@ -45,6 +45,33 @@ block" reliably — and it is trivial to debug.
 - A task containing a GitHub URL is cloned by the harness (one model step
   saved) and always starts from a clean clone.
 
+## Running without Docker (optional)
+
+If you can't (or don't want to) run Docker, two targets work without it:
+
+- **Local mode** — the agent works directly on the router's host in
+  `~/crewe-agent/<run-id>`. **This is unsandboxed**: commands run for real,
+  as the router's own user, with no egress allowlist and no resource limits
+  — the model's code can do anything your user can. Because that is a real
+  decision, the target does not exist until you opt in:
+
+  ```bash
+  CREWE_AGENT_ALLOW_LOCAL=1 python3 router.py
+  ```
+
+  A "⚠ local" target then appears in the dropdown, with the warning shown
+  in the UI. The test bench also falls back to a throwaway local dir when
+  Docker is absent and local mode is enabled. File writes/reads are contained
+  to the per-run workdir as hygiene, but `run` commands are not contained at
+  all — that's the trade you opted into.
+
+- **An SSH target pointed at any machine you control** (including
+  `127.0.0.1`) — see below. Also unsandboxed, but at least scoped to the
+  account and machine you choose.
+
+Prefer the sandbox when Docker is available: it is the only mode where
+hostile code and cloned repos are actually confined.
+
 ## Remote SSH targets (optional)
 
 The agent can work directly on a real machine over SSH instead of the Docker
@@ -74,6 +101,8 @@ cannot point the agent at an arbitrary machine.
 | `CREWE_AGENT_CMD_TIMEOUT` | `600` | per-command budget inside the workspace |
 | `CREWE_AGENT_OBS_LIMIT` | `12000` | max observation chars fed back to the model |
 | `CREWE_AGENT_HOSTS` | `~/crewe_agent_hosts.json` | SSH target allowlist file |
+| `CREWE_AGENT_ALLOW_LOCAL` | *(unset)* | `1` enables the unsandboxed local target |
+| `CREWE_AGENT_LOCAL_DIR` | `~/crewe-agent` | where local-mode runs keep their workdirs |
 | `CREWE_AGENT_AUDIT_DIR` | `~/llama_logs/agent` | append-only run audit logs |
 | `CREWE_AGENT_AUDIT_KEEP` | `300` | audit files kept before oldest are dropped |
 | `CREWE_SANDBOX_IMAGE` | `crewe-sandbox:latest` | sandbox container image |
