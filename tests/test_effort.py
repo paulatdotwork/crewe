@@ -59,8 +59,11 @@ check("normal resolves to CODE_AGENT_URL_FAST",
       easy_url == router.CODE_AGENT_URL_FAST, easy_url)
 check("extra resolves to CODE_AGENT_URL",
       hard_url == router.CODE_AGENT_URL, hard_url)
-check("the live config gives them distinct backends",
-      easy_url != hard_url, f"both {easy_url}")
+# Since the Aug 2026 3-tier rewire, normal and extra intentionally share the
+# deep coder (the paid tier is gone); the tiers differ in budgets/steps, and
+# the quick tier is the one that must be a genuinely different backend.
+check("the live config keeps the quick tier on a distinct backend",
+      fast_url != hard_url, f"both {fast_url}")
 
 print("--- budgets follow the model, not the level name ---")
 router.set_effort("normal")
