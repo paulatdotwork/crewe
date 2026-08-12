@@ -1224,6 +1224,15 @@ STEP_FIX_ROUNDS     = 2      # foreman fix attempts per step
 # Run the per-step LLM foreman ONLY when a free deterministic check fails.
 # Set 0 to always run it (the old behaviour).
 FOREMAN_ONLY_ON_ISSUES = os.environ.get("CREWE_FOREMAN_ALWAYS") != "1"
+# WHEN the foreman runs. "job" (default): deterministic checks still run after
+# every step, but the LLM check/fix pass runs ONCE over the whole delivery,
+# after all steps — a mid-build foreman fix is often rewritten by a later step
+# anyway (observed: a 9-minute foreman pass on step 1 of a 5-step build).
+# "step": the old behaviour, an LLM pass after every step with issues.
+# "off": deterministic checks only, no LLM foreman at all.
+FOREMAN_MODE = os.environ.get("CREWE_FOREMAN", "job")
+if FOREMAN_MODE not in ("job", "step", "off"):
+    FOREMAN_MODE = "job"
 # Env-tunable so slow-backend TESTS (e.g. the laguna TB-RPC rig) can shrink the
 # per-call prompt without code edits — prompt-eval cost scales with these.
 STEP_FILE_CHARS     = int(os.environ.get("CREWE_STEP_FILE_CHARS", "160000"))  # ~40k tokens of files
@@ -1236,6 +1245,13 @@ STEP_FILE_HARD      = int(os.environ.get("CREWE_STEP_FILE_HARD", "320000"))  # a
 # edited against code they could not see. 160k chars is ~40k tokens, a third of
 # the window, leaving ample room for the plan, working memory and the output.
 SMALL_PROJECT_CHARS = int(os.environ.get("CREWE_WHOLE_PROJECT_CHARS", "160000"))
+# The auto-include-EVERYTHING threshold, split off from SMALL_PROJECT_CHARS.
+# SMALL_PROJECT_CHARS still sizes the packer caps (what CAN be shown); this
+# decides when a step that named its own files gets the whole project anyway.
+# At 160k every step of every project re-sent the entire codebase (~20k
+# prompt tokens per step, observed live) — past ~60k chars the manifest +
+# NEED FILES protocol carry cross-file references at a fraction of the cost.
+RIDE_ALONG_CHARS = int(os.environ.get("CREWE_RIDE_ALONG_CHARS", "60000"))
 
 # Standing quality standards, injected into every pipeline call. Same idea as
 # coding-bot's preferences.md — edit the file, no code change needed.
@@ -1316,16 +1332,19 @@ FOREMAN_SYSTEM = (
     "in for characters, scenery, or UI) fail the step even when the logic "
     "works. Ignore work that belongs to later steps.\n"
     "If the step is correct and complete, reply with exactly: ON TRACK\n"
-    "Otherwise return every file that needs fixing — corrected and COMPLETE, "
-    "the file path on its own line then one fenced code block per file — and "
-    "end with one line starting 'FIXED:' that summarizes the correction. "
-    "Never output partial files, diffs, or placeholder comments.\n"
+    "Otherwise return a fix for every file that needs one — the file path on "
+    "its own line, then ONE fenced block: targeted SEARCH/REPLACE sections "
+    "(in the exact format described in the user message, quoting the current "
+    "file character-for-character) for an existing file, or the COMPLETE "
+    "file only when it is new or under ~100 lines — and end with one line "
+    "starting 'FIXED:' that summarizes the correction. "
+    "Never output placeholder comments or a partial file outside "
+    "SEARCH/REPLACE sections.\n"
     "OUTPUT RULES (absolute):\n"
     "- Do NOT deliberate, narrate, or reason out loud. No 'Let me check', no "
     "'Looking at the code', no walking through the files.\n"
-    "- Do NOT quote or echo existing code back. The only fenced blocks in "
-    "your reply are COMPLETE corrected files you are replacing.\n"
-    "- Your whole reply is either the two words ON TRACK, or file blocks "
+    "- Do NOT quote or echo existing code back outside SEARCH sections.\n"
+    "- Your whole reply is either the two words ON TRACK, or file fixes "
     "followed by one FIXED: line. Nothing else."
 )
 
@@ -1366,7 +1385,7 @@ _TRUNC_RETRY_NOTE = (
 # refusal is policy, not a mistake, so retrying it just burns a call.
 _RECOVERABLE_REJECT = re.compile(
     r"fragment|didn'?t match|cut off|unlabeled|no complete file|shorter than"
-    r"|doesn'?t exist",
+    r"|doesn'?t exist|full-file rewrite",
     re.I)
 
 
@@ -1569,6 +1588,24 @@ _EDIT_FORMAT_NOTE = (
     "complete files, never edits. NEVER output a file that exists but was not "
     "shown to you — it will be rejected."
 )
+
+# Fix rounds regenerate whole files for one-line changes (observed: a 28 KB
+# full-rewrite reply to fix one TypeError). On the FIRST attempt of a fix
+# round the edits are mandatory, and _execute_step rejects a full-file
+# rewrite of a large existing file so the standard retry feeds the reason
+# back. Escalation to full rewrites on the second attempt is unchanged —
+# that path exists because edits sometimes genuinely fail.
+_DIFF_ONLY_NOTE = (
+    "\n\nThis is a FIX round on an existing build: change as little as "
+    "possible. For EVERY file that already exists and is shown above, you "
+    "MUST return targeted SEARCH/REPLACE edit sections — a full-file rewrite "
+    "of an existing file will be REJECTED. Only a file that does not exist "
+    "yet may be sent as a complete file."
+)
+# rewrites of files smaller than this are cheaper to accept than to
+# re-request (the guard measures the EXISTING file — a rewrite that balloons
+# a small stub is new code being written, not old code being re-sent)
+EDIT_ONLY_MIN_CHARS = int(os.environ.get("CREWE_EDIT_ONLY_MIN_CHARS", "4000"))
 
 # The trailing word is OPTIONAL: models close the block with a bare ">>>>>>>"
 # about as often as ">>>>>>> REPLACE". Requiring the word meant the whole block
@@ -3621,6 +3658,7 @@ def _budget(key):
 
 
 def small_project_chars(): return _budget("small_project_chars")
+def ride_along_chars():    return min(small_project_chars(), RIDE_ALONG_CHARS)
 def step_file_chars():     return _budget("step_file_chars")
 def step_file_hard():      return _budget("step_file_hard")
 def max_plan_steps():      return EFFORT_TUNING[_effort()]["max_plan_steps"]
@@ -4777,6 +4815,128 @@ def _mem_digest(mem, limit=2000):
     return out
 
 
+def _foreman_fix_loop(job_id, step, changed, files, warnings, mem,
+                      foreman_system, stage, tag, label, header):
+    """The foreman check/fix loop, shared by both CREWE_FOREMAN modes.
+
+    Runs deterministic checks over `changed`; when they fail (or
+    CREWE_FOREMAN_ALWAYS=1), asks the foreman for a verdict and merges its
+    fixes, up to step_fix_rounds() rounds. Mutates changed/files/warnings in
+    place. `stage`/`tag`/`label`/`header` parameterize the progress line,
+    warning prefix, trace label and prompt header so the same loop serves a
+    per-step check ("step 3") and the job-level final pass ("final review").
+    Returns the foreman's FIXED: summary, or None if nothing was fixed."""
+    note = None
+    prev_issues: set = set()
+    for _ in range(step_fix_rounds()):
+        issues = _static_check_files(changed) + [
+            d for d in _dup_symbol_check(files)
+            if any(n in d for n in changed)] + [
+            b for b in _bundle_check(files)
+            if "does not exist" in b]
+        # Only pay for an LLM review when something deterministic is wrong.
+        # 18 foreman calls across two runs cost 39 minutes and merged zero
+        # fixes; every one of them was handed "No issues found".
+        if not issues and FOREMAN_ONLY_ON_ISSUES:
+            break
+        survived = [i for i in issues if i in prev_issues]
+        if survived:
+            _mem_note(mem, f"{tag}: these check failures SURVIVED the "
+                           f"previous foreman fix (that approach was wrong — "
+                           f"do not repeat it): " + "; ".join(survived[:4]))
+        prev_issues = set(issues)
+        _set_stage(job_id, stage)
+        checks = ("\n".join(f"- {i}" for i in issues) if issues
+                  else "No issues found by automated syntax checks.")
+        f_shown, f_total = {}, 0
+        for n, c in sorted(changed.items(), key=lambda kv: len(kv[1])):
+            if f_total + len(c) > step_file_hard():
+                continue
+            f_shown[n] = c
+            f_total += len(c)
+        check_user = (
+            (_mem_render(mem) + "\n" if mem else "")
+            + f"{header}\n{step['detail']}\n"
+            f"Done when: {step['done_when']}\n\n"
+            f"Automated syntax-check results:\n{checks}\n\n"
+            + _files_context(f_shown, limit=step_file_hard() * 2,
+                             header="Files produced by this step:"))
+        f_skipped = [n for n in changed if n not in f_shown]
+        if f_skipped:
+            check_user += ("\n\nAlso produced but too large to show — "
+                           "judge only what you can see, do NOT rewrite "
+                           "these: " + ", ".join(f_skipped))
+        check_user += _EDIT_FORMAT_NOTE
+        try:
+            verdict = _stream_chat(
+                coder_url(),
+                [{"role": "system", "content": foreman_system},
+                 {"role": "user", "content": check_user}],
+                job_id, temperature=0.1, label=f"{label}-foreman",
+                # A check is a BOUNDED job: "ON TRACK", or the corrected files
+                # it was shown. The prose rule holds for single-file steps but
+                # not when a step touched several files at once — observed live
+                # at 12k tokens and climbing. This ceiling is ~2x the largest
+                # legitimate fix; a truncated tail is discarded by the existing
+                # unclosed-fence guard, and the step has already banked its work.
+                max_tokens=int(os.environ.get("CREWE_FOREMAN_MAX_TOKENS", "12288")))
+        except Exception as e:
+            print(f"[code] foreman error: {e}")
+            warnings.append(f"{tag}: foreman check skipped "
+                            f"(specialist unreachable)")
+            break
+        clean = _strip_think(verdict).strip()
+        # verdict may arrive wrapped in prose ("The step is on track and…") —
+        # accept it from the first real line, but never past a negation
+        head = next((l for l in clean.splitlines() if l.strip()), "").upper()
+        # \b on NOT so NOTE / NOTHING / ANOTHER / CANNOT / NOTICED don't read
+        # as negations and reject a genuine ON TRACK verdict
+        approves = ("ON TRACK" in head
+                    or re.search(r"\b(CORRECT AND COMPLETE|COMPLETE AND CORRECT"
+                                 r"|FULLY IMPLEMENTED|NO CHANGES? (?:ARE )?NEEDED"
+                                 r"|NOTHING TO FIX|LOOKS CORRECT)\b", head))
+        if (approves and not re.search(r"\bNOT\b|N'T\b", head)
+                and "```" not in clean):
+            break
+        fixes = {}
+        f_target = list(f_shown)[0] if len(f_shown) == 1 else None
+        for n, c in _extract_files(clean, existing=files,
+                                   default_name=f_target).items():
+            merged = _merge_output_file(n, c, files, set(f_shown), warnings,
+                                        f"{tag} foreman", mem)
+            if merged is not None:
+                fixes[n] = merged
+        if not fixes:
+            # an objection with no usable fix must not pass as a silent ✓
+            objection = (clean.splitlines() or ["no verdict"])[0][:160]
+            warnings.append(f"{tag}: foreman flagged an issue that "
+                            f"was not auto-fixed: {objection}")
+            _mem_note(mem, f"{tag}: foreman objected but produced no "
+                           f"usable fix: {objection}")
+            break
+        files_before, changed_before = dict(files), dict(changed)
+        changed.update(fixes)
+        files.update(fixes)
+        if len(_static_check_files(changed)) > len(issues):
+            # never let a "fix" ship a step worse than the draft it judged
+            files.clear()
+            files.update(files_before)
+            changed.clear()
+            changed.update(changed_before)
+            warnings.append(f"{tag}: a foreman fix made the syntax "
+                            f"checks worse and was reverted")
+            _mem_note(mem, f"{tag}: a foreman fix touching "
+                           + ", ".join(sorted(fixes))
+                           + " made the syntax checks WORSE and was REVERTED "
+                             "— that approach failed, do not retry it")
+            break
+        fn = re.search(r"FIXED:\s*(.+)", clean)
+        note = fn.group(1).strip() if fn else "foreman revised the step"
+        _mem_note(mem, f"{tag} foreman round: edited "
+                       + ", ".join(sorted(fixes)) + f" — {note}")
+    return note
+
+
 def _execute_step(job_id, step, idx, total, goal, outline, files,
                   step_notes, warnings, step_system, foreman_system,
                   mem=None, temp=None):
@@ -4788,8 +4948,10 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
 
     # Context: this step's files in full. A small project rides along
     # whole, so cross-file references (ids, function names) stay visible.
+    # Above ride_along_chars() the step gets ITS files only — the symbol
+    # manifest and the NEED FILES protocol below cover the rest.
     step_ctx = {n: files[n] for n in step["files"] if n in files}
-    if files and sum(len(v) for v in files.values()) <= small_project_chars():
+    if files and sum(len(v) for v in files.values()) <= ride_along_chars():
         step_ctx = dict(files)
     if files and not step_ctx:
         # Synthetic steps (inspector catch-ups, browser fixes) often name no
@@ -4800,6 +4962,14 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
         step_ctx = {n: files[n] for n in files
                     if os.path.basename(n).lower() in detail_lc
                     or n.lower() in detail_lc} or dict(files)
+        # Error text names the file that THREW, but the cause often lives in
+        # the entry html wiring (script order, missing tag) — and a blind
+        # rewrite of a hidden file is refused without retry. Entry html is
+        # small; always let it ride along with the mentioned files.
+        if len(step_ctx) < len(files):
+            for n in files:
+                if n.endswith((".html", ".htm")):
+                    step_ctx.setdefault(n, files[n])
 
     # Pack explicitly so we KNOW which files the model saw — set(shown)
     # becomes the write allowlist for this call. Explicit step targets go
@@ -4855,6 +5025,9 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
     user += _FILE_FORMAT_NOTE
     if shown:
         user += _EDIT_FORMAT_NOTE
+    edit_only = bool(step.get("edit_only")) and bool(shown)
+    if edit_only:
+        user += _DIFF_ONLY_NOTE
 
     if _job_cancelled(job_id):
         step_notes.append(f"{idx}. {step['title']} — skipped (stopped)")
@@ -4865,6 +5038,10 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
            project_files=len(files), project_chars=sum(len(v) for v in files.values()),
            whole_project=(len(shown) == len(files) and not unseen and not others))
     changed = {}
+    # files granted via NEED FILES are exempt from edit-only enforcement —
+    # the grant explicitly lifts the do-not-output restriction, so rejecting
+    # the full file it invites would burn a call for nothing
+    edit_grant = set()
     # a step with ONE target file lets _extract_files rescue an unlabeled block
     step_target = step["files"][0] if len(step["files"]) == 1 else (
         list(shown)[0] if len(shown) == 1 else None)
@@ -4893,6 +5070,7 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
                 _mem_note(mem, f"Step {idx}: model asked for hidden files "
                                f"({', '.join(extra)}) — provided")
                 shown.update(extra)
+                edit_grant.update(extra)
                 unseen = [n for n in unseen if n not in extra]
                 user += ("\n\n" + _files_context(
                              extra, limit=step_file_hard() * 2,
@@ -4921,6 +5099,7 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
         # cap-truncated file parses fine and is then rejected at merge, so the
         # retry never fired while the step reported "produced no usable files".
         # The condition that matters is `changed` — files ACCEPTED.
+        ever_rejected = set()
         for attempt in range(2):
             # only the MOST RECENT call's notes count — a cap from attempt 1
             # must not inflate attempt 2's budget or judgement
@@ -4933,6 +5112,25 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
             rejected = []
             for name, code in new.items():
                 wpre = len(warnings)
+                # edit-only fix rounds: a wholesale rewrite of a large
+                # existing file is refused on the first attempt — the reason
+                # is recoverable, so the standard retry below re-asks with
+                # it. The retry accepts anything, so a model that truly
+                # cannot produce a matching edit still lands its fix.
+                if (edit_only and attempt == 0 and name in files
+                        and name in shown and name not in edit_grant
+                        and len(files[name]) > EDIT_ONLY_MIN_CHARS
+                        and not _DIFF_BLOCK.search(code)):
+                    warnings.append(
+                        f"step {idx}: {name} arrived as a full-file rewrite "
+                        f"in an edit-only fix round — use targeted "
+                        f"SEARCH/REPLACE sections quoting the current file")
+                    _trace(job_id, "merge", step=idx, file=name,
+                           verdict="REJECTED", in_chars=len(code),
+                           prev_chars=len(files.get(name, "")), out_chars=0,
+                           reason="full-file rewrite in edit-only fix round")
+                    rejected.append((name, warnings[-1]))
+                    continue
                 merged = _merge_output_file(name, code, files, set(shown),
                                             warnings, f"step {idx}", mem)
                 _trace(job_id, "merge", step=idx, file=name,
@@ -4947,6 +5145,7 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
             # A PARTIAL step used to report plain success: one file accepted,
             # another silently dropped, `changed` non-empty, nobody told.
             # Retry whenever a rejection is something the model can fix.
+            ever_rejected.update(n for n, _ in rejected)
             fixable = [n for n, w_ in rejected if _RECOVERABLE_REJECT.search(w_)]
             if (changed and not fixable) or attempt or _job_cancelled(job_id):
                 break
@@ -4960,22 +5159,30 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
                 _mem_note(mem, f"Step {idx}: attempt 1 produced nothing usable "
                                f"({why}) — retrying once")
             call_mark = _job_notes_len(job_id)
+            # the retry accepts anything — keeping the edit-only threat in
+            # the prompt while _retry_note says "send it COMPLETE" would be
+            # contradictory instructions on the one attempt that must land
+            retry_user = _retry_note(why, fixable) + (
+                user.replace(_DIFF_ONLY_NOTE, "") if edit_only else user)
             out = _stream_chat(
                 coder_url(),
                 [{"role": "system", "content": step_system},
-                 {"role": "user", "content": _retry_note(why, fixable) + user}],
+                 {"role": "user", "content": retry_user}],
                 job_id, temperature=temp or STEP_TEMP,
                 max_tokens=step_max_tokens() * 2 if capped else None,
                 label=f"step{idx}-retry")
             out = _strip_think(out)
             out = _continue_truncated(job_id, out, step_system,
-                                      _retry_note(why, fixable) + user, idx, mem)
+                                      retry_user, idx, mem)
             new = _extract_files(out, existing=files, default_name=step_target)
     except Exception as e:
         warnings.append(f"step {idx} ({step['title']}): aborted — {e}")
         step_notes.append(f"{idx}. {step['title']} — FAILED (specialist unreachable)")
         return False
-    still_bad = [n for n, _ in rejected if n not in changed]
+    # judged against EVERY attempt's rejections, not just the last reply's —
+    # a file rejected on attempt 0 and then omitted on the retry is still
+    # lost work and must not ship under an unqualified ✓
+    still_bad = sorted(n for n in ever_rejected if n not in changed)
     _trace(job_id, "step_end", step=idx, title=step["title"],
            changed=sorted(changed), usable=bool(changed),
            rejected=still_bad, partial=bool(changed and still_bad))
@@ -4997,112 +5204,40 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
 
     # ---- foreman: keep the step in line before the next one builds on it ----
     note = None
-    prev_issues: set = set()
-    for _ in range(step_fix_rounds()):
-        issues = _static_check_files(changed) + [
-            d for d in _dup_symbol_check(files)
-            if any(n in d for n in changed)] + [
-            b for b in _bundle_check(files)
-            if "does not exist" in b]
-        # Only pay for an LLM review when something deterministic is wrong.
-        # 18 foreman calls across two runs cost 39 minutes and merged zero
-        # fixes; every one of them was handed "No issues found".
-        if not issues and FOREMAN_ONLY_ON_ISSUES:
-            break
-        survived = [i for i in issues if i in prev_issues]
-        if survived:
-            _mem_note(mem, f"Step {idx}: these check failures SURVIVED the "
-                           f"previous foreman fix (that approach was wrong — "
-                           f"do not repeat it): " + "; ".join(survived[:4]))
-        prev_issues = set(issues)
-        _set_stage(job_id, f"checking step {idx}/{total}")
-        checks = ("\n".join(f"- {i}" for i in issues) if issues
-                  else "No issues found by automated syntax checks.")
-        f_shown, f_total = {}, 0
-        for n, c in sorted(changed.items(), key=lambda kv: len(kv[1])):
-            if f_total + len(c) > step_file_hard():
-                continue
-            f_shown[n] = c
-            f_total += len(c)
-        check_user = (
-            (_mem_render(mem) + "\n" if mem else "")
-            + f"Step {idx} of {total}: {step['title']}\n{step['detail']}\n"
-            f"Done when: {step['done_when']}\n\n"
-            f"Automated syntax-check results:\n{checks}\n\n"
-            + _files_context(f_shown, limit=step_file_hard() * 2,
-                             header="Files produced by this step:"))
-        f_skipped = [n for n in changed if n not in f_shown]
-        if f_skipped:
-            check_user += ("\n\nAlso produced but too large to show — "
-                           "judge only what you can see, do NOT rewrite "
-                           "these: " + ", ".join(f_skipped))
-        check_user += _EDIT_FORMAT_NOTE
-        try:
-            verdict = _stream_chat(
-                coder_url(),
-                [{"role": "system", "content": foreman_system},
-                 {"role": "user", "content": check_user}],
-                job_id, temperature=0.1, label=f"step{idx}-foreman",
-                # A check is a BOUNDED job: "ON TRACK", or the corrected files
-                # it was shown. The prose rule holds for single-file steps but
-                # not when a step touched several files at once — observed live
-                # at 12k tokens and climbing. This ceiling is ~2x the largest
-                # legitimate fix; a truncated tail is discarded by the existing
-                # unclosed-fence guard, and the step has already banked its work.
-                max_tokens=int(os.environ.get("CREWE_FOREMAN_MAX_TOKENS", "12288")))
-        except Exception as e:
-            print(f"[code] foreman error: {e}")
-            warnings.append(f"step {idx}: foreman check skipped "
-                            f"(specialist unreachable)")
-            break
-        clean = _strip_think(verdict).strip()
-        # verdict may arrive wrapped in prose ("The step is on track and…") —
-        # accept it from the first real line, but never past a negation
-        head = next((l for l in clean.splitlines() if l.strip()), "").upper()
-        # \b on NOT so NOTE / NOTHING / ANOTHER / CANNOT / NOTICED don't read
-        # as negations and reject a genuine ON TRACK verdict
-        approves = ("ON TRACK" in head
-                    or re.search(r"\b(CORRECT AND COMPLETE|COMPLETE AND CORRECT"
-                                 r"|FULLY IMPLEMENTED|NO CHANGES? (?:ARE )?NEEDED"
-                                 r"|NOTHING TO FIX|LOOKS CORRECT)\b", head))
-        if (approves and not re.search(r"\bNOT\b|N'T\b", head)
-                and "```" not in clean):
-            break
-        fixes = {}
-        f_target = list(f_shown)[0] if len(f_shown) == 1 else None
-        for n, c in _extract_files(clean, existing=files,
-                                   default_name=f_target).items():
-            merged = _merge_output_file(n, c, files, set(f_shown), warnings,
-                                        f"step {idx} foreman", mem)
-            if merged is not None:
-                fixes[n] = merged
-        if not fixes:
-            # an objection with no usable fix must not pass as a silent ✓
-            objection = (clean.splitlines() or ["no verdict"])[0][:160]
-            warnings.append(f"step {idx}: foreman flagged an issue that "
-                            f"was not auto-fixed: {objection}")
-            _mem_note(mem, f"Step {idx}: foreman objected but produced no "
-                           f"usable fix: {objection}")
-            break
-        files_before, changed_before = dict(files), dict(changed)
-        changed.update(fixes)
-        files.update(fixes)
-        if len(_static_check_files(changed)) > len(issues):
-            # never let a "fix" ship a step worse than the draft it judged
-            files.clear()
-            files.update(files_before)
-            changed = changed_before
-            warnings.append(f"step {idx}: a foreman fix made the syntax "
-                            f"checks worse and was reverted")
-            _mem_note(mem, f"Step {idx}: a foreman fix touching "
-                           + ", ".join(sorted(fixes))
-                           + " made the syntax checks WORSE and was REVERTED "
-                             "— that approach failed, do not retry it")
-            break
-        fn = re.search(r"FIXED:\s*(.+)", clean)
-        note = fn.group(1).strip() if fn else "foreman revised the step"
-        _mem_note(mem, f"Step {idx} foreman round: edited "
-                       + ", ".join(sorted(fixes)) + f" — {note}")
+    if FOREMAN_MODE == "step":
+        note = _foreman_fix_loop(
+            job_id, step, changed, files, warnings, mem, foreman_system,
+            stage=f"checking step {idx}/{total}", tag=f"step {idx}",
+            label=f"step{idx}",
+            header=f"Step {idx} of {total}: {step['title']}")
+    else:
+        with JOBS_LOCK:
+            final_done = bool(JOBS.get(job_id, {}).get("foreman_final_done"))
+        if FOREMAN_MODE == "job" and final_done:
+            # fix steps that run AFTER the final foreman pass (browser gate,
+            # behavior, visual) have no later pass to lean on — check them
+            # here, exactly as step mode would. Still free when green.
+            note = _foreman_fix_loop(
+                job_id, step, changed, files, warnings, mem, foreman_system,
+                stage=f"checking step {idx}/{total}", tag=f"step {idx}",
+                label=f"step{idx}",
+                header=f"Step {idx} of {total}: {step['title']}")
+        else:
+            # job mode pre-final (or off): the free deterministic checks
+            # still run NOW so later steps aren't building blind on a broken
+            # file — the findings go to working memory.
+            issues = _static_check_files(changed) + [
+                d for d in _dup_symbol_check(files)
+                if any(n in d for n in changed)] + [
+                b for b in _bundle_check(files)
+                if "does not exist" in b]
+            if issues:
+                _trace(job_id, "step_checks", step=idx,
+                       deferred=(FOREMAN_MODE == "job"), issues=issues[:6])
+                _mem_note(mem, f"Step {idx}: automated checks flag: "
+                               + "; ".join(issues[:4])
+                               + (" — the final foreman pass will fix these"
+                                  if FOREMAN_MODE == "job" else ""))
     step_notes.append(f"{idx}. {step['title']} "
                       + ("⚠ partial — " + ", ".join(still_bad) + " not applied"
                          if still_bad else "✓")
@@ -5145,7 +5280,9 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
            mode="PATCH" if followup else "BUILD",
            project_files=sorted(proj_files),
            project_chars=sum(len(v) for v in proj_files.values()),
-           whole_project_budget=small_project_chars(), coder=coder_url())
+           whole_project_budget=small_project_chars(),
+           ride_along=ride_along_chars(), foreman=FOREMAN_MODE,
+           coder=coder_url())
     print(f"[code] job {job_id} start: "
           f"{'PATCH' if followup else 'BUILD'} mode, "
           f"{len(proj_files)} files / {sum(len(v) for v in proj_files.values())} chars "
@@ -5328,6 +5465,33 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
                                      step_system, foreman_system, mem):
                     break
 
+    # ---- final foreman pass (CREWE_FOREMAN=job): one LLM check/fix over ----
+    # the whole delivery instead of one after every step. Runs before the
+    # browser gate so the gate loads code the foreman has already cleaned up.
+    # Costs nothing when the deterministic checks are green.
+    if FOREMAN_MODE == "job" and files and not _job_cancelled(job_id):
+        job_changed = {n: c for n, c in files.items()
+                       if proj_files.get(n) != c}
+        if job_changed:
+            fstep = {"title": "final foreman review",
+                     "detail": ("All build steps are complete. Review the "
+                                "files this job changed as ONE delivery: fix "
+                                "every automated check failure and any change "
+                                "that contradicts another file."),
+                     "done_when": "automated checks pass on the changed files"}
+            fnote = _foreman_fix_loop(
+                job_id, fstep, job_changed, files, warnings, mem,
+                foreman_system, stage="final foreman check",
+                tag="final review", label="final",
+                header="Final review of the whole build")
+            if fnote:
+                step_notes.append(f"🔧 final foreman: {fnote}")
+        # From here on, fix steps (browser gate, behavior, visual) have no
+        # later foreman pass to lean on — _execute_step sees this flag and
+        # checks them per-step again, exactly as step mode would.
+        with JOBS_LOCK:
+            JOBS.setdefault(job_id, {})["foreman_final_done"] = True
+
     AUTOFIX = os.environ.get("CREWE_AUTOFIX", "doa")
     VERIFY_BUDGET = int(os.environ.get("CREWE_VERIFY_BUDGET", "600"))
     verify_t0 = time.time()
@@ -5411,7 +5575,7 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
                        "\nFix every problem without removing features.")
             fix_step = {
                 "title": "fix runtime errors",
-                "detail": detail,
+                "detail": detail, "edit_only": attempt == 0,
                 "files": [], "done_when": "the page loads and draws without errors"}
             if not _budget_left("browser gate"):
                 break
@@ -5495,6 +5659,7 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
                            "behavior (output the full file, not "
                            "SEARCH/REPLACE edits).")
             vfix = {"title": "make behavior checks pass", "detail": detail,
+                    "edit_only": vround == 0,
                     "files": [], "done_when": "all behavior checks pass"}
             if not _budget_left("behavior checks"):
                 break
@@ -5573,6 +5738,7 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
             prev_vis = list(defects)
             vstep = {"title": "fix what the page visibly gets wrong",
                      "detail": detail, "files": [],
+                     "edit_only": vattempt == 0,
                      "done_when": "the rendered page visibly shows the "
                                   "requested interface"}
             if not _execute_step(job_id, vstep, 1, 1, plan["goal"], outline,
