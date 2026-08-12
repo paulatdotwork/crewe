@@ -2393,10 +2393,14 @@ _BUILTIN_RULES = {
                "well with a food or meal.\n",
     "code": ("- 'code': ANYTHING asking to build, create, make, generate, "
              "write, or fix something that produces a working artifact — "
-             "website, app, program, function, HTML, CSS, JSON, SQL, etc. "
-             "If the user wants something BUILT or CODED, always choose code, "
-             "even if the topic sounds creative. Also choose code when the "
-             "user reports errors, stack traces, or that something previously "
+             "game, website, app, program, function, HTML, CSS, JSON, SQL, "
+             "etc. A message describing or pitching a game or app — its "
+             "idea, features, mechanics, or rules ('I want to make a game "
+             "where...', 'I have an idea for a game/app...') — is code, NOT "
+             "creative and NOT general: the user wants it built. If the "
+             "user wants something BUILT or CODED, always choose code, even "
+             "if the topic sounds creative. Also choose code when the user "
+             "reports errors, stack traces, or that something previously "
              "built is broken or needs fixing.\n"),
     "review": ("- 'review': the user wants EXISTING code REVIEWED — 'suggest "
                "improvements', 'code review', 'critique this code', 'audit', "
