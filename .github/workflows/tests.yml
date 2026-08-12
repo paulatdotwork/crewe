@@ -48,3 +48,21 @@ jobs:
       - name: truncation
         if: ${{ !cancelled() }}
         run: python3 tests/test_truncation.py
+      - name: agent-loop
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_loop.py
+      - name: agent-routes
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_routes.py
+      - name: agent-ssh
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_ssh.py
+      - name: agent-coder
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_coder.py
+      - name: agent-preview
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_preview.py
+      - name: agent-projects
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_projects.py

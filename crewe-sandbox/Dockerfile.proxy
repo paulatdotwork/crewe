@@ -1,0 +1,8 @@
+# Egress proxy: tinyproxy with a default-deny allowlist. Built from alpine + apt
+# rather than a random hub image so the whole thing is auditable.
+FROM alpine:latest
+RUN apk add --no-cache tinyproxy
+COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
+COPY filter /etc/tinyproxy/filter
+EXPOSE 8888
+CMD ["tinyproxy", "-d"]

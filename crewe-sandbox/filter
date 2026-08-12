@@ -1,0 +1,23 @@
+# Egress allowlist (POSIX extended regex, matched against destination host).
+# With FilterDefaultDeny Yes, ONLY hosts matching a line here are reachable.
+# Keep this tight — every entry is a hole. Add package mirrors as builds prove
+# they're needed, not speculatively.
+
+# npm
+^registry\.npmjs\.org$
+(^|\.)npmjs\.org$
+
+# pip / PyPI
+(^|\.)pypi\.org$
+(^|\.)pythonhosted\.org$
+
+# apt (Debian bookworm — the sandbox base)
+(^|\.)debian\.org$
+
+# GitHub — lets the agent clone public repos for review-and-fix work
+# (added 2026-08-02; clone uses github.com, tarballs codeload, raw file
+# fetches the usercontent hosts)
+(^|\.)github\.com$
+^codeload\.github\.com$
+^raw\.githubusercontent\.com$
+^objects\.githubusercontent\.com$

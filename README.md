@@ -10,6 +10,20 @@
 
 ## Features
 
+**Code agent** *(admin-only)*
+- A coding agent at `/agent` that drives a **sandboxed Docker container**
+  (real shell, package installs through a default-deny egress allowlist) —
+  or, optionally, a real machine over SSH from a server-side allowlist
+- **Projects**: every run starts its own project; browse past builds as
+  cards, preview HTML builds live, test any build with one command in a
+  fresh sandbox, continue a project or delete it
+- Streamed model calls: live "coder writing…" progress, Stop that lands
+  mid-generation, silence-based timeouts that never kill a slow-but-alive
+  local model
+- Pick the coder per run from your configured backends; auto-plan turns a
+  vague request into a bounded MVP spec you can edit before building
+- Setup and security model: [docs/AGENT.md](docs/AGENT.md)
+
 **Routing**
 - A lightweight classifier picks the specialist per question; short continuations ("no", "keep going") stick with the previous route
 - **Settings UI** (`/settings`): register backends by type — **llama.cpp**, **Ollama**, **Claude (Anthropic)**, or any OpenAI-compatible server or hosted API — and point any route at any backend, add custom routes — with an AI helper that drafts the routing rule and a **live routing test** that runs your example questions through the real classifier before you commit. Changes apply live, no restart.

@@ -8208,6 +8208,7 @@ PAGE = r"""<!DOCTYPE html>
       <a href="/shots" target="_blank">build checks<span class="arr"> ↗</span></a>
       <a href="/compare" target="_blank">compare<span class="arr"> ↗</span></a>
       <a href="/admin" class="admin-only" style="display:none">👥 people</a>
+      <a href="/agent" class="admin-only" style="display:none">🛠 agent</a>
       <a href="/settings" class="admin-only" style="display:none">⚙ settings</a>
       <span id="spendTag" class="spend-tag" style="display:none"></span>
       <a href="/help">? help</a>
@@ -11289,9 +11290,1111 @@ def _start_meta_backfill():
         set_owner(None)
 
 
+# ---- code agent (admin-only) -------------------------------------------------
+# Wires ~/agent.py (Docker sandbox + egress + agent loop) into Crewe as an
+# admin-only mode. All /agent* routes are admin-gated via ADMIN_PREFIXES. Runs
+# are one-at-a-time (each ties up a container + the coder model) and their files
+# are snapshotted into the running user's account.
+AGENT_JOBS = {}
+AGENT_JOBS_LOCK = threading.Lock()
+AGENT_ACTIVE = threading.Lock()          # one agent run at a time
+AGENT_MAX_STEPS = int(os.environ.get("CREWE_AGENT_MAX_STEPS", "15"))
+
+# Remote SSH targets the agent may use. THE ALLOWLIST IS THE SECURITY BOUNDARY:
+# the browser only ever sends a target NAME; the host/user/key are resolved here,
+# server-side, so an admin can never point the agent at an arbitrary machine.
+# File shape: {"hosts":[{"name","host","user","port"?,"key"?,"workdir"?}]}
+# The file lives OUTSIDE the repo (machine settings, never committed).
+AGENT_HOSTS_FILE = os.path.expanduser(
+    os.environ.get("CREWE_AGENT_HOSTS", "~/crewe_agent_hosts.json"))
+
+def _load_agent_hosts():
+    try:
+        with open(AGENT_HOSTS_FILE) as f:
+            return json.load(f).get("hosts", [])
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def _agent_host(name):
+    return next((h for h in _load_agent_hosts()
+                 if h.get("name") == name), None)
+
+def _agent_coder(coder_id):
+    """Resolve a coder CHOICE to {url,key,model} server-side from the backend
+    list — the browser only ever sends a backend id, same posture as SSH
+    targets. Only openai-kind backends qualify: the agent loop speaks
+    /v1/chat/completions (agent.py is standalone and knows no other dialect)."""
+    b = next((b for b in ROUTER_CONFIG.get("backends", [])
+              if b.get("id") == coder_id
+              and b.get("kind", "openai") == "openai" and b.get("url")), None)
+    if not b:
+        return None
+    return {"url": b["url"].rstrip("/") + "/v1/chat/completions",
+            "key": b.get("key") or None, "model": b.get("model") or None}
+
+AGENT_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent &middot; Crewe</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%238b4a18'/%3E%3Cpath d='M32 57V34M32 34 16 13M32 34 48 13' stroke='%23faf6f0' stroke-width='7' stroke-linecap='round' fill='none'/%3E%3Ccircle cx='32' cy='34' r='6' fill='%23faf6f0'/%3E%3C/svg%3E">
+<link href="/static/fonts.css" rel="stylesheet">
+<script>try{var t=localStorage.getItem('creweTheme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<style>
+:root{--bg:#faf6f0;--card:#fff;--ink:#2b211a;--muted:#7d6b5d;--line:#e4d9cc;--gold:#8b4a18;--btn-ink:#faf6f0;--err:#a3301c;--ok:#3f7d3f;--run:#2b6cb0}
+[data-theme=dark]{--bg:#1e1815;--card:#2a2220;--ink:#f0e7dc;--muted:#a89684;--line:#3d322c;--gold:#c97a3d;--btn-ink:#1e1815;--err:#e08a76;--ok:#8fc98f;--run:#7fb0e0}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:'DM Sans',system-ui,sans-serif;padding:26px 18px}
+.wrap{max-width:860px;margin:0 auto}
+.top{display:flex;align-items:center;gap:11px;margin-bottom:8px}
+.top svg{width:32px;height:32px;border-radius:8px}
+.top h1{font-family:'Lora',Georgia,serif;font-size:23px;margin:0;flex:1;font-weight:600}
+.top a{color:var(--gold);text-decoration:none;font-size:14px}
+.note{color:var(--muted);font-size:13px;margin:0 0 18px}
+textarea{width:100%;min-height:74px;padding:12px 13px;border:1px solid var(--line);border-radius:11px;
+     background:var(--card);color:var(--ink);font:inherit;font-size:15px;resize:vertical}
+.bar{display:flex;gap:10px;margin:12px 0 20px;align-items:center}
+button{padding:10px 20px;border:0;border-radius:9px;background:var(--gold);color:var(--btn-ink);
+     font:inherit;font-weight:600;font-size:14.5px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+button.stop{background:var(--err)}
+select{padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:var(--card);color:var(--ink);font:inherit;font-size:14px}
+.plan{font-size:13.5px;color:var(--muted);display:flex;align-items:center;gap:5px;cursor:pointer}
+.line.plan-block{color:var(--gold);background:color-mix(in srgb,var(--gold) 7%,transparent);border-radius:8px;padding:8px 10px;margin:4px 0}
+.status{color:var(--muted);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:16px 18px;margin-bottom:18px}
+.card h2{font-family:'Lora',Georgia,serif;font-size:16px;margin:0 0 10px}
+#feed{font-family:ui-monospace,'SF Mono',monospace;font-size:12.5px;line-height:1.5;max-height:420px;overflow:auto}
+.line{padding:3px 0;border-bottom:1px solid var(--line);white-space:pre-wrap;word-break:break-word}
+.line .k{display:inline-block;min-width:64px;font-weight:700}
+.line.action .k{color:var(--run)} .line.obs .k{color:var(--muted)}
+.line.error{color:var(--err)} .line.warn{color:var(--gold)}
+#files a{display:block;color:var(--gold);text-decoration:none;padding:3px 0;font-size:14px}
+.dl{display:inline-block;margin-bottom:8px;font-weight:600}
+.hidden{display:none}
+/* ---- remote file browser ---- */
+.fsbar{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.fsbar button{padding:6px 12px;font-size:13px}
+#fsPath{flex:1;min-width:200px;font:12.5px ui-monospace,monospace;color:var(--muted);
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+#fsList{font-family:ui-monospace,'SF Mono',monospace;font-size:13px;max-height:300px;overflow:auto}
+.fsrow{display:flex;gap:9px;padding:4px 6px;border-radius:6px;cursor:pointer;align-items:baseline}
+.fsrow:hover{background:color-mix(in srgb,var(--gold) 9%,transparent)}
+.fsrow .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fsrow .sz{color:var(--muted);font-size:11.5px;flex:none}
+.fsrow.dir .nm{color:var(--gold);font-weight:600}
+.fsrow.dot .nm{opacity:.62}
+.fshint{color:var(--muted);font-size:12px;margin-top:8px}
+/* ---- test bench + preview ---- */
+#testCmd{flex:1;min-width:220px;padding:9px 11px;border:1px solid var(--line);border-radius:9px;
+        background:var(--bg);color:var(--ink);font:12.5px ui-monospace,'SF Mono',monospace}
+#testOut{font:12.5px/1.5 ui-monospace,'SF Mono',monospace;white-space:pre-wrap;word-break:break-word;
+        background:color-mix(in srgb,var(--ink) 5%,transparent);border-radius:8px;padding:10px 12px;
+        max-height:320px;overflow:auto;margin:10px 0 0}
+#preview{width:100%;height:460px;border:1px solid var(--line);border-radius:9px;background:#fff}
+/* ---- project shelf ---- */
+.projgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(235px,1fr));gap:10px}
+.proj{border:1px solid var(--line);border-radius:11px;padding:11px 13px;cursor:pointer;background:var(--bg)}
+.proj:hover{border-color:var(--gold)}
+.proj.sel{outline:2px solid var(--gold)}
+.proj.new{border-style:dashed;display:flex;flex-direction:column;justify-content:center}
+.proj.new h3{color:var(--gold)}
+.proj h3{font-family:'Lora',Georgia,serif;font-size:14.5px;margin:0 0 4px;font-weight:600}
+.proj .meta{color:var(--muted);font-size:12px}
+.proj .sum{color:var(--muted);font-size:12.5px;margin-top:6px;display:-webkit-box;
+          -webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.proj .acts{display:flex;gap:8px;margin-top:9px;align-items:center}
+.proj .acts button{padding:5px 12px;font-size:12.5px}
+.proj .acts a{color:var(--gold);text-decoration:none;font-size:12.5px}
+</style></head><body><div class="wrap">
+<div class="top">
+  <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><rect width="64" height="64" rx="14" fill="#8b4a18"/><path d="M32 57V34M32 34 16 13M32 34 48 13" stroke="#faf6f0" stroke-width="7" stroke-linecap="round" fill="none"/><circle cx="32" cy="34" r="6" fill="#faf6f0"/></svg>
+  <h1>Agent</h1><a href="/">&larr; Back to Crewe</a>
+</div>
+<p class="note">A coding agent working in a sandboxed Linux container (real shell, package installs, no access to your network). Admin only. One run at a time.</p>
+
+<div class="card hidden" id="projCard"><h2>📚 Projects</h2>
+  <div id="projList" class="projgrid"></div>
+  <p class="fshint">Each request starts its own project. <b>Continue</b> a project to build on its files — otherwise the agent always starts clean.</p>
+</div>
+
+<p class="note hidden" id="projChip" style="margin:0 0 10px">📂 Continuing <b id="projName"></b> — the agent starts from this project's files.
+  <a href="#" onclick="clearProject();return false" style="color:var(--gold)">✕ start a new project instead</a></p>
+<textarea id="task" placeholder="Describe what to build — e.g. 'Write a Python CLI that dedupes a CSV file, install any packages it needs, and test it on sample data.'"></textarea>
+<div class="bar">
+  <select id="target" title="where the agent works" onchange="targetNote()"></select>
+  <select id="coder" title="which model drives the agent"></select>
+  <select id="steps" title="step budget for this run">
+    <option value="8">8 steps</option>
+    <option value="15" selected>15 steps</option>
+    <option value="25">25 steps</option>
+    <option value="40">40 steps</option>
+  </select>
+  <label class="plan"><input type="checkbox" id="plan" checked> Auto-plan</label>
+  <button id="planBtn" onclick="makePlan()">Plan &amp; review</button>
+  <button id="go" onclick="runTask()">Run agent</button>
+  <button id="stop" class="stop hidden" onclick="stopRun()">Stop</button>
+  <span class="status" id="status"></span>
+</div>
+<div id="planArea" class="card hidden">
+  <h2>Plan — edit before running</h2>
+  <textarea id="planText" style="min-height:190px;font-family:ui-monospace,monospace;font-size:12.5px"></textarea>
+  <p class="note" style="margin:8px 0 0">Edit freely, then hit <b>Run agent</b> to build exactly this. Clear the box to let the agent plan on its own.</p>
+</div>
+<p class="note hidden" id="targetWarn" style="color:var(--err);margin-top:-8px">⚠ This target is a real machine over SSH — it is <b>not</b> sandboxed. Commands run for real, as that host's user.</p>
+
+<div class="card hidden" id="fsCard">
+  <h2>📁 Files on <span id="fsHost"></span></h2>
+  <div class="fsbar">
+    <button onclick="fsUp()" title="Parent directory">↑ Up</button>
+    <button onclick="fsLoad()" title="Refresh">⟳</button>
+    <button onclick="fsMkdir()" title="Create a directory here">＋ New folder</button>
+    <span id="fsPath"></span>
+  </div>
+  <div id="fsList"></div>
+  <p class="fshint">Click a folder to open it · click a file to insert its path
+  into the task box · new agent runs land in <code>~/crewe-agent/&lt;run-id&gt;</code>.</p>
+</div>
+
+<div class="card"><h2>Transcript</h2><div id="feed"></div></div>
+<div class="card hidden" id="summaryCard"><h2>Summary</h2><div id="summary"></div></div>
+<div class="card hidden" id="filesCard"><h2>Files</h2><div id="files"></div></div>
+<div class="card hidden" id="previewCard"><h2>👁 Preview</h2>
+  <a class="dl" id="previewOpen" href="#" target="_blank">↗ Open in a new tab</a>
+  <iframe id="preview" sandbox="allow-scripts" title="preview of the built app"></iframe>
+</div>
+<div class="card hidden" id="testCard"><h2>🧪 Test it</h2>
+  <div class="fsbar">
+    <input id="testCmd" type="text" placeholder="e.g. python3 app.py --help &nbsp;·&nbsp; pip install -r requirements.txt && python3 -m pytest"
+      onkeydown="if(event.key==='Enter')runTest()">
+    <button id="testBtn" onclick="runTest()">Run</button>
+  </div>
+  <pre id="testOut" class="hidden"></pre>
+  <p class="fshint">Runs one command in a FRESH sandbox seeded with this run's files.
+  Installed packages don't carry over — reinstall them in the same command if needed.</p>
+</div>
+<div class="card hidden" id="followCard"><h2>💬 Follow up</h2>
+  <textarea id="followTask" style="min-height:56px" placeholder="e.g. The board is too small — make it fill the page, and add a score display."></textarea>
+  <div class="bar" style="margin:10px 0 0">
+    <button onclick="followUp()">Improve it</button>
+    <span class="status">runs the agent again in the same workspace, with this build and its summary as context</span>
+  </div>
+</div>
+
+<script>
+let cursor=0, jobId=null, poll=null;
+const $=id=>document.getElementById(id);
+async function loadTargets(){
+  try{ const t=await(await fetch('/agent/hosts')).json();
+    const sel=$('target'); sel.innerHTML='';
+    (t.targets||[]).forEach(x=>{ const o=document.createElement('option');
+      const icon = x.kind==='ssh'?'🖥 ':'📦 ';
+      o.value=x.name; o.textContent=icon+x.name;
+      o.dataset.kind=x.kind; sel.appendChild(o); });
+    const cs=$('coder'); cs.innerHTML='';
+    (t.coders||[{id:'default'}]).forEach(x=>{ const o=document.createElement('option');
+      o.value=x.id; o.textContent='🧠 '+(x.id==='default'?'default coder':x.id);
+      cs.appendChild(o); });
+    targetNote();
+  }catch(e){}
+}
+function targetNote(){
+  const sel=$('target'), opt=sel.options[sel.selectedIndex];
+  const isSSH=opt && opt.dataset.kind==='ssh';
+  $('targetWarn').classList.toggle('hidden', !isSSH);
+  $('fsCard').classList.toggle('hidden', !isSSH);
+  if(isSSH){ $('fsHost').textContent=opt.value; fsPath='~'; fsLoad(); }
+}
+
+// ---- remote file browser ----------------------------------------------------
+let fsPath='~', fsBusy=false;
+function fmtSize(n){
+  if(n>=1048576)return (n/1048576).toFixed(1)+' MB';
+  if(n>=1024)return (n/1024).toFixed(0)+' KB';
+  return n+' B';
+}
+async function fsLoad(){
+  if(fsBusy)return; fsBusy=true;
+  const host=$('target').value, list=$('fsList');
+  list.innerHTML='<div class="fsrow"><span class="nm" style="color:var(--muted)">loading…</span></div>';
+  try{
+    const r=await(await fetch('/agent/fs/'+encodeURIComponent(host)+'/list?path='+encodeURIComponent(fsPath))).json();
+    if(r.error){list.innerHTML='<div class="fsrow"><span class="nm" style="color:var(--err)">'+esc(r.error)+'</span></div>';fsBusy=false;return;}
+    fsPath=r.path; $('fsPath').textContent=r.path; $('fsPath').title=r.path;
+    list.innerHTML='';
+    if(!r.entries.length)
+      list.innerHTML='<div class="fsrow"><span class="nm" style="color:var(--muted)">(empty directory)</span></div>';
+    r.entries.forEach(e=>{
+      const row=document.createElement('div');
+      row.className='fsrow'+(e.dir?' dir':'')+(e.name.startsWith('.')?' dot':'');
+      row.innerHTML='<span>'+(e.dir?'📁':'📄')+'</span><span class="nm">'+esc(e.name)+'</span>'
+        +(e.dir?'':'<span class="sz">'+fmtSize(e.size)+'</span>');
+      row.addEventListener('click',()=>{
+        if(e.dir){ fsPath=fsPath.replace(/\/+$/,'')+'/'+e.name; fsLoad(); }
+        else{
+          const t=$('task'), p=fsPath.replace(/\/+$/,'')+'/'+e.name;
+          t.value=(t.value.trimEnd()+(t.value.trim()?'\n':'')+p);
+          t.focus();
+        }
+      });
+      list.appendChild(row);
+    });
+    if(r.truncated){
+      const row=document.createElement('div'); row.className='fsrow';
+      row.innerHTML='<span class="nm" style="color:var(--muted)">(showing first 500 entries)</span>';
+      list.appendChild(row);
+    }
+  }catch(e){
+    list.innerHTML='<div class="fsrow"><span class="nm" style="color:var(--err)">browser unreachable</span></div>';
+  }
+  fsBusy=false;
+}
+function fsUp(){
+  if(fsPath==='/'){return;}
+  fsPath=fsPath.replace(/\/+$/,'').split('/').slice(0,-1).join('/')||'/';
+  fsLoad();
+}
+async function fsMkdir(){
+  const folder=prompt('New folder name (created in '+fsPath+'):');
+  if(!folder)return;
+  const host=$('target').value;
+  const r=await(await fetch('/agent/fs/'+encodeURIComponent(host)+'/mkdir',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({path:fsPath,folder:folder.trim()})})).json();
+  if(r.error)alert(r.error); else fsLoad();
+}
+async function makePlan(){
+  const task=$('task').value.trim(); if(!task)return;
+  const b=$('planBtn'); b.disabled=true; b.textContent='Planning…';
+  try{
+    const r=await(await fetch('/agent/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task, target: $('target').value, coder: $('coder').value})})).json();
+    if(r.spec){ $('planText').value=r.spec; $('planArea').classList.remove('hidden'); }
+    else alert(r.error||'planning failed');
+  }catch(e){ alert('planning failed'); }
+  b.disabled=false; b.textContent='Plan & review';
+}
+loadTargets();
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
+function addLine(cls,k,txt){const d=document.createElement('div');d.className='line '+cls;
+  d.innerHTML='<span class="k">'+esc(k)+'</span>'+esc(txt);$('feed').appendChild(d);
+  $('feed').scrollTop=$('feed').scrollHeight;}
+function shortDetail(det){if(!det)return '';if(det.cmd)return det.cmd;if(det.path)return det.path;if(det.summary)return det.summary;return JSON.stringify(det);}
+function renderEvent(e){
+  if(e.t==='plan') addLine('plan-block','plan', e.spec);
+  else if(e.t==='vision'){
+    if(e.critique) addLine('plan-block','👁 review'+(e.ok?' ✓ looks good':''), e.critique);
+    else if(e.note) addLine('warn','👁', e.note);
+  }
+  else if(e.t==='plan_error') addLine('warn','·','planning failed, running raw task: '+e.error);
+  else if(e.t==='model_progress'){ $('status').textContent='step '+e.step+' · coder writing… '+e.chars.toLocaleString()+' chars'; }
+  else if(e.t==='action'){ $('status').textContent='running…'; addLine('action', e.action, shortDetail(e.detail)); }
+  else if(e.t==='observation') addLine('obs','→', e.obs);
+  else if(e.t==='parse_fail') addLine('warn','·','(model reply unparseable, retrying)');
+  else if(e.t==='cancelled') addLine('warn','·','cancelled');
+  else if(e.t==='model_error') addLine('error','!', e.error);
+  else if(e.t==='harness') addLine('warn','·', e.note);
+  else if(e.t==='warn') addLine('warn','·', e.note);
+  else if(e.t==='snapshot_error') addLine('warn','·','snapshot: '+e.error);
+}
+async function runTask(){
+  const task=$('task').value.trim(); if(!task)return;
+  const pt=$('planText').value.trim(); const useEdited = !$('planArea').classList.contains('hidden') && pt;
+  const payload={task, target: $('target').value, coder: $('coder').value,
+                 steps: $('steps').value};
+  if(useEdited){ payload.plan_text=pt; } else { payload.plan=$('plan').checked; }
+  startRun(payload);
+}
+async function startRun(payload){
+  $('feed').innerHTML='';
+  ['summaryCard','filesCard','previewCard','testCard','followCard'].forEach(id=>$(id).classList.add('hidden'));
+  $('testOut').classList.add('hidden'); $('testOut').textContent=''; $('testCmd').value='';
+  // only an EXPLICIT Continue click attaches a run to an old project; with
+  // nothing selected every run starts a brand-new one (payload.project may
+  // also be set directly, e.g. by a follow-up)
+  if(payload.project===undefined && selectedProject) payload.project=selectedProject;
+  let r,j; try{ r=await fetch('/agent/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); j=await r.json(); }
+  catch(e){ addLine('error','!','request failed'); return; }
+  if(j.error){ addLine('error','!', j.error); return; }
+  lastRunProject=j.project||null;    // remembered so Improve-it targets THIS build
+  jobId=j.job_id; cursor=0; setRunning(true);
+  poll=setInterval(tick, 900); tick();
+}
+function followUp(){
+  const t=$('followTask').value.trim(); if(!t)return;
+  // surgical by design: no auto-replan (a fresh MVP spec would re-scope the
+  // build); the selected project seeds the workspace + carries its summary
+  $('task').value=t; $('planArea').classList.add('hidden'); $('planText').value='';
+  $('followTask').value='';
+  startRun({task:t, target: $('target').value, coder: $('coder').value, plan:false,
+            steps: $('steps').value,
+            project: selectedProject||lastRunProject||undefined});
+}
+// ---- project shelf ----------------------------------------------------------
+let selectedProject=null, lastRunProject=null;
+async function loadProjects(){
+  let r; try{ r=await(await fetch('/agent/projects')).json(); }catch(e){ return; }
+  const ps=r.projects||[], box=$('projList'); box.innerHTML='';
+  $('projCard').classList.remove('hidden');
+  const nw=document.createElement('div');
+  nw.className='proj new'+(selectedProject?'':' sel');
+  nw.innerHTML='<h3>＋ New project</h3><div class="meta">start clean — nothing carried over</div>';
+  nw.onclick=()=>clearProject();
+  box.appendChild(nw);
+  ps.forEach(p=>{
+    const d=document.createElement('div'); d.className='proj'+(p.id===selectedProject?' sel':'');
+    const when=p.updated? new Date(p.updated*1000).toLocaleDateString():'';
+    d.innerHTML='<h3>'+esc(p.title)+'</h3><div class="meta">'
+      +p.runs+' run'+(p.runs===1?'':'s')+' · '+p.files+' file'+(p.files===1?'':'s')+(when?' · '+when:'')+'</div>'
+      +(p.summary?'<div class="sum">'+esc(p.summary)+'</div>':'');
+    const acts=document.createElement('div'); acts.className='acts';
+    const bC=document.createElement('button');
+    bC.textContent=(p.id===selectedProject)?'✓ continuing':'Continue';
+    bC.onclick=e=>{e.stopPropagation(); selectProject(p);};
+    acts.appendChild(bC);
+    if(p.has_html && p.job_id){
+      const a=document.createElement('a'); a.href='/agent/preview/'+p.job_id+'/';
+      a.target='_blank'; a.textContent='👁 preview';
+      a.onclick=e=>e.stopPropagation(); acts.appendChild(a);
+    }
+    const bD=document.createElement('button'); bD.className='stop'; bD.textContent='🗑';
+    bD.title='Delete this project and its files';
+    bD.onclick=async e=>{e.stopPropagation();
+      if(!confirm('Delete project "'+p.title+'" and all its files?'))return;
+      const res=await(await fetch('/agent/projects/'+p.id+'/delete',{method:'POST'})).json();
+      if(res.error){alert(res.error);return;}
+      if(selectedProject===p.id) clearProject();
+      loadProjects();};
+    acts.appendChild(bD);
+    d.appendChild(acts);
+    d.onclick=()=>selectProject(p);
+    box.appendChild(d);
+  });
+}
+async function selectProject(p){
+  // pure LOAD: bring the project's saved state onto the page. No model call
+  // happens here — the coder is only ever invoked by Run agent / Improve it.
+  selectedProject=p.id; $('projName').textContent=p.title;
+  $('projChip').classList.remove('hidden'); loadProjects(); $('task').focus();
+  ['summaryCard','filesCard','previewCard','testCard','followCard'].forEach(id=>$(id).classList.add('hidden'));
+  $('testOut').classList.add('hidden'); $('testOut').textContent=''; $('testCmd').value='';
+  if(!p.job_id) return;                       // never completed a run — nothing to show
+  jobId=p.job_id;
+  $('summary').textContent=p.summary||'(no summary saved)';
+  $('summaryCard').classList.remove('hidden');
+  try{ const f=await(await fetch('/agent/files/'+p.job_id)).json();
+       renderFiles(f.files||[]); }catch(e){}
+  if(p.has_html){
+    $('preview').src='/agent/preview/'+p.job_id+'/';
+    $('previewOpen').href='/agent/preview/'+p.job_id+'/';
+    $('previewCard').classList.remove('hidden');
+  }
+  if(p.entry_cmd) $('testCmd').value=p.entry_cmd;
+  $('testCard').classList.remove('hidden');
+  $('followCard').classList.remove('hidden');
+}
+function clearProject(){
+  selectedProject=null; $('projChip').classList.add('hidden');
+  ['summaryCard','filesCard','previewCard','testCard','followCard'].forEach(id=>$(id).classList.add('hidden'));
+  loadProjects();
+}
+loadProjects();
+async function runTest(){
+  const cmd=$('testCmd').value.trim(); if(!cmd||!jobId)return;
+  const b=$('testBtn'), out=$('testOut');
+  b.disabled=true; out.classList.remove('hidden'); out.textContent='running…';
+  try{
+    const r=await(await fetch('/agent/test/'+jobId,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd})})).json();
+    out.textContent = r.error ? '! '+r.error
+      : 'exit '+r.exit_code+'\n'+(r.stdout||'')+(r.stderr?'\n--- stderr ---\n'+r.stderr:'');
+  }catch(e){ out.textContent='! request failed'; }
+  b.disabled=false;
+}
+async function tick(){
+  let p; try{ p=await(await fetch('/agent/progress/'+jobId+'?since='+cursor)).json(); }catch(e){ return; }
+  if(p.error && !p.events){
+    // unknown job: the router restarted under us — stop polling forever
+    clearInterval(poll); setRunning(false);
+    $('status').textContent='job lost (router restarted?)';
+    addLine('error','!','job lost — the router restarted mid-run');
+    return;
+  }
+  cursor=p.cursor; (p.events||[]).forEach(renderEvent);
+  if(p.live) renderEvent(p.live);
+  if(p.done){ clearInterval(poll); setRunning(false); finish(p); }
+}
+function finish(p){
+  if(p.error) addLine('error','!', p.error);
+  $('status').textContent = p.cancelled ? 'stopped'
+    : (p.error ? 'failed'
+    : (p.exhausted ? 'ran out of steps — result is best-effort' : 'done'));
+  $('summary').textContent = p.summary || '(no summary)';
+  $('summaryCard').classList.remove('hidden');
+  renderFiles(p.files||[]);
+  const files=p.files||[];
+  if(files.length && !p.error){
+    if(files.some(f=>f.toLowerCase().endsWith('.html'))){
+      $('preview').src='/agent/preview/'+jobId+'/';
+      $('previewOpen').href='/agent/preview/'+jobId+'/';
+      $('previewCard').classList.remove('hidden');
+    }
+    if(p.entry_cmd) $('testCmd').value=p.entry_cmd;
+    $('testCard').classList.remove('hidden');
+    $('followCard').classList.remove('hidden');
+  }
+  loadProjects();
+}
+function renderFiles(files){
+  const box=$('files'); box.innerHTML='';
+  const dl=document.createElement('a'); dl.className='dl'; dl.href='/agent/download/'+jobId+'.zip';
+  dl.textContent='⬇ Download all (.zip)'; box.appendChild(dl);
+  if(!files.length){ const s=document.createElement('div');s.textContent='(no files produced)';box.appendChild(s); }
+  files.forEach(f=>{ const a=document.createElement('a'); a.href='/agent/file/'+jobId+'/'+f; a.target='_blank'; a.textContent='📄 '+f; box.appendChild(a); });
+  $('filesCard').classList.remove('hidden');
+}
+function setRunning(on){
+  $('go').disabled=on; $('stop').classList.toggle('hidden',!on);
+  $('status').textContent = on ? 'running…' : $('status').textContent;
+}
+async function stopRun(){ if(jobId){ $('status').textContent='stopping…'; try{await fetch('/agent/stop/'+jobId,{method:'POST'});}catch(e){} } }
+</script>
+</div></body></html>"""
+
+def agent_runs_dir(uid=None):
+    return _ustore("agent_runs", uid)
+
+def _reap_sandbox_containers():
+    """Remove stray crewe-sbx-* containers. Safe because only ONE agent run
+    happens at a time (AGENT_ACTIVE), so any container alive when a new run
+    starts is a leak from a run that was killed or wedged."""
+    try:
+        import subprocess as _sp
+        ids = _sp.run(["docker", "ps", "-q", "--filter", "name=crewe-sbx-"],
+                      capture_output=True, text=True, timeout=15).stdout.split()
+        if ids:
+            _sp.run(["docker", "rm", "-f", *ids], capture_output=True, timeout=30)
+            print(f"[agent] reaped {len(ids)} stray sandbox container(s)")
+    except Exception as e:
+        print(f"[agent] reap failed: {e}")
+
+# ---- agent projects ----------------------------------------------------------
+# Every run belongs to a PROJECT, and a run only ever starts from a project the
+# admin explicitly chose to continue. This replaces the old agent_last.json
+# implicit continuity, which seeded EVERY link-less task from whatever ran last
+# — a brand-new request would wake up inside the previous build's files.
+# Store: per-user agent_projects.json {"projects":[{id,title,created,updated,
+# job_id,jobs,summary}]} — job_id is the LATEST run (its snapshot is the
+# workspace to continue from), jobs is every run ever made under the project.
+AGENT_PROJECTS_LOCK = threading.Lock()
+
+def _load_projects(uid=None):
+    path = _ufile("agent_projects.json", uid)
+    try:
+        with open(path) as f:
+            return json.load(f).get("projects", [])
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError:
+        # quarantine, don't blank: treating a half-written file as "no
+        # projects" would let the next save silently orphan every project
+        try:
+            os.replace(path, path + f".damaged-{int(time.time())}")
+            print(f"[agent] {path} was corrupt — quarantined")
+        except OSError:
+            pass
+        return []
+
+def _save_projects(projects, uid=None):
+    # atomic: a crash mid-dump must never leave a truncated store behind
+    path = _ufile("agent_projects.json", uid)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"projects": projects}, f)
+    os.replace(tmp, path)
+
+def _project(pid, uid=None):
+    return next((p for p in _load_projects(uid) if p.get("id") == pid), None)
+
+def _agent_default_coder():
+    """The coder used when the UI choice is 'default': an explicit
+    CREWE_AGENT_URL wins (operator override — agent.py resolves it itself);
+    otherwise the router's own coder role, so the agent works out of the box
+    with zero agent-specific config on any install."""
+    if os.environ.get("CREWE_AGENT_URL"):
+        return None
+    url = CODE_AGENT_URL
+    info = BACKEND_INFO.get(url, {}) or {}
+    if not url or (info.get("kind") or "openai") != "openai":
+        return None
+    return {"url": url, "key": info.get("key") or None,
+            "model": info.get("model") or None}
+
+def _entry_cmd(files):
+    """A ready-to-run command for the build, so trying a CLI/script build is
+    one click, not an agent run. Preference: a conventional entry name at the
+    top level, then anywhere; else the single .py file if there is only one.
+    Returns None when there is no obvious entry (the box stays blank)."""
+    pys = [f for f in files if f.endswith(".py")]
+    entry = None
+    for cand in ("main.py", "app.py", "cli.py", "run.py"):
+        hits = [f for f in pys if os.path.basename(f) == cand]
+        if hits:
+            entry = min(hits, key=lambda f: f.count("/"))
+            break
+    if entry is None and len(pys) == 1:
+        entry = pys[0]
+    if entry is None:
+        return None
+    cmd = f"python3 {entry}"
+    reqs = [f for f in files if os.path.basename(f) == "requirements.txt"]
+    if reqs:
+        cmd = f"pip install -r {min(reqs, key=lambda f: f.count('/'))} && " + cmd
+    return cmd
+
+def _gc_orphan_runs(uid, keep_days=7):
+    """Remove run snapshots no project references (failed runs, runs of
+    hand-deleted projects). Only old ones — a run IN PROGRESS has a snapshot
+    dir that no project references until it completes."""
+    try:
+        d = agent_runs_dir(uid)
+        referenced = set()
+        for p in _load_projects(uid):
+            referenced.update(p.get("jobs") or [])
+            if p.get("job_id"):
+                referenced.add(p["job_id"])
+        cutoff = time.time() - keep_days * 86400
+        import shutil
+        for r in os.listdir(d):
+            full = os.path.join(d, r)
+            if (r not in referenced and os.path.isdir(full)
+                    and os.path.getmtime(full) < cutoff):
+                shutil.rmtree(full, ignore_errors=True)
+    except OSError:
+        pass
+
+def _run_agent_job(job_id, task, uid, target="sandbox", plan=True, plan_text=None,
+                   coder=None, project=None, max_steps=None):
+    import agent as _agent
+    if coder is None:
+        coder = _agent_default_coder()
+    _reap_sandbox_containers()          # clear leaks from any prior wedged run
+    _gc_orphan_runs(uid)
+    snapshot = os.path.join(agent_runs_dir(uid), job_id)
+    backend = None
+    if target != "sandbox":
+        h = _agent_host(target)          # re-resolved server-side; never client host
+        if not h:
+            with AGENT_JOBS_LOCK:
+                AGENT_JOBS[job_id].update(done=True, error=f"unknown target '{target}'")
+            try: AGENT_ACTIVE.release()
+            except RuntimeError: pass
+            return
+        import ssh_workspace
+        backend = ssh_workspace.SSHWorkspace(
+            host=h["host"], user=h["user"], port=h.get("port", 22),
+            key=h.get("key"), workdir_base=h.get("workdir", "~/crewe-agent"),
+            run_id=job_id)
+    def on_event(e):
+        with AGENT_JOBS_LOCK:
+            j = AGENT_JOBS.get(job_id)
+            if j is not None:
+                if e.get("t") == "model_progress":
+                    j["live"] = e        # transient: replaced, never appended
+                else:
+                    j["events"].append(e)
+                    j.pop("live", None)
+                j["stage_ts"] = time.time()
+    def cancelled():
+        with AGENT_JOBS_LOCK:
+            j = AGENT_JOBS.get(job_id)
+            return bool(j and j.get("cancel"))
+    try:
+        # Continuity is EXPLICIT: only a continued project seeds the workspace
+        # (from that project's latest snapshot). A task WITH a repo link still
+        # starts fresh from a clean clone even inside a project. Files alone
+        # are not continuity — a follow-up like "fix problem 1 from your
+        # analysis" refers to the previous CONVERSATION, which a fresh run has
+        # never seen (one run burned 13 steps grepping git history for it) —
+        # so the project's last summary rides along with the task.
+        seed = None
+        proj = _project(project, uid) if project else None
+        if proj and proj.get("job_id") and "github.com/" not in task:
+            snap = os.path.join(agent_runs_dir(uid), proj["job_id"])
+            if os.path.isdir(snap):
+                seed = snap
+                if proj.get("summary"):
+                    task = (task + "\n\nCONTEXT — your previous run on this "
+                            "project ended with this summary:\n"
+                            + str(proj["summary"])[:2000])
+        res = _agent.run_agent(task, network="egress",
+                               max_steps=max_steps or AGENT_MAX_STEPS,
+                               on_event=on_event, snapshot_dir=snapshot,
+                               should_cancel=cancelled, backend=backend, plan=plan,
+                               plan_text=plan_text, seed_dir=seed, coder=coder)
+        if project:
+            # record the run — but only a run that left a snapshot is
+            # continuable, and a project whose ONLY run left nothing (stopped
+            # during planning, crashed before the sandbox) is stillborn: drop
+            # it rather than shelve an empty card.
+            snap_ok = os.path.isdir(snapshot)
+            with AGENT_PROJECTS_LOCK:
+                ps = _load_projects(uid)
+                p = next((q for q in ps if q.get("id") == project), None)
+                if p is not None:
+                    if snap_ok:
+                        p["job_id"] = job_id
+                        p["jobs"] = (p.get("jobs") or []) + [job_id]
+                    if res.get("summary"):
+                        p["summary"] = (res.get("summary") or "")[:4000]
+                    p["updated"] = time.time()
+                    if not p.get("jobs") and not p.get("job_id"):
+                        ps = [q for q in ps if q.get("id") != project]
+                    _save_projects(ps, uid)
+        with AGENT_JOBS_LOCK:
+            AGENT_JOBS[job_id].update(done=True, ok=res.get("done"),
+                                      summary=res.get("summary"),
+                                      files=res.get("files") or [],
+                                      entry_cmd=_entry_cmd(res.get("files") or []),
+                                      steps=res.get("steps"),
+                                      # a mid-run model error used to vanish
+                                      # here and render as a successful "done"
+                                      error=res.get("error"),
+                                      exhausted=res.get("exhausted", False),
+                                      cancelled=res.get("cancelled", False))
+    except Exception as e:
+        print(f"[agent] job {job_id} crashed: {e}")
+        with AGENT_JOBS_LOCK:
+            AGENT_JOBS[job_id].update(done=True, error=str(e))
+        if project:
+            # a crash before any completed run leaves a stillborn project
+            with AGENT_PROJECTS_LOCK:
+                ps = _load_projects(uid)
+                ps = [q for q in ps if not (q.get("id") == project
+                      and not q.get("jobs") and not q.get("job_id"))]
+                _save_projects(ps, uid)
+    finally:
+        try:
+            AGENT_ACTIVE.release()
+        except RuntimeError:
+            pass
+
+def _safe_run_id(run_id):
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", run_id or ""))
+
+@app.route("/agent")
+def agent_page():
+    return Response(AGENT_PAGE, mimetype="text/html")
+
+@app.route("/agent/run", methods=["POST"])
+def agent_run():
+    body = request.json or {}
+    task = (body.get("task") or "").strip()
+    target = (body.get("target") or "sandbox").strip()
+    plan = bool(body.get("plan", True))
+    plan_text = (body.get("plan_text") or "").strip() or None
+    if not task:
+        return jsonify({"error": "empty task"}), 400
+    # validate the target BEFORE starting anything ('sandbox' is the built-in;
+    # anything else must be a name on the SSH allowlist)
+    if target != "sandbox" and not _agent_host(target):
+        return jsonify({"error": f"unknown target '{target}'"}), 400
+    coder_id = (body.get("coder") or "default").strip()
+    coder = None
+    if coder_id != "default":
+        coder = _agent_coder(coder_id)
+        if not coder:
+            return jsonify({"error": f"unknown coder '{coder_id}'"}), 400
+    pid = (body.get("project") or "").strip()
+    if pid and not _project(pid):
+        return jsonify({"error": "unknown project"}), 400
+    try:
+        max_steps = min(40, max(1, int(body.get("steps") or AGENT_MAX_STEPS)))
+    except (TypeError, ValueError):
+        max_steps = AGENT_MAX_STEPS
+    if not AGENT_ACTIVE.acquire(blocking=False):
+        return jsonify({"error": "An agent run is already in progress. "
+                                 "One runs at a time."}), 429
+    # from here the lock is OURS until the worker's finally releases it — any
+    # exception before the thread starts must release, or one failed save
+    # bricks the agent with 429s until a restart
+    try:
+        if not pid:
+            # every run belongs to a project; no selection = a NEW one, so a
+            # fresh request can never wake up inside an older build's files
+            pid = uuid.uuid4().hex[:12]
+            title = " ".join(task.split())[:60]
+            with AGENT_PROJECTS_LOCK:
+                ps = _load_projects()
+                ps.append({"id": pid, "title": title, "created": time.time(),
+                           "updated": time.time(), "job_id": None, "jobs": [],
+                           "summary": None})
+                _save_projects(ps)
+        job_id = uuid.uuid4().hex
+        with AGENT_JOBS_LOCK:
+            AGENT_JOBS[job_id] = {"owner": _owner(), "task": task, "target": target,
+                                  "coder": coder_id, "project": pid,
+                                  "events": [], "done": False,
+                                  "stage_ts": time.time()}
+            _prune_jobs(AGENT_JOBS)
+        spawn_owned(target=_run_agent_job,
+                    args=(job_id, task, _owner(), target, plan, plan_text, coder,
+                          pid, max_steps),
+                    daemon=True).start()
+    except Exception:
+        try:
+            AGENT_ACTIVE.release()
+        except RuntimeError:
+            pass
+        raise
+    return jsonify({"job_id": job_id, "project": pid})
+
+@app.route("/agent/plan", methods=["POST"])
+def agent_plan():
+    """Generate a plan for review/editing WITHOUT building anything (one model
+    call). The UI shows it editable; the edited text is sent back as plan_text."""
+    body = request.json or {}
+    task = (body.get("task") or "").strip()
+    if not task:
+        return jsonify({"error": "empty task"}), 400
+    import agent as _agent
+    coder_id = (body.get("coder") or "default").strip()
+    coder = _agent_coder(coder_id) if coder_id != "default" else None
+    if coder_id != "default" and not coder:
+        return jsonify({"error": f"unknown coder '{coder_id}'"}), 400
+    try:
+        return jsonify({"spec": _agent._plan(task, coder=coder)})
+    except Exception as e:
+        return jsonify({"error": f"planning failed: {e}"}), 502
+
+@app.route("/agent/hosts")
+def agent_hosts():
+    # only NAMES reach the client — never host/user/key
+    targets = [{"name": "sandbox", "kind": "sandbox"}]
+    targets += [{"name": h["name"], "kind": "ssh"}
+                for h in _load_agent_hosts() if h.get("name")]
+    # coder choices: backend IDS only (resolved server-side in _agent_coder)
+    coders = [{"id": "default"}]
+    coders += [{"id": b["id"]} for b in ROUTER_CONFIG.get("backends", [])
+               if b.get("id") and b.get("url")
+               and b.get("kind", "openai") == "openai"]
+    return jsonify({"targets": targets, "coders": coders})
+
+
+# ---- remote file browser (admin-gated via /agent prefix) ---------------------
+# Same security rails as the agent itself: the client sends a host NAME, the
+# allowlist resolves it, SSH is key-only BatchMode, and the remote user's own
+# permissions are the boundary. Short-lived ssh calls, no persistent state.
+def _agent_fs_ssh(name):
+    h = _agent_host(name)
+    if not h:
+        return None, (jsonify({"error": "unknown host"}), 404)
+    import ssh_workspace as _sw
+    ws = _sw.SSHWorkspace(h["host"], h["user"], port=h.get("port") or 22,
+                          key=h.get("key"))
+    return ws, None
+
+
+def _agent_fs_resolve(ws, path):
+    """Expand a leading ~ against the REMOTE home. Returns (path, err)."""
+    path = (path or "~").strip() or "~"
+    if path == "~" or path.startswith("~/"):
+        r = subprocess.run(ws._ssh() + ["echo $HOME"],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return None, (jsonify({"error": "ssh connect failed: "
+                                   + r.stderr.strip()[:200]}), 502)
+        home = r.stdout.strip() or "/"
+        path = home if path == "~" else home + path[1:]
+    if not path.startswith("/"):
+        path = "/" + path
+    return path, None
+
+
+@app.route("/agent/fs/<name>/list")
+def agent_fs_list(name):
+    import shlex
+    ws, err = _agent_fs_ssh(name)
+    if err:
+        return err
+    path, err = _agent_fs_resolve(ws, request.args.get("path"))
+    if err:
+        return err
+    cmd = (f"cd -- {shlex.quote(path)} && "
+           "find . -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%f\\n'")
+    r = subprocess.run(ws._ssh() + [cmd], capture_output=True, text=True,
+                       timeout=30)
+    if r.returncode != 0:
+        return jsonify({"error": (r.stderr.strip() or "listing failed")[:300],
+                        "path": path}), 502
+    entries = []
+    for line in r.stdout.splitlines():
+        try:
+            t, s, n = line.split("\t", 2)
+        except ValueError:
+            continue
+        entries.append({"name": n, "dir": t == "d",
+                        "size": int(s) if s.isdigit() else 0})
+    # dirs first, dotfiles after visible names within each group
+    entries.sort(key=lambda e: (not e["dir"], e["name"].startswith("."),
+                                e["name"].lower()))
+    return jsonify({"path": path, "entries": entries[:500],
+                    "truncated": len(entries) > 500})
+
+
+@app.route("/agent/fs/<name>/mkdir", methods=["POST"])
+def agent_fs_mkdir(name):
+    import shlex
+    ws, err = _agent_fs_ssh(name)
+    if err:
+        return err
+    body = request.json or {}
+    path, err = _agent_fs_resolve(ws, body.get("path"))
+    if err:
+        return err
+    folder = (body.get("folder") or "").strip()
+    if (not folder or "/" in folder or folder in (".", "..")
+            or "\x00" in folder or len(folder) > 120):
+        return jsonify({"error": "invalid folder name"}), 400
+    target = path.rstrip("/") + "/" + folder
+    r = subprocess.run(ws._ssh() + [f"mkdir -- {shlex.quote(target)}"],
+                       capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        return jsonify({"error": (r.stderr.strip() or "mkdir failed")[:300]}), 502
+    return jsonify({"ok": True, "path": target})
+
+@app.route("/agent/progress/<job_id>")
+def agent_progress(job_id):
+    j = owned_job(AGENT_JOBS, job_id)
+    if not j:
+        return jsonify({"error": "unknown job"}), 404
+    since = request.args.get("since", "0")
+    since = int(since) if since.isdigit() else 0
+    with AGENT_JOBS_LOCK:
+        evs = j["events"][since:]
+        return jsonify({
+            "events": evs, "cursor": len(j["events"]),
+            "done": j.get("done", False), "summary": j.get("summary"),
+            "files": j.get("files"), "error": j.get("error"),
+            "entry_cmd": j.get("entry_cmd"), "live": j.get("live"),
+            "ok": j.get("ok"), "exhausted": j.get("exhausted", False),
+            "cancelled": j.get("cancelled", False), "task": j.get("task"),
+        })
+
+@app.route("/agent/stop/<job_id>", methods=["POST"])
+def agent_stop(job_id):
+    j = owned_job(AGENT_JOBS, job_id)
+    if j:
+        with AGENT_JOBS_LOCK:
+            j["cancel"] = True
+    return jsonify({"ok": True})
+
+@app.route("/agent/projects")
+def agent_projects_list():
+    """The cookbook shelf: every project, newest first, with enough to decide
+    whether to continue, preview, or delete it. Also the janitor: entries whose
+    only run never completed (router died mid-run) are dropped once they are
+    old and no live job claims them."""
+    projects = _load_projects()
+    with AGENT_JOBS_LOCK:
+        live = {j.get("project") for j in AGENT_JOBS.values() if not j.get("done")}
+    stale = [p.get("id") for p in projects
+             if not p.get("job_id") and not p.get("jobs")
+             and p.get("id") not in live
+             and time.time() - (p.get("updated") or 0) > 3600]
+    if stale:
+        with AGENT_PROJECTS_LOCK:
+            _save_projects([p for p in _load_projects()
+                            if p.get("id") not in stale])
+        projects = [p for p in projects if p.get("id") not in stale]
+    out = []
+    for p in sorted(projects, key=lambda p: -(p.get("updated") or 0)):
+        jid = p.get("job_id")
+        rel, has_html = [], False
+        if jid and _safe_run_id(jid):
+            snap = os.path.join(agent_runs_dir(), jid)
+            if os.path.isdir(snap):
+                for _r, _d, fs in os.walk(snap):
+                    rel += [os.path.relpath(os.path.join(_r, f), snap) for f in fs]
+                has_html = any(f.endswith(".html") for f in rel)
+        out.append({"id": p.get("id"), "title": p.get("title") or "(untitled)",
+                    "updated": p.get("updated"), "runs": len(p.get("jobs") or []),
+                    "summary": (p.get("summary") or "")[:220],
+                    "job_id": jid, "files": len(rel), "has_html": has_html,
+                    "entry_cmd": _entry_cmd(rel)})
+    return jsonify({"projects": out})
+
+@app.route("/agent/projects/<pid>/delete", methods=["POST"])
+def agent_project_delete(pid):
+    p = _project(pid)
+    if not p:
+        return jsonify({"error": "unknown project"}), 404
+    with AGENT_JOBS_LOCK:
+        if any(j.get("project") == pid and not j.get("done")
+               for j in AGENT_JOBS.values()):
+            return jsonify({"error": "This project has a run in progress — "
+                                     "stop it first."}), 409
+    # the test bench holds the slot without a job entry, and it may be reading
+    # THIS project's snapshot right now — no deletes while anything is active
+    if AGENT_ACTIVE.locked():
+        return jsonify({"error": "The agent is busy (run or test in progress) "
+                                 "— try again when it finishes."}), 409
+    import shutil
+    for jid in set((p.get("jobs") or []) + ([p["job_id"]] if p.get("job_id") else [])):
+        if _safe_run_id(jid):
+            d = os.path.join(agent_runs_dir(), jid)
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
+    with AGENT_PROJECTS_LOCK:
+        _save_projects([q for q in _load_projects() if q.get("id") != pid])
+    return jsonify({"ok": True})
+
+@app.route("/agent/runs")
+def agent_runs():
+    d = agent_runs_dir()
+    runs = []
+    if os.path.isdir(d):
+        for r in sorted(os.listdir(d), reverse=True):
+            if _safe_run_id(r) and os.path.isdir(os.path.join(d, r)):
+                runs.append(r)
+    return jsonify({"runs": runs})
+
+@app.route("/agent/files/<run_id>")
+def agent_run_files(run_id):
+    if not _safe_run_id(run_id):
+        return jsonify({"error": "bad run id"}), 400
+    base = os.path.join(agent_runs_dir(), run_id)
+    if not os.path.isdir(base):
+        return jsonify({"error": "unknown run"}), 404
+    out = []
+    for root, _, files in os.walk(base):
+        for f in files:
+            rel = os.path.relpath(os.path.join(root, f), base)
+            out.append(rel)
+    return jsonify({"files": sorted(out)})
+
+@app.route("/agent/file/<run_id>/<path:fname>")
+def agent_file(run_id, fname):
+    if not _safe_run_id(run_id):
+        return jsonify({"error": "bad run id"}), 400
+    base = os.path.realpath(os.path.join(agent_runs_dir(), run_id))
+    target = os.path.realpath(os.path.join(base, fname))
+    # containment check — no traversal outside this run's dir
+    if not (target == base or target.startswith(base + os.sep)) or not os.path.isfile(target):
+        return jsonify({"error": "not found"}), 404
+    try:
+        with open(target, "rb") as fh:
+            data = fh.read()
+    except Exception:
+        return jsonify({"error": "could not read"}), 500
+    # Serve text inline (viewable), binary as a real download — otherwise a
+    # binary file read as text is mangled. Detect by trying to decode.
+    try:
+        text = data.decode("utf-8")
+        if "\x00" not in text:
+            return Response(text, mimetype="text/plain")
+    except UnicodeDecodeError:
+        pass
+    import mimetypes
+    ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+    return Response(data, mimetype=ctype, headers={
+        "Content-Disposition": f'attachment; filename="{os.path.basename(fname)}"'})
+
+@app.route("/agent/download/<run_id>.zip")
+def agent_download(run_id):
+    import io, zipfile
+    if not _safe_run_id(run_id):
+        return jsonify({"error": "bad run id"}), 400
+    base = os.path.realpath(os.path.join(agent_runs_dir(), run_id))
+    if not os.path.isdir(base):
+        return jsonify({"error": "unknown run"}), 404
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(base):
+            for f in files:
+                full = os.path.join(root, f)
+                # zipfile.write FOLLOWS symlinks: a hostile repo/model can
+                # plant `ln -s /etc/passwd x` in the workspace and "Download
+                # all" would package the host file. Same containment rule as
+                # /agent/file and /agent/preview.
+                if (os.path.islink(full)
+                        or not os.path.realpath(full).startswith(base + os.sep)):
+                    continue
+                z.write(full, os.path.relpath(full, base))
+    buf.seek(0)
+    return Response(buf.read(), mimetype="application/zip", headers={
+        "Content-Disposition": f'attachment; filename="agent-{run_id}.zip"'})
+
+@app.route("/agent/preview/<run_id>/", defaults={"fname": ""})
+@app.route("/agent/preview/<run_id>/<path:fname>")
+def agent_preview(run_id, fname):
+    """Serve a run's snapshot as a real static site so the built app can be
+    SEEN (iframe on /agent, or open-in-tab). Unlike /agent/file — which
+    deliberately serves everything as text/plain — html/css/js here get their
+    true mimetypes so relative links work. Every response is CSP-sandboxed
+    into an opaque origin: these pages are MODEL-WRITTEN, and must never be
+    able to reach the admin session's cookies or DOM."""
+    import mimetypes
+    if not _safe_run_id(run_id):
+        return jsonify({"error": "bad run id"}), 400
+    base = os.path.realpath(os.path.join(agent_runs_dir(), run_id))
+    if not os.path.isdir(base):
+        return jsonify({"error": "unknown run"}), 404
+    if not fname:
+        # root of the site: index.html if the build made one, else the first
+        # html anywhere in the snapshot (builds sometimes nest under repo/)
+        cands = ["index.html"] + sorted(
+            os.path.relpath(os.path.join(r, f), base)
+            for r, _, fs in os.walk(base) for f in fs if f.endswith(".html"))
+        fname = next((c for c in cands
+                      if os.path.isfile(os.path.join(base, c))), None)
+        if not fname:
+            return Response("This run produced no HTML page to preview.",
+                            mimetype="text/plain")
+    target = os.path.realpath(os.path.join(base, fname))
+    if not target.startswith(base + os.sep) or not os.path.isfile(target):
+        return jsonify({"error": "not found"}), 404
+    with open(target, "rb") as fh:
+        data = fh.read()
+    ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
+    return Response(data, mimetype=ctype, headers={
+        "Content-Security-Policy": "sandbox allow-scripts"})
+
+@app.route("/agent/test/<run_id>", methods=["POST"])
+def agent_test(run_id):
+    """Test bench: run ONE command in a fresh Docker sandbox seeded from the
+    run's snapshot, and return its output — try the delivered code without
+    spending agent steps. Takes the AGENT_ACTIVE slot for its whole duration:
+    the container is a crewe-sbx-* like any other, and the reaper's safety
+    argument ('one run at a time, anything else alive is a leak') must hold."""
+    if not _safe_run_id(run_id):
+        return jsonify({"error": "bad run id"}), 400
+    base = os.path.realpath(os.path.join(agent_runs_dir(), run_id))
+    if not os.path.isdir(base):
+        return jsonify({"error": "unknown run"}), 404
+    cmd = ((request.json or {}).get("cmd") or "").strip()
+    if not cmd:
+        return jsonify({"error": "empty command"}), 400
+    if not AGENT_ACTIVE.acquire(blocking=False):
+        return jsonify({"error": "An agent run is in progress — test after it "
+                                 "finishes."}), 429
+    try:
+        import agent as _agent
+        from sandbox import Sandbox
+        _reap_sandbox_containers()
+        with Sandbox(network="egress") as sb:
+            if not sb.restore(base):
+                return jsonify({"error": "could not seed the workspace from "
+                                         "this run's snapshot"}), 500
+            code, out, err = sb.run(cmd, timeout=_agent.CMD_TIMEOUT)
+        return jsonify({"exit_code": code,
+                        "stdout": out[-20000:], "stderr": err[-20000:]})
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 500
+    finally:
+        AGENT_ACTIVE.release()
+
+
 if __name__ == "__main__":
     _start_photo_backfill()
     _start_meta_backfill()
+    _reap_sandbox_containers()   # a restart mid-run leaves its container behind
     # Bind host: default 0.0.0.0 keeps LAN/tailnet direct access working. For a
     # pure public-via-tunnel deploy, set CREWE_BIND=127.0.0.1 so ONLY cloudflared
     # can reach Flask (closes any header-spoofing path and hides :5000 from LAN).

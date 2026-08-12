@@ -1,0 +1,23 @@
+# Fat build image for the Crewe code agent: Node + Python + a C toolchain + git.
+# Covers browser/desktop-OS builds (Node), Python work, and native npm modules
+# (build-essential). Anything not baked in, the agent installs at build time
+# through the egress proxy (allowlisted to package mirrors only).
+FROM node:22-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv python-is-python3 \
+        build-essential git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# python-is-python3: Debian has no bare `python` by default; add it so a model
+# that types `python foo.py` doesn't waste a step hitting "command not found".
+
+# Owned by the non-root sandbox user (node, uid 1000 in this base image) —
+# sandbox.py starts containers with --user 1000:1000; see CREWE_SANDBOX_USER.
+RUN mkdir -p /workspace && chown 1000:1000 /workspace
+
+# Debian marks the system python env externally-managed (PEP 668) and pip
+# refuses to install — an ephemeral container IS the sanctioned exception.
+# Non-root pip lands in the user site under /home/node.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+WORKDIR /workspace
