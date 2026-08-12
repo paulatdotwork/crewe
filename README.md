@@ -89,6 +89,15 @@ Then open **⚙ Settings**: hit *Scan localhost* to find your running model
 servers (Ollama, llama.cpp, LM Studio…), or add backends by URL — including
 hosted APIs with an API key. Point each route at a backend. Done.
 
+To use the **code agent** (`/agent`), also build its sandbox once — requires
+Docker; run as root so the egress firewall rule installs too:
+
+```bash
+sudo bash crewe-sandbox/setup.sh
+```
+
+Full agent setup and security model: [docs/AGENT.md](docs/AGENT.md).
+
 Configuration lives in `router_config.json` (created on first save — **it can
 contain API keys; never commit it**). `CREWE_HOST` / `CREWE_CODER_HOST` env
 vars seed the defaults on first run.
