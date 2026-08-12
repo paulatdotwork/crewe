@@ -1602,6 +1602,24 @@ _DIFF_ONLY_NOTE = (
     "of an existing file will be REJECTED. Only a file that does not exist "
     "yet may be sent as a complete file."
 )
+# The accept-mode variant asks for edits without the rejection threat —
+# in accept mode a rewrite IS taken, and the prompt must not lie about it.
+_DIFF_ONLY_NOTE_SOFT = (
+    "\n\nThis is a FIX round on an existing build: change as little as "
+    "possible. For files that already exist and are shown above, prefer "
+    "targeted SEARCH/REPLACE edit sections quoting the current file "
+    "exactly; send a complete file only if most of it must change."
+)
+# Whether an edit-only fix round REJECTS a full-file rewrite of a large
+# existing file on attempt 0 (forcing SEARCH/REPLACE at the cost of a full
+# second generation) or ACCEPTS it. Measured on the .234 coder (job
+# 98439b25, 2026-08-05): it NEVER complies with SEARCH/REPLACE, so 'reject'
+# paid ~29k output tokens (16.8k rejected + a 12k+ retry of the same files)
+# plus a second 19k-token prompt per fix round, for zero savings. 'accept'
+# still asks for edits but takes a complete rewrite as-is — the elision and
+# truncation guards in _merge_output_file still apply to it.
+# Tune with CREWE_EDIT_ONLY (accept | reject).
+EDIT_ONLY_REJECT = os.environ.get("CREWE_EDIT_ONLY", "accept").lower() == "reject"
 # rewrites of files smaller than this are cheaper to accept than to
 # re-request (the guard measures the EXISTING file — a rewrite that balloons
 # a small stub is new code being written, not old code being re-sent)
@@ -4902,8 +4920,19 @@ def _foreman_fix_loop(job_id, step, changed, files, warnings, mem,
         _set_stage(job_id, stage)
         checks = ("\n".join(f"- {i}" for i in issues) if issues
                   else "No issues found by automated syntax checks.")
+        # Only the files the checks implicate ride along (plus entry html —
+        # it wires everything). The foreman used to see, and freely rewrite,
+        # the whole delivery: job 98439b25's two final-foreman calls cost
+        # 19k output tokens, one spiralling to its cap. A file it can't see
+        # it can't rewrite — the skipped-list line below already forbids
+        # that, and _merge_output_file enforces it.
+        implicated = {n for n in changed
+                      if any(os.path.basename(n) in i for i in issues)}
+        cand = ({n: c for n, c in changed.items()
+                 if n in implicated or n.endswith((".html", ".htm"))}
+                if implicated else dict(changed))
         f_shown, f_total = {}, 0
-        for n, c in sorted(changed.items(), key=lambda kv: len(kv[1])):
+        for n, c in sorted(cand.items(), key=lambda kv: len(kv[1])):
             if f_total + len(c) > step_file_hard():
                 continue
             f_shown[n] = c
@@ -4917,7 +4946,8 @@ def _foreman_fix_loop(job_id, step, changed, files, warnings, mem,
                              header="Files produced by this step:"))
         f_skipped = [n for n in changed if n not in f_shown]
         if f_skipped:
-            check_user += ("\n\nAlso produced but too large to show — "
+            check_user += ("\n\nAlso part of this build but NOT shown "
+                           "(not implicated by the checks, or too large) — "
                            "judge only what you can see, do NOT rewrite "
                            "these: " + ", ".join(f_skipped))
         check_user += _EDIT_FORMAT_NOTE
@@ -5004,8 +5034,15 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
     # whole, so cross-file references (ids, function names) stay visible.
     # Above ride_along_chars() the step gets ITS files only — the symbol
     # manifest and the NEED FILES protocol below cover the rest.
+    # FIX steps are surgical and never take the whole-project ride-along:
+    # they carry only the files their defect text names (plus entry html,
+    # added below). Measured on job 98439b25: whole-project fix calls
+    # re-sent ~19k input tokens apiece, and the fix phase out-cost the
+    # build 4:1. Hidden files stay reachable via the manifest + NEED FILES.
+    fix_step = bool(step.get("fix"))
     step_ctx = {n: files[n] for n in step["files"] if n in files}
-    if files and sum(len(v) for v in files.values()) <= ride_along_chars():
+    if (files and not fix_step
+            and sum(len(v) for v in files.values()) <= ride_along_chars()):
         step_ctx = dict(files)
     if files and not step_ctx:
         # Synthetic steps (inspector catch-ups, browser fixes) often name no
@@ -5081,7 +5118,7 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
         user += _EDIT_FORMAT_NOTE
     edit_only = bool(step.get("edit_only")) and bool(shown)
     if edit_only:
-        user += _DIFF_ONLY_NOTE
+        user += _DIFF_ONLY_NOTE if EDIT_ONLY_REJECT else _DIFF_ONLY_NOTE_SOFT
 
     if _job_cancelled(job_id):
         step_notes.append(f"{idx}. {step['title']} — skipped (stopped)")
@@ -5175,16 +5212,26 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
                         and name in shown and name not in edit_grant
                         and len(files[name]) > EDIT_ONLY_MIN_CHARS
                         and not _DIFF_BLOCK.search(code)):
-                    warnings.append(
-                        f"step {idx}: {name} arrived as a full-file rewrite "
-                        f"in an edit-only fix round — use targeted "
-                        f"SEARCH/REPLACE sections quoting the current file")
-                    _trace(job_id, "merge", step=idx, file=name,
-                           verdict="REJECTED", in_chars=len(code),
-                           prev_chars=len(files.get(name, "")), out_chars=0,
-                           reason="full-file rewrite in edit-only fix round")
-                    rejected.append((name, warnings[-1]))
-                    continue
+                    if EDIT_ONLY_REJECT:
+                        warnings.append(
+                            f"step {idx}: {name} arrived as a full-file "
+                            f"rewrite in an edit-only fix round — use "
+                            f"targeted SEARCH/REPLACE sections quoting the "
+                            f"current file")
+                        _trace(job_id, "merge", step=idx, file=name,
+                               verdict="REJECTED", in_chars=len(code),
+                               prev_chars=len(files.get(name, "")),
+                               out_chars=0,
+                               reason="full-file rewrite in edit-only fix round")
+                        rejected.append((name, warnings[-1]))
+                        continue
+                    # accept mode: the rewrite is already paid for — taking
+                    # it costs nothing, re-requesting costs a second full
+                    # generation. Trace the non-compliance and fall through
+                    # to the normal merge (elision/truncation guards apply).
+                    _trace(job_id, "edit_only_accept", step=idx, file=name,
+                           in_chars=len(code),
+                           prev_chars=len(files.get(name, "")))
                 merged = _merge_output_file(name, code, files, set(shown),
                                             warnings, f"step {idx}", mem)
                 _trace(job_id, "merge", step=idx, file=name,
@@ -5217,7 +5264,8 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
             # the prompt while _retry_note says "send it COMPLETE" would be
             # contradictory instructions on the one attempt that must land
             retry_user = _retry_note(why, fixable) + (
-                user.replace(_DIFF_ONLY_NOTE, "") if edit_only else user)
+                user.replace(_DIFF_ONLY_NOTE, "")
+                    .replace(_DIFF_ONLY_NOTE_SOFT, "") if edit_only else user)
             out = _stream_chat(
                 coder_url(),
                 [{"role": "system", "content": step_system},
@@ -5629,7 +5677,7 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
                        "\nFix every problem without removing features.")
             fix_step = {
                 "title": "fix runtime errors",
-                "detail": detail, "edit_only": attempt == 0,
+                "detail": detail, "edit_only": attempt == 0, "fix": True,
                 "files": [], "done_when": "the page loads and draws without errors"}
             if not _budget_left("browser gate"):
                 break
@@ -5713,7 +5761,7 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
                            "behavior (output the full file, not "
                            "SEARCH/REPLACE edits).")
             vfix = {"title": "make behavior checks pass", "detail": detail,
-                    "edit_only": vround == 0,
+                    "edit_only": vround == 0, "fix": True,
                     "files": [], "done_when": "all behavior checks pass"}
             if not _budget_left("behavior checks"):
                 break
@@ -5791,7 +5839,7 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
                 break
             prev_vis = list(defects)
             vstep = {"title": "fix what the page visibly gets wrong",
-                     "detail": detail, "files": [],
+                     "detail": detail, "files": [], "fix": True,
                      "edit_only": vattempt == 0,
                      "done_when": "the rendered page visibly shows the "
                                   "requested interface"}
