@@ -3550,6 +3550,19 @@ CODE_STREAM_TIMEOUT = int(os.environ.get("CREWE_CODE_TIMEOUT", "1200"))
 # detector; runaway wall-clock by CODE_STREAM_TIMEOUT; the user by Stop.
 # Set CREWE_STEP_MAX_TOKENS to a number only to debug a specific backend.
 STEP_MAX_TOKENS = int(os.environ.get("CREWE_STEP_MAX_TOKENS", "0"))
+# Reasoning-runaway guard. A reasoning coder can spend its whole wall-clock
+# budget "thinking" without emitting one visible byte: job cc95f629 burned
+# 58,069 think tokens / 0 content over 89 min before CREWE_CODE_TIMEOUT shot
+# it. Abort a call whose hidden reasoning passes this budget while content is
+# still empty, then retry ONCE with an explicit answer-directly directive.
+# Distinct from the repetition/spiral detectors, which watch CONTENT — a
+# think runaway never produces any content to inspect. 0 disables.
+# Tune with CREWE_THINK_MAX_TOKENS.
+THINK_MAX_TOKENS = int(os.environ.get("CREWE_THINK_MAX_TOKENS", "8000"))
+THINK_RETRY_NOTE = (
+    "Your previous attempt was aborted because it produced only hidden "
+    "reasoning and no answer. Do NOT deliberate, plan, or think out loud. "
+    "Begin writing the final answer immediately.")
 
 
 # ---------------------------------------------------------------------------
@@ -3950,18 +3963,13 @@ def _stream_chat(url, messages, job_id, temperature=None, max_tokens=None,
     check) wants thinking OFF: measured on the 26B, the same planner prompt
     took 524 tokens / 20.6s with thinking vs 101 tokens / 3.6s without, with
     identical output quality. Templates without the switch ignore the kwarg."""
-    payload = {"messages": messages, "stream": True,
-               "chat_template_kwargs": {"enable_thinking": False}}
-    if temperature is not None:
-        payload["temperature"] = temperature
     # Steps are NOT capped by default. A cap that binds mid-file silently
     # corrupts the build, and starving a step is never the right answer to a
     # long one. Pathology is caught by what it actually is: the repetition
-    # detector below (loops) and CODE_STREAM_TIMEOUT (wall clock). Callers with
-    # a genuinely bounded job (classifier, planner, inspector) pass max_tokens.
+    # detector below (loops), the think-runaway guard (all reasoning, no
+    # output), and CODE_STREAM_TIMEOUT (wall clock). Callers with a genuinely
+    # bounded job (classifier, planner, inspector) pass max_tokens.
     cap = max_tokens or step_max_tokens()
-    if cap:
-        payload["max_tokens"] = cap
     with _TRACE_LOCK:
         seq = _TRACE_SEQ[job_id] = _TRACE_SEQ.get(job_id, 0) + 1
     label = label or "call"
@@ -3972,79 +3980,138 @@ def _stream_chat(url, messages, job_id, temperature=None, max_tokens=None,
            prompt_chars=len(prompt_txt), messages=len(messages),
            max_tokens=cap or None, temperature=temperature)
     t0 = time.time()
-    finish_reason = None
-    parts = []
-    think_n = content_n = 0
-    payload = _with_usage(_inject_model(payload, url), url)
-    _usage = None
-    with requests.post(url, json=payload, headers=_hdrs(url),
-                       stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-        for line in _cancellable_lines(r, job_id):
-            if not line:
-                continue
-            line = line.decode("utf-8")
-            if not line.startswith("data: "):
-                continue
-            data = line[6:]
-            if data.strip() == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-                # usage arrives on a final chunk whose choices list is EMPTY
-                if chunk.get("usage"):
-                    _usage = chunk["usage"]
-                if not chunk.get("choices"):
+    # Two attempts at most: the first with the caller's messages as-is; a
+    # second ONLY when the think-runaway guard aborts attempt 0, with an
+    # explicit answer-directly directive appended.
+    for attempt in (0, 1):
+        finish_reason = None
+        parts = []
+        think_n = content_n = 0
+        think_aborted = False
+        _usage = None
+        payload = {"messages": messages, "stream": True,
+                   "chat_template_kwargs": {"enable_thinking": False}}
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if cap:
+            payload["max_tokens"] = cap
+        payload = _with_usage(_inject_model(payload, url), url)
+        with requests.post(url, json=payload, headers=_hdrs(url),
+                           stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            for line in _cancellable_lines(r, job_id):
+                if not line:
                     continue
-                finish_reason = (chunk["choices"][0].get("finish_reason")
-                                 or finish_reason)
-                d = chunk["choices"][0]["delta"]
-                delta = d.get("content", "")
-                if delta:
-                    parts.append(delta)
-                    content_n += 1
-                    # LIVE balloon telemetry: every TRACE_TICK tokens, record
-                    # how fast it is going AND what it is actually emitting
-                    # right now. A token count alone never explained a runaway;
-                    # the tail excerpt does, while the call is still running.
-                    if TRACE_TICK and content_n % TRACE_TICK == 0:
-                        el = max(0.1, time.time() - t0)
-                        so_far = "".join(parts)
-                        tail = so_far[-200:].replace("\n", "\\n")
-                        shape = _output_shape(so_far)
-                        _trace(job_id, "tick", seq=seq, label=label,
-                               tokens=content_n, elapsed=round(el, 1),
-                               tok_s=round(content_n / el, 1),
-                               unique_line_ratio=shape["unique_line_ratio"],
-                               top_repeat=(shape["top_repeats"] or [{}])[0],
-                               fences=shape["fences"],
-                               diff_blocks=shape["diff_blocks"], tail=tail)
-                        print(f"[code] {label} @{content_n}tok "
-                              f"{round(content_n / el, 1)}/s "
-                              f"uniq={shape['unique_line_ratio']} "
-                              f"fences={shape['fences']} "
-                              f"diffs={shape['diff_blocks']} … {tail[-90:]}")
-                    # repetition-loop detector — STRICT periodicity only:
-                    # fire iff the ENTIRE last 1200 chars are one exact unit
-                    # (<=300 chars, so >=4 repeats) tiling the tail. Real code
-                    # is repetitive-but-VARYING and is never exactly periodic
-                    # over a full 1200-char window; only degeneration is.
-                    # Deliberation-spiral abort. Measured on the corpus:
-                    # every legitimate generation held unique_line_ratio
-                    # >= 0.48 past 10k tokens; the observed spirals read
-                    # 0.38 -> 0.27 while the model narrated "Actually,
-                    # wait." for 17 minutes. Both signals must agree.
-                    if content_n and content_n % 2048 == 0 and content_n >= 10240:
-                        u = _output_shape("".join(parts))["unique_line_ratio"]
-                        if u < 0.35:
-                            msg = (f"deliberation spiral detected "
-                                   f"(unique-line ratio {u} after "
-                                   f"{content_n} tokens) — call aborted; "
-                                   f"the model is reasoning in circles, "
-                                   f"not writing code")
-                            print(f"[code] {msg}")
-                            _trace(job_id, "spiral_abort", seq=seq, label=label,
-                                   tokens=content_n, uniq=u)
+                line = line.decode("utf-8")
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    # usage arrives on a final chunk whose choices list is EMPTY
+                    if chunk.get("usage"):
+                        _usage = chunk["usage"]
+                    if not chunk.get("choices"):
+                        continue
+                    finish_reason = (chunk["choices"][0].get("finish_reason")
+                                     or finish_reason)
+                    d = chunk["choices"][0]["delta"]
+                    delta = d.get("content", "")
+                    if delta:
+                        parts.append(delta)
+                        content_n += 1
+                        # LIVE balloon telemetry: every TRACE_TICK tokens, record
+                        # how fast it is going AND what it is actually emitting
+                        # right now. A token count alone never explained a runaway;
+                        # the tail excerpt does, while the call is still running.
+                        if TRACE_TICK and content_n % TRACE_TICK == 0:
+                            el = max(0.1, time.time() - t0)
+                            so_far = "".join(parts)
+                            tail = so_far[-200:].replace("\n", "\\n")
+                            shape = _output_shape(so_far)
+                            _trace(job_id, "tick", seq=seq, label=label,
+                                   tokens=content_n, elapsed=round(el, 1),
+                                   tok_s=round(content_n / el, 1),
+                                   unique_line_ratio=shape["unique_line_ratio"],
+                                   top_repeat=(shape["top_repeats"] or [{}])[0],
+                                   fences=shape["fences"],
+                                   diff_blocks=shape["diff_blocks"], tail=tail)
+                            print(f"[code] {label} @{content_n}tok "
+                                  f"{round(content_n / el, 1)}/s "
+                                  f"uniq={shape['unique_line_ratio']} "
+                                  f"fences={shape['fences']} "
+                                  f"diffs={shape['diff_blocks']} … {tail[-90:]}")
+                        # repetition-loop detector — STRICT periodicity only:
+                        # fire iff the ENTIRE last 1200 chars are one exact unit
+                        # (<=300 chars, so >=4 repeats) tiling the tail. Real code
+                        # is repetitive-but-VARYING and is never exactly periodic
+                        # over a full 1200-char window; only degeneration is.
+                        # Deliberation-spiral abort. Measured on the corpus:
+                        # every legitimate generation held unique_line_ratio
+                        # >= 0.48 past 10k tokens; the observed spirals read
+                        # 0.38 -> 0.27 while the model narrated "Actually,
+                        # wait." for 17 minutes. Both signals must agree.
+                        if content_n and content_n % 2048 == 0 and content_n >= 10240:
+                            u = _output_shape("".join(parts))["unique_line_ratio"]
+                            if u < 0.35:
+                                msg = (f"deliberation spiral detected "
+                                       f"(unique-line ratio {u} after "
+                                       f"{content_n} tokens) — call aborted; "
+                                       f"the model is reasoning in circles, "
+                                       f"not writing code")
+                                print(f"[code] {msg}")
+                                _trace(job_id, "spiral_abort", seq=seq, label=label,
+                                       tokens=content_n, uniq=u)
+                                if job_id:
+                                    with JOBS_LOCK:
+                                        j = JOBS.get(job_id)
+                                        if j is not None:
+                                            j.setdefault("notes", []).append(msg)
+                                try:
+                                    r.close()
+                                except Exception:
+                                    pass
+                                break
+                        if content_n and content_n % 512 == 0 and content_n >= 2048:
+                            tail = "".join(parts)[-1200:]
+                            p = _min_period(tail) if len(tail) == 1200 else 0
+                            if 0 < p <= 300:
+                                msg = (f"repetition loop detected after "
+                                       f"{content_n} tokens (period {p} chars) — "
+                                       f"call aborted")
+                                print(f"[code] {msg}")
+                                _trace(job_id, "loop_abort", seq=seq, label=label,
+                                       tokens=content_n, period=p,
+                                       repeated=tail[-p:] if p else "")
+                                if job_id:
+                                    with JOBS_LOCK:
+                                        j = JOBS.get(job_id)
+                                        if j is not None:
+                                            j.setdefault("notes", []).append(msg)
+                                try:
+                                    r.close()
+                                except Exception:
+                                    pass
+                                break
+                    if d.get("reasoning_content"):
+                        think_n += 1
+                        # think-runaway guard: all reasoning, no output. Content
+                        # pathologies have their own detectors below; this one
+                        # can only fire while content is still EMPTY.
+                        if (THINK_MAX_TOKENS and content_n == 0
+                                and think_n >= THINK_MAX_TOKENS):
+                            think_aborted = True
+                            msg = (f"think runaway: {think_n} reasoning tokens "
+                                   f"with zero content — call aborted"
+                                   + (", retrying once with a direct-answer "
+                                      "directive" if attempt == 0 else
+                                      "; the retry ran away too, giving up"))
+                            print(f"[code] {label} {msg}")
+                            _trace(job_id, "think_abort", seq=seq, label=label,
+                                   attempt=attempt, think_tokens=think_n,
+                                   elapsed=round(time.time() - t0, 1))
                             if job_id:
                                 with JOBS_LOCK:
                                     j = JOBS.get(job_id)
@@ -4055,34 +4122,17 @@ def _stream_chat(url, messages, job_id, temperature=None, max_tokens=None,
                             except Exception:
                                 pass
                             break
-                    if content_n and content_n % 512 == 0 and content_n >= 2048:
-                        tail = "".join(parts)[-1200:]
-                        p = _min_period(tail) if len(tail) == 1200 else 0
-                        if 0 < p <= 300:
-                            msg = (f"repetition loop detected after "
-                                   f"{content_n} tokens (period {p} chars) — "
-                                   f"call aborted")
-                            print(f"[code] {msg}")
-                            _trace(job_id, "loop_abort", seq=seq, label=label,
-                                   tokens=content_n, period=p,
-                                   repeated=tail[-p:] if p else "")
-                            if job_id:
-                                with JOBS_LOCK:
-                                    j = JOBS.get(job_id)
-                                    if j is not None:
-                                        j.setdefault("notes", []).append(msg)
-                            try:
-                                r.close()
-                            except Exception:
-                                pass
-                            break
-                if d.get("reasoning_content"):
-                    think_n += 1
-                if delta or d.get("reasoning_content"):
-                    with JOBS_LOCK:
-                        JOBS[job_id]["tokens"] += 1
-            except Exception:
-                pass
+                    if delta or d.get("reasoning_content"):
+                        with JOBS_LOCK:
+                            JOBS[job_id]["tokens"] += 1
+                except Exception:
+                    pass
+        if not (think_aborted and attempt == 0):
+            break
+        # retry with the directive appended as a fresh user turn — the caller's
+        # list is never mutated, so a retry at a higher level starts clean
+        messages = messages + [{"role": "user", "content": THINK_RETRY_NOTE}]
+        _trace(job_id, "think_retry", seq=seq, label=label)
     total = think_n + content_n
     if cap and total >= cap - 8:
         msg = (f"call hit the {cap}-token cap "
