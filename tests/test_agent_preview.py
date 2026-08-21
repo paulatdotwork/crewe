@@ -10,6 +10,7 @@ import os, sys, tempfile, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import router, agent, sandbox
+router.AGENT_BROWSER_CHECK = False   # no headless browser in unit tests
 
 tmp = tempfile.mkdtemp()
 router.USERS_FILE = os.path.join(tmp, "u.json")

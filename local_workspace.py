@@ -63,8 +63,14 @@ class LocalWorkspace:
             f.write(data)
 
     def read_file(self, path, max_bytes=200_000):
+        p = self._abs(path)
+        # _abs checks the path STRING; a symlink (file or directory) planted
+        # in the workspace could still resolve outside it — refuse those
+        real, base = os.path.realpath(p), os.path.realpath(self.workdir)
+        if os.path.islink(p) or not (real == base or real.startswith(base + os.sep)):
+            return None
         try:
-            with open(self._abs(path), "rb") as f:
+            with open(p, "rb") as f:
                 return f.read(max_bytes).decode("utf-8", "replace")
         except (FileNotFoundError, IsADirectoryError):
             return None

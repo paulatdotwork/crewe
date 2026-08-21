@@ -1,6 +1,6 @@
 # Testing
 
-Crewe's suite lives in `tests/` — eleven standalone scripts and a runner:
+Crewe's suite lives in `tests/` — twenty-five standalone scripts and a runner:
 
 ```bash
 cd tests

@@ -69,3 +69,24 @@ jobs:
       - name: agent-local
         if: ${{ !cancelled() }}
         run: python3 tests/test_agent_local.py
+      - name: agent-budget
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_budget.py
+      - name: agent-verify
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_verify.py
+      - name: agent-prompthelp
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_prompthelp.py
+      - name: agent-dialect
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_dialect.py
+      - name: agent-context
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_context.py
+      - name: agent-notes
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_notes.py
+      - name: agent-symlink
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_symlink.py

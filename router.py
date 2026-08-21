@@ -1427,16 +1427,30 @@ def _vision_url():
     return SPECIALISTS.get("general") or coder_url()
 
 
-@functools.lru_cache(maxsize=8)
+_VISION_PROBE = {}                       # url -> (ok, probed_at)
+VISION_RETRY_SECS = int(os.environ.get("CREWE_VISION_RETRY", "300"))
+
 def _vision_ready(url):
-    """True when that backend actually has a vision encoder loaded. Cached —
-    but keyed on url, so pointing at a different backend re-probes."""
+    """True when that backend actually has a vision encoder loaded.
+
+    Positive probes are cached for the process lifetime (an encoder doesn't
+    unload); NEGATIVE ones are retried after VISION_RETRY_SECS. The old
+    lru_cache never expired, so one probe that landed mid model-swap on the
+    vision box cached False and silently blinded every critic until the next
+    router restart — 'vision sometimes doesn't work' for no visible reason."""
+    ok, ts = _VISION_PROBE.get(url, (None, 0.0))
+    if ok:
+        return True
+    if ok is False and time.time() - ts < VISION_RETRY_SECS:
+        return False
     try:
         base = url.rsplit("/v1/", 1)[0]
         r = requests.get(f"{base}/props", timeout=10)
-        return bool((r.json().get("modalities") or {}).get("vision"))
+        ok = bool((r.json().get("modalities") or {}).get("vision"))
     except Exception:
-        return False
+        ok = False
+    _VISION_PROBE[url] = (ok, time.time())
+    return ok
 
 
 def _vision_critique(shot, goal, features, job_id=None):
@@ -4330,11 +4344,16 @@ def _inject_html(html, snippet):
     return snippet + html
 
 
-def _browser_check(files):
+def _browser_check(files, offline=False):
     """Write the project to a run dir, load its entry html in headless
     Firefox, and return (runtime errors, screenshot path). Degrades to
     ([], None) whenever selenium/geckodriver are unavailable — the pipeline
-    must work without a browser, just with one less safety net."""
+    must work without a browser, just with one less safety net.
+
+    offline=True routes every request except the local test server into a
+    closed port: the page's JS runs on THIS host, and model-written (or
+    cloned) code must not get to probe the LAN or phone home from the
+    router's network position."""
     entry = ("index.html" if "index.html" in files
              else next((n for n in files if n.endswith((".html", ".htm"))), None))
     if not entry:
@@ -4374,18 +4393,45 @@ def _browser_check(files):
         class _Quiet(SimpleHTTPRequestHandler):
             def log_message(self, *args):
                 pass
-        httpd = ThreadingHTTPServer(
-            ("127.0.0.1", 0), functools.partial(_Quiet, directory=run_dir))
+        # offline mode serves from 127.0.0.2: the proxy exemption is then
+        # THIS page's address only, and 127.0.0.1 (the router, local model
+        # servers) is routed into the closed port like everything else
+        bind = "127.0.0.2" if offline else "127.0.0.1"
+        try:
+            httpd = ThreadingHTTPServer(
+                (bind, 0), functools.partial(_Quiet, directory=run_dir))
+        except OSError:
+            if offline:
+                # without the separate address the exemption would re-open
+                # 127.0.0.1 — report the check as unavailable instead
+                print("[code] offline browser check unavailable: cannot bind 127.0.0.2")
+                return [], None
+            bind = "127.0.0.1"
+            httpd = ThreadingHTTPServer(
+                (bind, 0), functools.partial(_Quiet, directory=run_dir))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
         opts = Options()
         opts.add_argument("--headless")
+        if offline:
+            for k, v in (("network.proxy.type", 1),
+                         ("network.proxy.http", "127.0.0.1"),
+                         ("network.proxy.http_port", 1),
+                         ("network.proxy.ssl", "127.0.0.1"),
+                         ("network.proxy.ssl_port", 1),
+                         ("network.proxy.socks", "127.0.0.1"),
+                         ("network.proxy.socks_port", 1),
+                         ("network.proxy.no_proxies_on", bind),
+                         ("network.proxy.allow_hijacking_localhost", True),
+                         ("network.proxy.socks_remote_dns", True),
+                         ("network.dns.disablePrefetch", True)):
+                opts.set_preference(k, v)
         gecko = "/snap/bin/geckodriver"
         service = Service(executable_path=gecko) if os.path.exists(gecko) else Service()
         driver = webdriver.Firefox(options=opts, service=service)
         driver.set_page_load_timeout(25)
         try:
-            driver.get(f"http://127.0.0.1:{httpd.server_address[1]}/{entry}")
+            driver.get(f"http://{bind}:{httpd.server_address[1]}/{entry}")
         except Exception as e:
             # a page that never finishes loading is a FAILURE — the old
             # catch-all reported it as 'loads clean'
@@ -11299,6 +11345,9 @@ AGENT_JOBS = {}
 AGENT_JOBS_LOCK = threading.Lock()
 AGENT_ACTIVE = threading.Lock()          # one agent run at a time
 AGENT_MAX_STEPS = int(os.environ.get("CREWE_AGENT_MAX_STEPS", "15"))
+# Post-run headless-browser check of HTML builds (runtime errors on load).
+# Informational only — it never re-runs the agent. 0 disables.
+AGENT_BROWSER_CHECK = os.environ.get("CREWE_AGENT_BROWSER_CHECK", "1") != "0"
 
 # Remote SSH targets the agent may use. THE ALLOWLIST IS THE SECURITY BOUNDARY:
 # the browser only ever sends a target NAME; the host/user/key are resolved here,
@@ -11326,18 +11375,47 @@ def _agent_host(name):
     return next((h for h in _load_agent_hosts()
                  if h.get("name") == name), None)
 
+AGENT_CODER_KINDS = ("openai", "anthropic")
+
+def _agent_coder_ok(b):
+    """Can agent.py drive this backend? The loop speaks two dialects — OpenAI
+    chat-completions and Anthropic Messages (which needs a model name, there
+    is no server-side default) — so a Claude backend is a valid choice now;
+    llamacpp/ollama-kind entries are not (agent.py is standalone and knows
+    no other wire shape)."""
+    kind = b.get("kind") or "openai"
+    if kind not in AGENT_CODER_KINDS or not b.get("url"):
+        return False
+    return kind != "anthropic" or bool(b.get("model"))
+
 def _agent_coder(coder_id):
-    """Resolve a coder CHOICE to {url,key,model} server-side from the backend
-    list — the browser only ever sends a backend id, same posture as SSH
-    targets. Only openai-kind backends qualify: the agent loop speaks
-    /v1/chat/completions (agent.py is standalone and knows no other dialect)."""
+    """Resolve a coder CHOICE to {url,key,model,kind} server-side from the
+    backend list — the browser only ever sends a backend id, same posture as
+    SSH targets. The url is the backend's CHAT endpoint for its kind."""
     b = next((b for b in ROUTER_CONFIG.get("backends", [])
-              if b.get("id") == coder_id
-              and b.get("kind", "openai") == "openai" and b.get("url")), None)
+              if b.get("id") == coder_id and _agent_coder_ok(b)), None)
     if not b:
         return None
-    return {"url": b["url"].rstrip("/") + "/v1/chat/completions",
-            "key": b.get("key") or None, "model": b.get("model") or None}
+    return {"url": _chat_url(b), "key": b.get("key") or None,
+            "model": b.get("model") or None, "kind": b.get("kind") or "openai"}
+
+def _agent_pick_coder(coder_id):
+    """Resolve the UI's coder choice for a ONE-SHOT call: (coder, error).
+
+    'default' resolves through _agent_default_coder() right here, because the
+    only place that used to happen was inside the build worker — so planning
+    and the prompt helper quietly fell through to agent.py's hardcoded
+    127.0.0.1:8080 while the build itself used the configured coder. Two
+    different models behind one word is exactly the kind of thing nobody
+    notices until the output is bad."""
+    coder_id = (coder_id or "default").strip()
+    if coder_id == "default":
+        return _agent_default_coder(), None
+    coder = _agent_coder(coder_id)
+    if not coder:
+        return None, f"unknown coder '{coder_id}'"
+    return coder, None
+
 
 AGENT_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -11363,6 +11441,22 @@ button{padding:10px 20px;border:0;border-radius:9px;background:var(--gold);color
      font:inherit;font-weight:600;font-size:14.5px;cursor:pointer}
 button:disabled{opacity:.5;cursor:default}
 button.stop{background:var(--err)}
+button.ghost{background:transparent;color:var(--gold);border:1px solid var(--line);font-weight:600}
+button.ghost:hover:not(:disabled){border-color:var(--gold)}
+.sug{margin-bottom:14px}
+.sug h3{font-size:13.5px;margin:0 0 6px;font-weight:600;color:var(--muted)}
+.sug textarea{min-height:92px;background:var(--bg);font-size:14px}
+.sug .acts{display:flex;gap:9px;align-items:center;margin-top:8px}
+.sug .acts button{padding:6px 13px;font-size:13px}
+.q{margin-bottom:16px}
+.q h3{font-size:14.5px;margin:0 0 8px;font-weight:600}
+.q .opts{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:7px}
+.opt{padding:6px 12px;font-size:13px;background:var(--bg);color:var(--ink);
+     border:1px solid var(--line);border-radius:999px;font-weight:500}
+.opt:hover{border-color:var(--gold)}
+.opt.sel{background:var(--gold);color:var(--btn-ink);border-color:var(--gold)}
+.qother{width:100%;padding:8px 11px;border:1px solid var(--line);border-radius:9px;
+        background:var(--bg);color:var(--ink);font:inherit;font-size:13.5px}
 select{padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:var(--card);color:var(--ink);font:inherit;font-size:14px}
 .plan{font-size:13.5px;color:var(--muted);display:flex;align-items:center;gap:5px;cursor:pointer}
 .line.plan-block{color:var(--gold);background:color-mix(in srgb,var(--gold) 7%,transparent);border-radius:8px;padding:8px 10px;margin:4px 0}
@@ -11427,19 +11521,49 @@ select{padding:9px 11px;border:1px solid var(--line);border-radius:9px;backgroun
   <a href="#" onclick="clearProject();return false" style="color:var(--gold)">✕ start a new project instead</a></p>
 <textarea id="task" placeholder="Describe what to build — e.g. 'Write a Python CLI that dedupes a CSV file, install any packages it needs, and test it on sample data.'"></textarea>
 <div class="bar">
-  <select id="target" title="where the agent works" onchange="targetNote()"></select>
-  <select id="coder" title="which model drives the agent"></select>
-  <select id="steps" title="step budget for this run">
+  <select id="target" title="where the agent works" onchange="targetNote();rememberChoice('target','creweAgentTarget')"></select>
+  <select id="coder" title="which model drives the agent" onchange="rememberChoice('coder','creweAgentCoder')"></select>
+  <select id="steps" title="step budget for this run" onchange="rememberChoice('steps','creweAgentSteps')">
     <option value="8">8 steps</option>
     <option value="15" selected>15 steps</option>
     <option value="25">25 steps</option>
     <option value="40">40 steps</option>
   </select>
   <label class="plan"><input type="checkbox" id="plan" checked> Auto-plan</label>
+  <button id="helpBtn" class="ghost" onclick="promptHelp()" title="turn a rough idea into a sharper task">✨ Help me write it</button>
   <button id="planBtn" onclick="makePlan()">Plan &amp; review</button>
   <button id="go" onclick="runTask()">Run agent</button>
   <button id="stop" class="stop hidden" onclick="stopRun()">Stop</button>
   <span class="status" id="status"></span>
+</div>
+<div id="qCard" class="card hidden">
+  <h2>❓ A few questions first</h2>
+  <div id="qList"></div>
+  <div class="acts" style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">
+    <button id="qGo" onclick="draftHelp(collectAnswers())">Write it →</button>
+    <button class="ghost" onclick="draftHelp([])">Skip the questions</button>
+    <button class="ghost" onclick="$('qCard').classList.add('hidden')">✕ Dismiss</button>
+    <span class="status" id="qStatus"></span>
+  </div>
+  <p class="fshint">Pick as many options as apply, or type your own — a typed answer wins.
+  Leave a question blank and it stays the model's call. Answers <b>add</b> constraints;
+  they never shrink the idea. They steer the draft, not the run itself.</p>
+</div>
+<div id="helpCard" class="card hidden">
+  <h2>✨ Suggestion — edit it, then keep what you want</h2>
+  <div class="sug" id="sugTaskBox">
+    <h3>Sharper task</h3>
+    <textarea id="sugTask"></textarea>
+    <div class="acts"><button onclick="useSug()">↑ Use as my task</button>
+      <span class="status">replaces the task box above</span></div>
+  </div>
+  <div class="acts" style="display:flex;gap:9px;align-items:center">
+    <button class="ghost" onclick="draftHelp(helpAnswers)" title="same answers, another draft">↻ Try again</button>
+    <button class="ghost hidden" id="sugBack" onclick="$('helpCard').classList.add('hidden');$('qCard').classList.remove('hidden')">✎ Change my answers</button>
+    <button class="ghost" onclick="promptHelp()" title="start over — asks fresh questions">❓ Ask me again</button>
+    <button class="ghost" onclick="$('helpCard').classList.add('hidden')">✕ Dismiss</button>
+  </div>
+  <p class="fshint">A suggestion, not a decision — nothing here changes your run until you click.</p>
 </div>
 <div id="planArea" class="card hidden">
   <h2>Plan — edit before running</h2>
@@ -11461,7 +11585,9 @@ select{padding:9px 11px;border:1px solid var(--line);border-radius:9px;backgroun
   into the task box · new agent runs land in <code>~/crewe-agent/&lt;run-id&gt;</code>.</p>
 </div>
 
-<div class="card"><h2>Transcript</h2><div id="feed"></div></div>
+<div class="card"><h2>Transcript</h2><div id="feed"></div>
+<div class="bar hidden" id="noteBar" style="margin:8px 0 0"><input id="note" style="flex:1;min-width:0" placeholder="Send the agent a note mid-run — delivered after its current action" onkeydown="if(event.key==='Enter'){sendNote();}"><button id="noteBtn" onclick="sendNote()">Send note</button></div>
+</div>
 <div class="card hidden" id="summaryCard"><h2>Summary</h2><div id="summary"></div></div>
 <div class="card hidden" id="filesCard"><h2>Files</h2><div id="files"></div></div>
 <div class="card hidden" id="previewCard"><h2>👁 Preview</h2>
@@ -11475,8 +11601,10 @@ select{padding:9px 11px;border:1px solid var(--line);border-radius:9px;backgroun
     <button id="testBtn" onclick="runTest()">Run</button>
   </div>
   <pre id="testOut" class="hidden"></pre>
-  <p class="fshint">Runs one command in a FRESH sandbox seeded with this run's files.
-  Installed packages don't carry over — reinstall them in the same command if needed.</p>
+  <p class="fshint">Runs one command in a FRESH Docker sandbox seeded with this run's files —
+  <b>always the sandbox</b>, even when the run itself happened on an SSH host, so this is not a
+  test of that machine's environment. Installed packages don't carry over — reinstall them in the
+  same command if needed.</p>
 </div>
 <div class="card hidden" id="followCard"><h2>💬 Follow up</h2>
   <textarea id="followTask" style="min-height:56px" placeholder="e.g. The board is too small — make it fill the page, and add a score display."></textarea>
@@ -11498,10 +11626,25 @@ async function loadTargets(){
       o.dataset.kind=x.kind; sel.appendChild(o); });
     const cs=$('coder'); cs.innerHTML='';
     (t.coders||[{id:'default'}]).forEach(x=>{ const o=document.createElement('option');
-      o.value=x.id; o.textContent='🧠 '+(x.id==='default'?'default coder':x.id);
+      o.value=x.id; o.textContent='🧠 '+(x.label||x.id);
       cs.appendChild(o); });
+    // The selects are rebuilt on every page load, so without this the choice
+    // silently reverts to the first option — sandbox — and a run you meant for
+    // a real machine goes to a container instead. A router restart or an F5 is
+    // enough to lose it, which is exactly when you would not think to re-check.
+    restoreChoice('target','creweAgentTarget'); restoreChoice('coder','creweAgentCoder');
+    restoreChoice('steps','creweAgentSteps');
     targetNote();
   }catch(e){}
+}
+function restoreChoice(id,key){
+  try{ const v=localStorage.getItem(key); if(!v) return;
+    const sel=$(id);
+    if([...sel.options].some(o=>o.value===v)) sel.value=v;   // gone from config? keep the default
+  }catch(e){}
+}
+function rememberChoice(id,key){
+  try{ localStorage.setItem(key,$(id).value); }catch(e){}
 }
 function targetNote(){
   const sel=$('target'), opt=sel.options[sel.selectedIndex];
@@ -11571,6 +11714,94 @@ async function fsMkdir(){
     body:JSON.stringify({path:fsPath,folder:folder.trim()})})).json();
   if(r.error)alert(r.error); else fsLoad();
 }
+// ---- prompt helper ----------------------------------------------------------
+// Ask, then draft. "Modernized" means a different build in every head, so the
+// helper asks what it cannot know before writing anything — but answering is
+// optional at every point (Skip drafts from the idea alone). Applies NOTHING
+// on its own: both halves land in editable boxes, inserted only on a click.
+let helpAnswers=[], helpAsked=false;
+function helpPayload(extra){
+  return Object.assign({task:$('task').value.trim(), coder:$('coder').value,
+    steps:$('steps').value}, extra||{});
+}
+async function promptHelp(){
+  const idea=$('task').value.trim();
+  if(!idea){ $('task').focus(); alert('Type the rough idea first — even one line is enough.'); return; }
+  helpAnswers=[]; helpAsked=false;
+  const b=$('helpBtn'); b.disabled=true; b.textContent='Thinking…';
+  let r=null;
+  try{ r=await(await fetch('/agent/prompt-help',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(helpPayload({stage:'ask'}))})).json(); }catch(e){}
+  b.disabled=false; b.textContent='✨ Help me write it';
+  // no questions (or the ask call failed) is not an error — draft straight from
+  // the idea, which is exactly what this button used to do
+  if(r && r.questions && r.questions.length){ renderQuestions(r.questions); }
+  else draftHelp([]);
+}
+function renderQuestions(qs){
+  helpAsked=true;
+  const box=$('qList'); box.innerHTML='';
+  qs.forEach((q,i)=>{
+    const d=document.createElement('div'); d.className='q';
+    d.innerHTML='<h3>'+(i+1)+'. '+esc(q.q)+'</h3>';
+    const opts=document.createElement('div'); opts.className='opts';
+    (q.options||[]).forEach(o=>{
+      const btn=document.createElement('button'); btn.className='opt'; btn.type='button';
+      btn.textContent=o;
+      // multi-select on purpose: "which of these matter" is a real answer, and
+      // forcing one pick is what makes a draft quietly drop the rest
+      btn.onclick=()=>btn.classList.toggle('sel');
+      opts.appendChild(btn);
+    });
+    d.appendChild(opts);
+    const inp=document.createElement('input'); inp.className='qother'; inp.type='text';
+    inp.placeholder='or type your own answer';
+    inp.onkeydown=e=>{ if(e.key==='Enter') draftHelp(collectAnswers()); };
+    d.appendChild(inp);
+    d.dataset.q=q.q;
+    box.appendChild(d);
+  });
+  $('qStatus').textContent='';
+  $('helpCard').classList.add('hidden');
+  $('qCard').classList.remove('hidden');
+  $('qCard').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+function collectAnswers(){
+  return [...$('qList').querySelectorAll('.q')].map(d=>{
+    const typed=d.querySelector('.qother').value.trim();     // typed wins
+    const picked=[...d.querySelectorAll('.opt.sel')].map(x=>x.textContent).join(', ');
+    return {q:d.dataset.q, a: typed || picked};
+  }).filter(x=>x.a);
+}
+async function draftHelp(answers){
+  helpAnswers=answers||[];
+  const btns=[$('helpBtn'),$('qGo')];
+  btns.forEach(b=>{ if(b) b.disabled=true; });
+  $('helpBtn').textContent='Writing…'; $('qStatus').textContent='writing…';
+  try{
+    const r=await(await fetch('/agent/prompt-help',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(helpPayload({stage:'draft', answers:helpAnswers}))})).json();
+    if(r.error){ alert(r.error); }
+    else{
+      $('sugTask').value=r.task||'';
+      $('sugBack').classList.toggle('hidden', !helpAsked);
+      $('qCard').classList.add('hidden');
+      $('helpCard').classList.remove('hidden');
+      $('helpCard').scrollIntoView({behavior:'smooth',block:'nearest'});
+    }
+  }catch(e){ alert('prompt helper failed'); }
+  btns.forEach(b=>{ if(b) b.disabled=false; });
+  $('helpBtn').textContent='✨ Help me write it'; $('qStatus').textContent='';
+}
+function useSug(){
+  const t=$('sugTask').value.trim();
+  if(t){
+    $('task').value=t;
+    // an old plan describes the OLD task — drop it rather than run a stale spec
+    $('planArea').classList.add('hidden'); $('planText').value='';
+  }
+  $('helpCard').classList.add('hidden');
+}
 async function makePlan(){
   const task=$('task').value.trim(); if(!task)return;
   const b=$('planBtn'); b.disabled=true; b.textContent='Planning…';
@@ -11601,6 +11832,8 @@ function renderEvent(e){
   else if(e.t==='cancelled') addLine('warn','·','cancelled');
   else if(e.t==='model_error') addLine('error','!', e.error);
   else if(e.t==='harness') addLine('warn','·', e.note);
+  else if(e.t==='note_queued') addLine('plan-block','📝 you', e.text+'   (queued — delivered after the current action)');
+  else if(e.t==='note') addLine('warn','📝','your note reached the agent at step '+e.step);
   else if(e.t==='warn') addLine('warn','·', e.note);
   else if(e.t==='snapshot_error') addLine('warn','·','snapshot: '+e.error);
 }
@@ -11734,7 +11967,12 @@ function finish(p){
   if(p.error) addLine('error','!', p.error);
   $('status').textContent = p.cancelled ? 'stopped'
     : (p.error ? 'failed'
-    : (p.exhausted ? 'ran out of steps — result is best-effort' : 'done'));
+    : (p.timed_out ? 'ran out of time — result is best-effort'
+    : (p.exhausted ? 'ran out of steps — result is best-effort' : 'done')));
+  if(!p.error && !p.cancelled && p.verified!==null && p.verified!==undefined)
+    $('status').textContent += p.verified
+      ? ' · ✓ verified — '+(p.verify_note||'')
+      : ' · ⚠ unverified — '+(p.verify_note||'');
   $('summary').textContent = p.summary || '(no summary)';
   $('summaryCard').classList.remove('hidden');
   renderFiles(p.files||[]);
@@ -11760,10 +11998,19 @@ function renderFiles(files){
   $('filesCard').classList.remove('hidden');
 }
 function setRunning(on){
-  $('go').disabled=on; $('stop').classList.toggle('hidden',!on);
+  $('go').disabled=on; $('stop').classList.toggle('hidden',!on); $('noteBar').classList.toggle('hidden',!on);
   $('status').textContent = on ? 'running…' : $('status').textContent;
 }
 async function stopRun(){ if(jobId){ $('status').textContent='stopping…'; try{await fetch('/agent/stop/'+jobId,{method:'POST'});}catch(e){} } }
+async function sendNote(){
+  const t=$('note').value.trim(); if(!t||!jobId) return;
+  const b=$('noteBtn'); b.disabled=true;
+  try{
+    const r=await(await fetch('/agent/note/'+jobId,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})})).json();
+    if(r.error){ $('status').textContent='note: '+r.error; } else { $('note').value=''; }
+  }catch(e){ $('status').textContent='note: request failed'; }
+  b.disabled=false;
+}
 </script>
 </div></body></html>"""
 
@@ -11826,15 +12073,45 @@ def _agent_default_coder():
     """The coder used when the UI choice is 'default': an explicit
     CREWE_AGENT_URL wins (operator override — agent.py resolves it itself);
     otherwise the router's own coder role, so the agent works out of the box
-    with zero agent-specific config on any install."""
+    with zero agent-specific config on any install.
+
+    Which tier: the NORMAL one (coder_fast), never the extra tier. Same rule as
+    DEFAULT_EFFORT — an unstated choice must never silently select the paid
+    coder, and an agent run spends dozens of calls, so picking the expensive
+    tier by default is worse here than anywhere else. Extra stays where it
+    belongs: a deliberate pick, and in agent mode that means naming the backend
+    in the coder dropdown.
+
+    Then the CODE ROUTE, because the tier can be a backend the agent cannot
+    drive at all — agent.py speaks OpenAI chat-completions and Anthropic
+    Messages (with a model name); any other kind is unusable here. Giving up instead sends agent.py
+    to its hardcoded 127.0.0.1:8080, which on a configured fleet is whatever
+    unrelated model owns that port; that silent fallback ran every agent build
+    against a recipes model for weeks."""
     if os.environ.get("CREWE_AGENT_URL"):
         return None
-    url = CODE_AGENT_URL
-    info = BACKEND_INFO.get(url, {}) or {}
-    if not url or (info.get("kind") or "openai") != "openai":
+    for url in (CODE_AGENT_URL_FAST, SPECIALISTS.get("code")):
+        info = BACKEND_INFO.get(url, {}) or {}
+        kind = info.get("kind") or "openai"
+        if (url and kind in AGENT_CODER_KINDS
+                and (kind != "anthropic" or info.get("model"))):
+            return {"url": url, "key": info.get("key") or None,
+                    "model": info.get("model") or None, "kind": kind}
+    return None
+
+
+def _agent_default_coder_id():
+    """The backend ID the 'default' choice resolves to, for the UI to show —
+    an ID, never a URL, so no host or key reaches the browser. None means the
+    agent will fall back to agent.py's own default, which is worth surfacing
+    rather than hiding behind the word 'default'."""
+    dflt = _agent_default_coder()
+    if not dflt:
         return None
-    return {"url": url, "key": info.get("key") or None,
-            "model": info.get("model") or None}
+    for b in ROUTER_CONFIG.get("backends", []):
+        if b.get("url") and _chat_url(b) == dflt["url"]:
+            return b.get("id")
+    return None
 
 def _entry_cmd(files):
     """A ready-to-run command for the build, so trying a CLI/script build is
@@ -11879,31 +12156,328 @@ def _gc_orphan_runs(uid, keep_days=7):
     except OSError:
         pass
 
+# ---- prompt helper -----------------------------------------------------------
+# A rough one-liner is the usual reason a run disappoints: the builder guesses
+# at the scope. One model call turns "an updated Final Fantasy Legend, in
+# color" into a brief with its systems named.
+#
+# The helper deliberately does NOT share the planner's MVP instinct. The planner
+# scopes one run; follow-ups continue the same workspace, so the brief that
+# belongs here is the real thing. The first version of this prompt was written
+# like the planner and turned an RPG into a single combat screen with two
+# sprites — a smaller, DIFFERENT game, which is the one outcome that makes the
+# feature worse than typing the idea yourself.
+# Nothing is applied automatically: the UI shows the draft editable and the
+# operator chooses whether to keep it.
+PROMPT_HELPER_SYSTEM = """You help someone brief a coding agent that builds \
+real, working software in a sandbox. You write ONE thing from their rough \
+idea: their request, sharpened.
+
+The build is NOT one shot. The agent gets a full step budget for this run, and \
+the operator can keep going with follow-up runs in the same workspace. So \
+brief the REAL THING and let the follow-ups carry it. Shrinking the idea to \
+what a single run could finish is the worst thing you can do here.
+
+TASK — their request, sharpened, and still THEIR request at THEIR scale.
+- Never substitute a smaller, different artifact. An RPG does not become one \
+combat screen; a game with a world does not lose its world; a map app does not \
+become a list. If it has an overworld, towns, a party, an inventory — those \
+stay in the brief.
+- If they name an existing work, treat its well-known structure as part of the \
+spec and say those systems out loud rather than gesturing at the title.
+- Say what is on screen, how the player moves through it, and the modernizing \
+they asked for (color, resolution, sound, screen scaling, quality-of-life).
+- Pick the technology the FINISHED thing would actually be built in, and say \
+it plainly along with how it is run. If they name a language, engine, or \
+platform, that is the answer — use it.
+- Do NOT default to a web page. A single self-contained index.html suits a \
+small visual toy; something with several systems wants a real project \
+structure — separate modules, an assets folder, a named entry point — and \
+saying so is part of the brief.
+- Drop something only if it cannot be built in this medium at all, and say so \
+in a clause instead of silently deleting it.
+- If the operator answered questions, those answers ADD constraints — they fix \
+the platform, the style, the emphasis. They never license shrinking the idea: \
+"keep the story" means the story is ALSO required, not that the world, party \
+or battles may quietly vanish. An emphasis is not a scope cut.
+- A direct instruction, 4-8 SHORT sentences, no headings or bullets. Never one \
+long run-on sentence.
+- If they named an existing work, use ONLY what you are certain of. Never add \
+a subtitle, alternate title, character, plot point or signature mechanic you \
+are unsure about: a guessed "fact" becomes a hard build requirement, and the \
+agent will then spend its budget building something the operator never \
+wanted. When unsure, describe the systems their own words imply instead.
+
+Reply with the sharpened task and nothing else — no heading, no label, no \
+preamble, no closing remark."""
+
+# The helper's FIRST move is to ask, not to guess. "Modernized" and "a bit
+# more" carry a different build in every head, and a wrong guess is expensive
+# here — it is not one bad paragraph, it is a whole step budget spent building
+# the wrong game. Questions are cheap and answering them is optional: Skip
+# drafts from the idea alone, exactly as before.
+PROMPT_QUESTION_SYSTEM = """Someone is about to have a coding agent build \
+their idea. Before anything is written, ask what you actually need to know.
+
+Ask only about things that CHANGE WHAT GETS BUILT: the target platform or \
+technology, which systems are in scope, what a vague word like "modernized" \
+or "better" means to them here, the art or interaction style, who it is for. \
+If they named an existing work, ask what to keep from it and what to change — \
+and if you are NOT certain of its core mechanics, ask a question that pins the \
+main one down, with the plausible options (e.g. "Is combat turn-based or \
+real-time?"). Asking beats guessing: a guess becomes a build requirement, and \
+they are the one who played it.
+
+Never ask:
+- anything the idea already answers;
+- implementation trivia the builder should just decide (file names, \
+libraries, variable naming, colour hex codes);
+- open-ended interviewing ("tell me more about your vision").
+
+Prefer questions with genuinely EXCLUSIVE answers — which platform, which art \
+style, which scope tier. Do not ask them to choose which parts of their own \
+idea survive; if you need to know what matters most, ask what to EMPHASISE, \
+and remember they can pick more than one option.
+
+Ask 2 to 4 questions, sharpest first — if one question would change the build \
+most, it goes first. Each gets 2 to 4 concrete options they can pick from, \
+and the FIRST option is the sensible default for their idea. Options are \
+short: a few words, not sentences.
+
+Reply in EXACTLY this form and nothing else:
+
+Q: <question ending in a question mark>
+- <option>
+- <option>
+Q: <question ending in a question mark>
+- <option>
+- <option>"""
+
+
+def _parse_prompt_questions(text, max_q=4, max_opts=5):
+    """Parse the ask stage into [{"q", "options"}]. Junk-tolerant and lossy by
+    design — the questions are a convenience, so anything unparseable simply
+    means fewer questions (the UI then drafts straight from the idea), never
+    an error. Requiring a '?' is what keeps a chatty model's prose out."""
+    out = []
+    for raw in _strip_think(text or "").replace("\r\n", "\n").split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("```"):
+            continue
+        # drop bold PAIRS only: stripping bare '*' would eat a '* option' bullet
+        line = line.replace("**", "").strip()
+        q = re.match(r"^(?:Q(?:uestion)?\s*\d*\s*[:.)-]|\d+\s*[.)])\s*(.+)$",
+                     line, re.I)
+        if q:
+            qt = q.group(1).strip()
+            if "?" in qt and len(out) < max_q:
+                out.append({"q": qt[:300], "options": []})
+            continue
+        o = re.match(r"^[-*•]\s*(.+)$", line)
+        if o and out and len(out[-1]["options"]) < max_opts:
+            opt = o.group(1).strip().strip("*").strip()
+            if opt:
+                out[-1]["options"].append(opt[:140])
+    return [q for q in out if q["q"]]
+
+
+def _clean_answers(answers, max_n=6):
+    """Normalise the browser's [{q, a}] into the lines the draft call sees.
+    Blank answers are DROPPED, not sent as 'no preference' — a question the
+    operator skipped should leave the model free, not pinned to an empty
+    string."""
+    out = []
+    if not isinstance(answers, list):
+        return out
+    for item in answers[:max_n]:
+        if not isinstance(item, dict):
+            continue
+        q = " ".join(str(item.get("q") or "").split())[:300]
+        a = " ".join(str(item.get("a") or "").split())[:300]
+        if q and a:
+            out.append({"q": q, "a": a})
+    return out
+
+
+def _parse_prompt_help(text):
+    """The helper's reply -> the sharpened task, or None. Tolerant on purpose:
+    a small model will wander (markdown bold, fences, a stray "TASK:" label,
+    <think> leakage), and a usable draft is worth more than a 502."""
+    text = _strip_think(text or "").replace("\r\n", "\n")
+    text = re.sub(r"^\s*```[^\n]*\n|\n?```\s*$", "", text.strip())
+    # the label may arrive as "TASK:", "**TASK**", "## Task —" etc.
+    m = re.search(r"^[#*\s]*TASK\b[:\s*—-]*$|^[#*\s]*TASK\b[:\s*—-]+",
+                  text, re.I | re.M)
+    if m:
+        text = text[m.end():]
+    text = re.sub(r"^\s*```[^\n]*\n|\n?```\s*$", "", text.strip())
+    return text.strip().strip('"').strip()[:4000] or None
+
+
+def _snapshot_text_files(snap, max_files=60, max_bytes=300_000, skipped=None):
+    """Snapshot dir -> {relpath: text} for the browser check. REGULAR FILES
+    ONLY, links never followed: the snapshot is a tar out of the workspace,
+    and tar preserves symlinks and FIFOs an untrusted build or cloned repo put
+    there — following a link would read host files, opening a FIFO would hang
+    this thread with the agent slot held. Same hygiene as the zip route.
+    `skipped` (a list) collects regular files left out for size or binary
+    content — a page whose assets are missing cannot be judged fairly."""
+    out = {}
+    for root, dirs, fs in os.walk(snap):
+        dirs[:] = [d for d in dirs
+                   if d not in ("node_modules", ".git", "__pycache__",
+                                "venv", ".venv")]
+        for f in sorted(fs):
+            full = os.path.join(root, f)
+            try:
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue            # isfile is False for FIFOs/devices
+                if os.path.getsize(full) > max_bytes:
+                    if skipped is not None:
+                        skipped.append(os.path.relpath(full, snap))
+                    continue
+                with open(full, "rb") as fh:
+                    raw = fh.read(max_bytes)
+            except OSError:
+                continue
+            if b"\x00" in raw[:4096]:
+                if skipped is not None:
+                    skipped.append(os.path.relpath(full, snap))
+                continue
+            out[os.path.relpath(full, snap)] = raw.decode("utf-8", "replace")
+            if len(out) >= max_files:
+                return out
+    return out
+
+
+# absolute AND scheme-relative (//cdn…) references — both leave the page
+_EXTERNAL_URL = re.compile(r"""(?:https?:|["'(=\s])//[\w.-]+\.[a-z]{2,}""", re.I)
+_PAGE_LOADABLE = (".html", ".htm", ".js", ".mjs", ".cjs", ".css", ".json", ".svg")
+
+
+def _agent_browser_check(res, snapshot, on_event):
+    """Harness verification for web builds, AFTER the run: load the snapshot
+    in a headless browser and report runtime errors in the transcript. Adds
+    evidence to the run's verdict; never loops the agent. A check that could
+    not run says so — it must never read as 'clean'."""
+    if not AGENT_BROWSER_CHECK or not res.get("snapshot_dir"):
+        return
+    if res.get("cancelled") or res.get("error"):
+        return
+    if res.get("verified") is None:
+        return          # nothing was changed: an old page is not this run's work
+    try:
+        skipped = []
+        files = _snapshot_text_files(snapshot, skipped=skipped)
+        if not any(n.lower().endswith((".html", ".htm")) for n in files):
+            return
+        if skipped:
+            # images, bundles, data files the check cannot serve: a page
+            # judged without its assets would be judged wrong
+            on_event({"t": "harness", "note":
+                      f"browser check skipped: {len(skipped)} file(s) it cannot "
+                      "serve (binary or >300 KB: "
+                      + ", ".join(skipped[:4]) + ") — page not checked"})
+            return
+        if any(_EXTERNAL_URL.search(body) for name, body in files.items()
+               if name.lower().endswith(_PAGE_LOADABLE)):
+            on_event({"t": "harness", "note": "browser check skipped: the page "
+                      "references external URLs and the check runs offline — "
+                      "page not checked"})
+            return
+        on_event({"t": "harness", "note": "browser check: loading the page "
+                                           "in an offline headless browser…"})
+        errs, shot = _browser_check(files, offline=True)
+    except Exception as e:
+        on_event({"t": "warn", "note": f"browser check skipped: {str(e)[:200]}"})
+        return
+    # BLANK SCREEN is a pixel heuristic written for the code pipeline's fix
+    # loop (title screens trip it); here it is a remark, never a demotion
+    blank = [e for e in errs if e.startswith("BLANK SCREEN")]
+    errs = [e for e in errs if not e.startswith("BLANK SCREEN")]
+    if errs:
+        res["verified"] = False
+        res["verify_note"] = (f"browser check found {len(errs)} problem(s) on "
+                              "load: " + " | ".join(e[:160] for e in errs[:3]))
+        on_event({"t": "warn", "note": "browser check: " + res["verify_note"]})
+    elif blank and shot:
+        on_event({"t": "harness", "note": "browser check: no runtime errors, but "
+                  "the page rendered blank at first load (a title screen "
+                  "waiting for input also looks like this)"})
+    elif shot:
+        on_event({"t": "harness", "note": "browser check: page loads with no "
+                                           "runtime errors"})
+        if res.get("verified") is not False:
+            res["verified"] = True
+            res["verify_note"] = "page loads with no runtime errors"
+    else:
+        on_event({"t": "harness", "note": "browser check unavailable (no "
+                  "selenium/geckodriver) — page not checked"})
+
+
 def _run_agent_job(job_id, task, uid, target="sandbox", plan=True, plan_text=None,
                    coder=None, project=None, max_steps=None):
+    # EVERYTHING runs under the try whose finally releases AGENT_ACTIVE — an
+    # exception in the preamble (disk-full in makedirs, a broken agent.py
+    # import) used to kill this thread with the lock held, bricking the agent
+    # with 429s until a restart.
+    try:
+        return _run_agent_job_inner(job_id, task, uid, target, plan, plan_text,
+                                    coder, project, max_steps)
+    except Exception as e:
+        print(f"[agent] job {job_id} crashed: {e}")
+        with AGENT_JOBS_LOCK:
+            if job_id in AGENT_JOBS:
+                AGENT_JOBS[job_id].update(done=True, error=str(e))
+        if project:
+            # a crash before any completed run leaves a stillborn project
+            with AGENT_PROJECTS_LOCK:
+                ps = _load_projects(uid)
+                ps = [q for q in ps if not (q.get("id") == project
+                      and not q.get("jobs") and not q.get("job_id"))]
+                _save_projects(ps, uid)
+    finally:
+        try:
+            AGENT_ACTIVE.release()
+        except RuntimeError:
+            pass
+
+
+def _run_agent_job_inner(job_id, task, uid, target, plan, plan_text,
+                         coder, project, max_steps):
     import agent as _agent
     if coder is None:
         coder = _agent_default_coder()
     _reap_sandbox_containers()          # clear leaks from any prior wedged run
     _gc_orphan_runs(uid)
     snapshot = os.path.join(agent_runs_dir(uid), job_id)
-    backend = None
-    if target == "local" and _agent_local_ok():
-        import local_workspace
-        backend = local_workspace.LocalWorkspace(run_id=job_id)
+    host = None
+    bad_target = None
+    if target == "local":
+        if not _agent_local_ok():        # the route checks too; never fall
+            bad_target = "local (unsandboxed) mode is disabled"   # back to sandbox
     elif target != "sandbox":
-        h = _agent_host(target)          # re-resolved server-side; never client host
-        if not h:
-            with AGENT_JOBS_LOCK:
-                AGENT_JOBS[job_id].update(done=True, error=f"unknown target '{target}'")
-            try: AGENT_ACTIVE.release()
-            except RuntimeError: pass
-            return
-        import ssh_workspace
-        backend = ssh_workspace.SSHWorkspace(
-            host=h["host"], user=h["user"], port=h.get("port", 22),
-            key=h.get("key"), workdir_base=h.get("workdir", "~/crewe-agent"),
-            run_id=job_id)
+        host = _agent_host(target)       # re-resolved server-side; never client host
+        if not host:
+            bad_target = f"unknown target '{target}'"
+    if bad_target:
+        with AGENT_JOBS_LOCK:
+            AGENT_JOBS[job_id].update(done=True, error=bad_target)
+        return
+
+    def make_backend():
+        # a FRESH workspace per call: backends are context managers that
+        # run_agent tears down on exit
+        if target == "local":
+            import local_workspace
+            return local_workspace.LocalWorkspace(run_id=job_id)
+        if host:
+            import ssh_workspace
+            return ssh_workspace.SSHWorkspace(
+                host=host["host"], user=host["user"], port=host.get("port", 22),
+                key=host.get("key"), workdir_base=host.get("workdir", "~/crewe-agent"),
+                run_id=job_id)
+        return None
     def on_event(e):
         with AGENT_JOBS_LOCK:
             j = AGENT_JOBS.get(job_id)
@@ -11918,75 +12492,94 @@ def _run_agent_job(job_id, task, uid, target="sandbox", plan=True, plan_text=Non
         with AGENT_JOBS_LOCK:
             j = AGENT_JOBS.get(job_id)
             return bool(j and j.get("cancel"))
-    try:
-        # Continuity is EXPLICIT: only a continued project seeds the workspace
-        # (from that project's latest snapshot). A task WITH a repo link still
-        # starts fresh from a clean clone even inside a project. Files alone
-        # are not continuity — a follow-up like "fix problem 1 from your
-        # analysis" refers to the previous CONVERSATION, which a fresh run has
-        # never seen (one run burned 13 steps grepping git history for it) —
-        # so the project's last summary rides along with the task.
-        seed = None
-        proj = _project(project, uid) if project else None
-        if proj and proj.get("job_id") and "github.com/" not in task:
-            snap = os.path.join(agent_runs_dir(uid), proj["job_id"])
-            if os.path.isdir(snap):
-                seed = snap
-                if proj.get("summary"):
-                    task = (task + "\n\nCONTEXT — your previous run on this "
-                            "project ended with this summary:\n"
-                            + str(proj["summary"])[:2000])
-        res = _agent.run_agent(task, network="egress",
-                               max_steps=max_steps or AGENT_MAX_STEPS,
-                               on_event=on_event, snapshot_dir=snapshot,
-                               should_cancel=cancelled, backend=backend, plan=plan,
-                               plan_text=plan_text, seed_dir=seed, coder=coder)
-        if project:
-            # record the run — but only a run that left a snapshot is
-            # continuable, and a project whose ONLY run left nothing (stopped
-            # during planning, crashed before the sandbox) is stillborn: drop
-            # it rather than shelve an empty card.
-            snap_ok = os.path.isdir(snapshot)
-            with AGENT_PROJECTS_LOCK:
-                ps = _load_projects(uid)
-                p = next((q for q in ps if q.get("id") == project), None)
-                if p is not None:
-                    if snap_ok:
-                        p["job_id"] = job_id
-                        p["jobs"] = (p.get("jobs") or []) + [job_id]
-                    if res.get("summary"):
-                        p["summary"] = (res.get("summary") or "")[:4000]
-                    p["updated"] = time.time()
-                    if not p.get("jobs") and not p.get("job_id"):
-                        ps = [q for q in ps if q.get("id") != project]
-                    _save_projects(ps, uid)
+    def pull_notes():
+        # notes the user posted to /agent/note while the run was live; the
+        # loop drains them after each action and delivers them as part of
+        # that observation — steering by the human, nothing automatic
         with AGENT_JOBS_LOCK:
-            AGENT_JOBS[job_id].update(done=True, ok=res.get("done"),
-                                      summary=res.get("summary"),
-                                      files=res.get("files") or [],
-                                      entry_cmd=_entry_cmd(res.get("files") or []),
-                                      steps=res.get("steps"),
-                                      # a mid-run model error used to vanish
-                                      # here and render as a successful "done"
-                                      error=res.get("error"),
-                                      exhausted=res.get("exhausted", False),
-                                      cancelled=res.get("cancelled", False))
-    except Exception as e:
-        print(f"[agent] job {job_id} crashed: {e}")
-        with AGENT_JOBS_LOCK:
-            AGENT_JOBS[job_id].update(done=True, error=str(e))
-        if project:
-            # a crash before any completed run leaves a stillborn project
-            with AGENT_PROJECTS_LOCK:
-                ps = _load_projects(uid)
-                ps = [q for q in ps if not (q.get("id") == project
-                      and not q.get("jobs") and not q.get("job_id"))]
+            j = AGENT_JOBS.get(job_id)
+            if not j:
+                return []
+            notes, j["notes"] = list(j.get("notes") or []), []
+            return notes
+    # Continuity is EXPLICIT: only a continued project seeds the workspace
+    # (from that project's latest snapshot). A task WITH a repo link still
+    # starts fresh from a clean clone even inside a project. Files alone
+    # are not continuity — a follow-up like "fix problem 1 from your
+    # analysis" refers to the previous CONVERSATION, which a fresh run has
+    # never seen (one run burned 13 steps grepping git history for it) —
+    # so the project's last summary rides along with the task.
+    seed = None
+    proj = _project(project, uid) if project else None
+    if proj and proj.get("job_id") and "github.com/" not in task:
+        snap = os.path.join(agent_runs_dir(uid), proj["job_id"])
+        if os.path.isdir(snap):
+            seed = snap
+            if proj.get("summary"):
+                task = (task + "\n\nCONTEXT — your previous run on this "
+                        "project ended with this summary:\n"
+                        + str(proj["summary"])[:2000])
+    # Say WHERE this ran, in the transcript, every time. Nothing else in the UI
+    # records it: a run on a real machine and a run in a container read exactly
+    # the same afterwards, so "did my target get used?" was unanswerable without
+    # SSHing to the box. NAME only — host/user/key stay server-side.
+    # ...and WHICH coder, by backend id (a url or key never reaches the
+    # transcript): "default" is named by what it resolved to
+    with AGENT_JOBS_LOCK:
+        cid = (AGENT_JOBS.get(job_id) or {}).get("coder") or "default"
+    if cid == "default":
+        did = _agent_default_coder_id()
+        cid = f"default → {did}" if did else "default (agent.py fallback)"
+    on_event({"t": "harness",
+              "note": "workspace: " + (
+                  f"{target} — a real machine over SSH, NOT sandboxed"
+                  if host else
+                  "local — this server, UNSANDBOXED" if target == "local"
+                  else "ephemeral Docker sandbox") + f" · coder: {cid}"})
+    res = _agent.run_agent(task, network="egress",
+                           max_steps=max_steps or AGENT_MAX_STEPS,
+                           on_event=on_event, snapshot_dir=snapshot,
+                           should_cancel=cancelled, backend=make_backend(),
+                           plan=plan, plan_text=plan_text, seed_dir=seed,
+                           coder=coder, pull_notes=pull_notes)
+    _agent_browser_check(res, snapshot, on_event)
+    if project:
+        # record the run — but only a run that left a snapshot is
+        # continuable, and a project whose ONLY run left nothing (stopped
+        # during planning, crashed before the sandbox) is stillborn: drop
+        # it rather than shelve an empty card.
+        snap_ok = os.path.isdir(snapshot)
+        with AGENT_PROJECTS_LOCK:
+            ps = _load_projects(uid)
+            p = next((q for q in ps if q.get("id") == project), None)
+            if p is not None:
+                if snap_ok:
+                    p["job_id"] = job_id
+                    p["jobs"] = (p.get("jobs") or []) + [job_id]
+                if res.get("summary"):
+                    p["summary"] = (res.get("summary") or "")[:4000]
+                p["updated"] = time.time()
+                if not p.get("jobs") and not p.get("job_id"):
+                    ps = [q for q in ps if q.get("id") != project]
                 _save_projects(ps, uid)
-    finally:
-        try:
-            AGENT_ACTIVE.release()
-        except RuntimeError:
-            pass
+    with AGENT_JOBS_LOCK:
+        AGENT_JOBS[job_id].update(done=True, ok=res.get("done"),
+                                  summary=res.get("summary"),
+                                  files=res.get("files") or [],
+                                  entry_cmd=_entry_cmd(res.get("files") or []),
+                                  steps=res.get("steps"),
+                                  # a mid-run model error used to vanish
+                                  # here and render as a successful "done"
+                                  error=res.get("error"),
+                                  exhausted=res.get("exhausted", False),
+                                  timed_out=res.get("timed_out", False),
+                                  cancelled=res.get("cancelled", False),
+                                  # verified: True/False = what the evidence
+                                  # says (a run after the last change, the
+                                  # syntax checks, the browser check); None =
+                                  # nothing was changed, nothing to verify
+                                  verified=res.get("verified"),
+                                  verify_note=res.get("verify_note"))
 
 def _safe_run_id(run_id):
     return bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", run_id or ""))
@@ -12048,7 +12641,7 @@ def agent_run():
         with AGENT_JOBS_LOCK:
             AGENT_JOBS[job_id] = {"owner": _owner(), "task": task, "target": target,
                                   "coder": coder_id, "project": pid,
-                                  "events": [], "done": False,
+                                  "events": [], "done": False, "notes": [],
                                   "stage_ts": time.time()}
             _prune_jobs(AGENT_JOBS)
         spawn_owned(target=_run_agent_job,
@@ -12072,14 +12665,79 @@ def agent_plan():
     if not task:
         return jsonify({"error": "empty task"}), 400
     import agent as _agent
-    coder_id = (body.get("coder") or "default").strip()
-    coder = _agent_coder(coder_id) if coder_id != "default" else None
-    if coder_id != "default" and not coder:
-        return jsonify({"error": f"unknown coder '{coder_id}'"}), 400
+    coder, cerr = _agent_pick_coder(body.get("coder"))
+    if cerr:
+        return jsonify({"error": cerr}), 400
     try:
         return jsonify({"spec": _agent._plan(task, coder=coder)})
     except Exception as e:
         return jsonify({"error": f"planning failed: {e}"}), 502
+
+@app.route("/agent/prompt-help", methods=["POST"])
+def agent_prompt_help():
+    """Two stages, one model call each.
+
+    stage='ask'   -> clarifying questions with pickable options, or an empty
+                     list, which the UI treats as "nothing to ask, go on".
+    stage='draft' -> the sharpened task, informed by whichever questions
+                     were actually answered.
+
+    Suggestion only — the UI decides what (if anything) to apply, so a weak
+    reply costs a click, never a run."""
+    body = request.json or {}
+    idea = (body.get("task") or "").strip()[:4000]
+    if not idea:
+        return jsonify({"error": "empty task"}), 400
+    stage = (body.get("stage") or "draft").strip().lower()
+    if stage not in ("ask", "draft"):
+        return jsonify({"error": f"unknown stage '{stage}'"}), 400
+    import agent as _agent
+    coder, cerr = _agent_pick_coder(body.get("coder"))
+    if cerr:
+        return jsonify({"error": cerr}), 400
+    # the real budget, so ambition is calibrated to it: 40 steps is a different
+    # brief from 8, and the model cannot see the select
+    try:
+        steps = min(40, max(1, int(body.get("steps") or AGENT_MAX_STEPS)))
+    except (TypeError, ValueError):
+        steps = AGENT_MAX_STEPS
+    budget = (f"Budget for this build: {steps} agent steps, and the operator "
+              f"can continue it afterwards with follow-up runs in the same "
+              f"workspace.")
+    if stage == "ask":
+        try:
+            out = _agent._chat(
+                [{"role": "system", "content": PROMPT_QUESTION_SYSTEM},
+                 {"role": "user", "content": f"{budget}\n\nRough idea: {idea}"}],
+                temperature=0.4, max_tokens=600, timeout=(10, 150), coder=coder)
+        except Exception as e:
+            # asking is optional, so a dead coder must not dead-end the flow:
+            # the UI drops through to drafting, which reports its own failure
+            return jsonify({"questions": [], "note": f"could not ask: {e}"})
+        return jsonify({"questions": _parse_prompt_questions(out)})
+
+    answers = _clean_answers(body.get("answers"))
+    ctx = ""
+    if answers:
+        ctx = ("\n\nThe operator was asked these questions and answered. These "
+               "answers OVERRIDE any default you would have picked, and they "
+               "ADD to the idea — never treat an answer as permission to drop "
+               "anything else the idea implies:\n"
+               + "\n".join(f"- {a['q']} -> {a['a']}" for a in answers))
+    try:
+        # same short silence timeout as planning: this is a small generation,
+        # so a long stall means a stuck coder, not real work
+        out = _agent._chat([{"role": "system", "content": PROMPT_HELPER_SYSTEM},
+                            {"role": "user",
+                             "content": f"{budget}\n\nRough idea: {idea}{ctx}"}],
+                           temperature=0.4, max_tokens=1200, timeout=(10, 180),
+                           coder=coder)
+    except Exception as e:
+        return jsonify({"error": f"prompt helper failed: {e}"}), 502
+    task = _parse_prompt_help(out)
+    if not task:
+        return jsonify({"error": "prompt helper returned nothing usable"}), 502
+    return jsonify({"task": task})
 
 @app.route("/agent/hosts")
 def agent_hosts():
@@ -12090,10 +12748,16 @@ def agent_hosts():
     targets += [{"name": h["name"], "kind": "ssh"}
                 for h in _load_agent_hosts() if h.get("name")]
     # coder choices: backend IDS only (resolved server-side in _agent_coder)
-    coders = [{"id": "default"}]
-    coders += [{"id": b["id"]} for b in ROUTER_CONFIG.get("backends", [])
-               if b.get("id") and b.get("url")
-               and b.get("kind", "openai") == "openai"]
+    did = _agent_default_coder_id()
+    coders = [{"id": "default",
+               "label": f"default coder ({did})" if did
+                        else "default coder (unresolved — agent.py fallback)"}]
+    # a label may carry the model NAME (never a host, port or key): the id
+    # alone does not say which Claude or which Qwen sits behind it
+    coders += [{"id": b["id"],
+                "label": b["id"] + (f" · {b['model']}" if b.get("model") else "")}
+               for b in ROUTER_CONFIG.get("backends", [])
+               if b.get("id") and _agent_coder_ok(b)]
     return jsonify({"targets": targets, "coders": coders})
 
 
@@ -12195,7 +12859,46 @@ def agent_progress(job_id):
             "entry_cmd": j.get("entry_cmd"), "live": j.get("live"),
             "ok": j.get("ok"), "exhausted": j.get("exhausted", False),
             "cancelled": j.get("cancelled", False), "task": j.get("task"),
+            "timed_out": j.get("timed_out", False),
+            "verified": j.get("verified"), "verify_note": j.get("verify_note"),
         })
+
+AGENT_NOTE_MAX = 2000          # chars per note
+AGENT_NOTES_PENDING_MAX = 20   # notes waiting for the next observation
+
+@app.route("/agent/note/<job_id>", methods=["POST"])
+def agent_note(job_id):
+    """A note to the RUNNING agent. Delivered with its next observation —
+    after the action in flight completes, never mid-generation — and shown in
+    the transcript when queued and again when delivered. Steering by the
+    human only: no critic, no rounds. Bounded: AGENT_NOTE_MAX chars each,
+    AGENT_NOTES_PENDING_MAX waiting (each delivery costs the model a reply)."""
+    j = owned_job(AGENT_JOBS, job_id)
+    if not j:
+        return jsonify({"error": "unknown job"}), 404
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        body = {}
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "empty note"}), 400
+    text = text[:AGENT_NOTE_MAX]
+    with AGENT_JOBS_LOCK:
+        if j.get("done"):
+            return jsonify({"error": "this run has finished — send the note as "
+                                     "a follow-up task instead"}), 409
+        if j.get("cancel"):
+            return jsonify({"error": "this run is stopping — the note would "
+                                     "never be delivered"}), 409
+        pending = j.setdefault("notes", [])
+        if len(pending) >= AGENT_NOTES_PENDING_MAX:
+            return jsonify({"error": f"{AGENT_NOTES_PENDING_MAX} notes are "
+                                     "already waiting"}), 429
+        pending.append(text)
+        j["events"].append({"t": "note_queued", "text": text[:300],
+                            "pending": len(pending)})
+        n = len(pending)
+    return jsonify({"ok": True, "pending": n})
 
 @app.route("/agent/stop/<job_id>", methods=["POST"])
 def agent_stop(job_id):

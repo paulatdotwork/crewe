@@ -160,6 +160,11 @@ class Sandbox:
             r = _docker("cp", f"{self.cid}:{path}", tmp, timeout=60)
             if r.returncode != 0:
                 return None
+            # docker cp copies a symlink AS a link, and open() would then
+            # follow it on the HOST — a link planted in the sandbox (by a
+            # cloned repo, or the model) must never read a host file
+            if os.path.islink(tmp):
+                return None
             with open(tmp, "rb") as fh:
                 data = fh.read(max_bytes)
             return data.decode("utf-8", "replace")

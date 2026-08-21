@@ -20,8 +20,17 @@
 - Streamed model calls: live "coder writing…" progress, Stop that lands
   mid-generation, silence-based timeouts that never kill a slow-but-alive
   local model
-- Pick the coder per run from your configured backends; auto-plan turns a
-  vague request into a bounded MVP spec you can edit before building
+- Pick the coder per run from your configured backends — llama.cpp, any
+  OpenAI-compatible server, or **Claude (Anthropic) natively**; auto-plan
+  turns a vague request into a bounded MVP spec you can edit before building
+- **Verified finishes**: every write is syntax-checked on the host, `finish`
+  is refused for code that was never run, and each run ends with an honest
+  `✓ verified` / `⚠ unverified` verdict — plus an offline headless-Firefox
+  check of HTML builds. All deterministic: no critic model, no revise rounds
+- An `edit` action for surgical changes; long builds stay inside the model's
+  **real context window** (history condensed to fit the backend's published
+  window); the workspace's `AGENTS.md` is briefed automatically
+- **Talk to it mid-run**: notes are delivered after the agent's current action
 - Setup and security model: [docs/AGENT.md](docs/AGENT.md)
 
 **Routing**

@@ -110,7 +110,10 @@ class SSHWorkspace:
     def read_file(self, path, max_bytes=200_000):
         p = self._abs(path)
         r = subprocess.run(
-            self._ssh() + [f"test -f {shlex.quote(p)} && cat {shlex.quote(p)} || exit 44"],
+            # `! -L`: a symlink (planted by a cloned repo, or the model) must
+            # never be followed on the remote box by the harness's own reads
+            self._ssh() + [f"test -f {shlex.quote(p)} && test ! -L {shlex.quote(p)} "
+                           f"&& cat {shlex.quote(p)} || exit 44"],
             capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             return None

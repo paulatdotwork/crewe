@@ -21,7 +21,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 sys.path.insert(0, ROOT)
+AGENT_DIR = ROOT      # where agent.py lives — the subprocess snippet needs it too
 import router, agent
 
 tmp = tempfile.mkdtemp()
@@ -96,8 +98,12 @@ check("empty key/model become None", c and c["key"] is None and c["model"] is No
 c2 = router._agent_coder("brainy")
 check("key + model pass through",
       c2 and c2["key"] == "sk-test" and c2["model"] == "brain-26b", str(c2))
-check("anthropic-kind REJECTED (agent speaks openai only)",
-      router._agent_coder("claude") is None)
+c3 = router._agent_coder("claude")
+check("anthropic-kind WITH a model accepted: kind + /v1/messages url + key",
+      bool(c3) and c3["kind"] == "anthropic"
+      and c3["url"] == "https://api.anthropic.com/v1/messages"
+      and c3["model"] == "claude-sonnet-5" and c3["key"] == "sk-ant", str(c3))
+check("openai resolution carries kind", c and c.get("kind") == "openai", str(c))
 check("url-less backend rejected", router._agent_coder("no-url") is None)
 check("unknown id rejected", router._agent_coder("nope") is None)
 
@@ -110,9 +116,15 @@ h = adm.get("/agent/hosts").get_json()
 ids = [x["id"] for x in h.get("coders", [])]
 check("default is first", ids[:1] == ["default"], str(ids))
 check("openai backends listed", "code-qwen" in ids and "brainy" in ids, str(ids))
-check("anthropic + url-less EXCLUDED", "claude" not in ids and "no-url" not in ids, str(ids))
-check("only ids reach the client — no url/key",
-      all(set(x.keys()) == {"id"} for x in h.get("coders", [])), str(h.get("coders")))
+check("anthropic listed (it has a model); url-less EXCLUDED",
+      "claude" in ids and "no-url" not in ids, str(ids))
+# ids and a human label may reach the client; a URL, host, port or key may not
+# (the label names the resolved BACKEND ID, which is why it is safe)
+check("only ids/labels reach the client — no url, host or key",
+      all(set(x.keys()) <= {"id", "label"} for x in h.get("coders", []))
+      and not any(t in json.dumps(h.get("coders", []))
+                  for t in ("http", "://", "sk-", ".0.0.", ":8", ":9")),
+      str(h.get("coders")))
 
 # ---- /agent/run validates the coder before taking the run slot ---------------
 print("--- /agent/run coder validation ---")
@@ -139,9 +151,64 @@ check("no coder -> default still runs", r.status_code == 200, str(r.get_json()))
 for _ in range(50):
     if seen: break
     time.sleep(0.1)
+_role_kind = (router.BACKEND_INFO.get(router.CODE_AGENT_URL_FAST) or {}).get("kind", "openai")
+_want = router.CODE_AGENT_URL_FAST if _role_kind == "openai" else router.SPECIALISTS.get("code")
 check("default coder resolves to the ROUTER'S code backend (zero-config)",
-      (seen.get("coder") or {}).get("url") == router.CODE_AGENT_URL,
-      f"{seen.get('coder')} vs {router.CODE_AGENT_URL}")
+      (seen.get("coder") or {}).get("url") == _want,
+      f"{seen.get('coder')} vs {_want}")
+
+# ---- default-coder resolution chain ------------------------------------------
+# agent.py speaks ONLY the OpenAI chat shape. When the coder ROLE is a backend
+# it cannot drive (anthropic), returning None hands the run to agent.py's
+# hardcoded 127.0.0.1:8080 — on a configured fleet that is whatever unrelated
+# model owns that port, and it is SILENT. The code route is the honest fallback.
+print("--- _agent_default_coder resolution ---")
+_saved = (router.CODE_AGENT_URL, router.CODE_AGENT_URL_FAST, router.SPECIALISTS,
+          router.BACKEND_INFO, router.ROUTER_CONFIG)
+NORMAL_OA, ANTH = "http://10.0.0.9:9001/v1/chat/completions", "https://api.anthropic.com/v1/messages"
+ROUTE_OA = "http://10.0.0.7:8080/v1/chat/completions"
+EXTRA_OA = "https://paid.example/v1/chat/completions"
+router.BACKEND_INFO = {NORMAL_OA: {"kind": "openai", "key": "sk-normal"},
+                       ANTH: {"kind": "anthropic", "key": "sk-anth"},
+                       EXTRA_OA: {"kind": "openai", "key": "sk-paid", "paid": True},
+                       ROUTE_OA: {"kind": "openai", "key": None}}
+router.ROUTER_CONFIG = {"backends": [{"id": "normal-box", "url": "http://10.0.0.9:9001"},
+                                     {"id": "route-box", "url": "http://10.0.0.7:8080"}]}
+router.SPECIALISTS = {"code": ROUTE_OA}
+try:
+    router.CODE_AGENT_URL, router.CODE_AGENT_URL_FAST = EXTRA_OA, NORMAL_OA
+    d = router._agent_default_coder()
+    check("openai NORMAL-tier coder is used as-is",
+          d and d["url"] == NORMAL_OA and d["key"] == "sk-normal", repr(d))
+    check("id shown for the normal-tier backend", router._agent_default_coder_id() == "normal-box")
+    # the house rule (see DEFAULT_EFFORT): an unstated choice never selects the
+    # paid tier — an agent run spends dozens of calls, so this matters most here
+    check("the EXTRA tier is never picked by default, even when driveable",
+          d["url"] != EXTRA_OA, repr(d))
+
+    router.CODE_AGENT_URL_FAST = ANTH
+    d = router._agent_default_coder()
+    check("undriveable normal tier falls through to the CODE ROUTE, not None",
+          d and d["url"] == ROUTE_OA, repr(d))
+    check("id shown for the route backend", router._agent_default_coder_id() == "route-box")
+    check("no key invented for a keyless backend", d.get("key") is None)
+    check("still never reaches for the paid extra tier", d["url"] != EXTRA_OA)
+
+    router.SPECIALISTS = {"code": ANTH}
+    check("nothing driveable -> None (agent.py default, as before)",
+          router._agent_default_coder() is None)
+    check("unresolvable default has no id to show", router._agent_default_coder_id() is None)
+
+    router.SPECIALISTS = {"code": ROUTE_OA}
+    os.environ["CREWE_AGENT_URL"] = "http://10.0.0.5:1234/v1/chat/completions"
+    try:
+        check("explicit CREWE_AGENT_URL still wins over both",
+              router._agent_default_coder() is None)
+    finally:
+        del os.environ["CREWE_AGENT_URL"]
+finally:
+    (router.CODE_AGENT_URL, router.CODE_AGENT_URL_FAST, router.SPECIALISTS,
+     router.BACKEND_INFO, router.ROUTER_CONFIG) = _saved
 
 # ---- agent._chat honors the coder dict ---------------------------------------
 print("--- _chat coder plumbing (real HTTP stub) ---")
@@ -203,8 +270,8 @@ check("cmd timeout default 600 (was 180)", agent.CMD_TIMEOUT == 600,
 # env override + real behavior: 1s read timeout against a 3s-slow stub must
 # raise ReadTimeout (fresh interpreter so the module-level int is re-read)
 code = (
-    ("import sys; sys.path.insert(0, %r)\n" % ROOT)
-    + "import requests, agent\n"
+    f"import sys; sys.path.insert(0, {AGENT_DIR!r})\n"
+    "import requests, agent\n"
     "assert agent.READ_TIMEOUT == 1, agent.READ_TIMEOUT\n"
     "try:\n"
     f"    agent._chat([{{'role':'user','content':'x'}}], coder={{'url': '{BASE}/slow/v1/chat/completions'}})\n"

@@ -8,11 +8,11 @@ router.USERS_FILE=os.path.join(tmp,"u.json"); router.USERDATA_ROOT=os.path.join(
 router.app.config["SESSION_COOKIE_SECURE"]=False
 # allowlist with one remote host
 router.AGENT_HOSTS_FILE=os.path.join(tmp,"hosts.json")
-json.dump({"hosts":[{"name":"palai","host":"192.168.86.53","user":"pal","workdir":"~/crewe-agent"}]},
+json.dump({"hosts":[{"name":"buildbox","host":"10.0.0.5","user":"pal","workdir":"~/crewe-agent"}]},
           open(router.AGENT_HOSTS_FILE,"w"))
 
 captured={}
-def fake_run(task, *, max_steps=15, network="egress", on_event=None, snapshot_dir=None, should_cancel=None, backend=None, plan=True, plan_text=None, mode="code", model_url=None, seed_dir=None, coder=None):
+def fake_run(task, *, max_steps=15, network="egress", on_event=None, snapshot_dir=None, should_cancel=None, backend=None, plan=True, plan_text=None, mode="code", model_url=None, seed_dir=None, coder=None, **kw):
     captured["backend"]=backend
     on_event and on_event({"t":"action","step":1,"action":"run","detail":{"cmd":"echo hi"}})
     os.makedirs(snapshot_dir, exist_ok=True)
@@ -46,16 +46,16 @@ _expected = ["sandbox"] + [h["name"] for h in
                            json.load(open(router.AGENT_HOSTS_FILE))["hosts"]]
 check("lists the built-in targets plus every allowlisted host",
       names == _expected, f"{names} != {_expected}")
-check("NO host/user/key leaked to client", "192.168.86.53" not in json.dumps(h) and "pal" not in [t.get('user') for t in h['targets']])
+check("NO host/user/key leaked to client", "10.0.0.5" not in json.dumps(h) and "pal" not in [t.get('user') for t in h['targets']])
 check("non-admin blocked from /agent/hosts", gst.get("/agent/hosts",headers={"Accept":"application/json"}).status_code==403)
 
 print("--- target routing (allowlist = boundary) ---")
-r=adm.post("/agent/run",json={"task":"t","target":"palai"}); check("run target=palai accepted", r.status_code==200)
-p=wait_done(r.get_json()["job_id"]); check("palai run completed", bool(p))
+r=adm.post("/agent/run",json={"task":"t","target":"buildbox"}); check("run target=buildbox accepted", r.status_code==200)
+p=wait_done(r.get_json()["job_id"]); check("buildbox run completed", bool(p))
 import ssh_workspace
 bk=captured.get("backend")
 check("backend is an SSHWorkspace", isinstance(bk, ssh_workspace.SSHWorkspace))
-check("backend resolved to the allowlisted host", bk and bk.host=="192.168.86.53" and bk.user=="pal", f"{bk and bk.host}")
+check("backend resolved to the allowlisted host", bk and bk.host=="10.0.0.5" and bk.user=="pal", f"{bk and bk.host}")
 
 captured.clear()
 r=adm.post("/agent/run",json={"task":"t","target":"sandbox"}); wait_done(r.get_json()["job_id"])
@@ -64,7 +64,7 @@ check("target=sandbox -> backend None (Docker)", captured.get("backend") is None
 print("--- allowlist rejects arbitrary hosts ---")
 r=adm.post("/agent/run",json={"task":"t","target":"evil.attacker.com"})
 check("unknown/arbitrary target -> 400", r.status_code==400, str(r.status_code))
-r=adm.post("/agent/run",json={"task":"t","target":"192.168.86.99"})
+r=adm.post("/agent/run",json={"task":"t","target":"10.0.0.5"})
 check("raw IP not on allowlist -> 400", r.status_code==400)
 
 print(f"\n{len(P)} passed, {len(F)} failed")

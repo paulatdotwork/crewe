@@ -8,7 +8,7 @@ router.USERS_FILE=os.path.join(tmp,"u.json"); router.USERDATA_ROOT=os.path.join(
 router.app.config["SESSION_COOKIE_SECURE"]=False
 
 # fake agent run: emits events, writes a file into the snapshot dir, returns
-def fake_run(task, *, max_steps=15, network="egress", on_event=None, snapshot_dir=None, should_cancel=None, backend=None, plan=True, plan_text=None, mode="code", model_url=None, seed_dir=None, coder=None):
+def fake_run(task, *, max_steps=15, network="egress", on_event=None, snapshot_dir=None, should_cancel=None, backend=None, plan=True, plan_text=None, mode="code", model_url=None, seed_dir=None, coder=None, **kw):
     on_event and on_event({"t":"action","step":1,"action":"write","detail":{"path":"a.py"}})
     on_event and on_event({"t":"observation","step":1,"obs":"wrote a.py"})
     os.makedirs(snapshot_dir, exist_ok=True)
@@ -62,6 +62,33 @@ try:
     check("second run -> 429 while active", adm.post("/agent/run",json={"task":"y"}).status_code==429)
 finally:
     router.AGENT_ACTIVE.release()
+
+# ---- every run says WHERE it ran ---------------------------------------------
+# A container run and a real-machine run were indistinguishable in the UI, so
+# "did my target actually get used?" could only be answered by SSHing to the
+# box. The transcript now answers it, with the NAME only — never host/user/key.
+print("--- workspace is stated in the transcript ---")
+def _events_for(target):
+    j = adm.post("/agent/run", json={"task": "x", "target": target, "plan": False}).get_json()
+    for _ in range(80):
+        p = adm.get(f"/agent/progress/{j['job_id']}?since=0").get_json()
+        if p.get("done"):
+            return [e.get("note", "") for e in p["events"] if e.get("t") == "harness"]
+        time.sleep(0.1)
+    return []
+notes = " ".join(_events_for("sandbox"))
+check("sandbox run names the sandbox", "workspace:" in notes and "sandbox" in notes, notes)
+# an SSH target from a FIXTURE allowlist (never the operator's real file)
+import json as _json
+router.AGENT_HOSTS_FILE = os.path.join(tmp, "hosts.json")
+with open(router.AGENT_HOSTS_FILE, "w") as f:
+    _json.dump({"hosts": [{"name": "buildbox", "host": "10.0.0.5", "user": "me",
+                           "port": 22, "key": os.path.join(tmp, "id_test")}]}, f)
+notes = " ".join(_events_for("buildbox"))
+check("ssh run names the host and warns it is not sandboxed",
+      "workspace: buildbox" in notes and "NOT sandboxed" in notes, notes)
+check("no host, user or key leaks into the transcript",
+      not any(t in notes for t in ("10.0.0.", "@", "BatchMode", "ssh -", "id_test")), notes)
 
 print(f"\n{len(P)} passed, {len(F)} failed")
 sys.exit(1 if F else 0)
