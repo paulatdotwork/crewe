@@ -90,3 +90,6 @@ jobs:
       - name: agent-symlink
         if: ${{ !cancelled() }}
         run: python3 tests/test_agent_symlink.py
+      - name: agent-toolcalls
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_agent_toolcalls.py

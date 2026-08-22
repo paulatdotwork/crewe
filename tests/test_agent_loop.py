@@ -89,7 +89,8 @@ with tempfile.TemporaryDirectory() as snap:
     check("reports files", res["files"] == ["hello.py"])
     check("snapshots the workspace", res.get("snapshot_dir") == sb.snapshotted)
     check("planned first (extra model call)", seen["calls"] == 5)
-    check("uses the CODE system prompt", seen["systems"][1] == agent.SYSTEM)
+    check("uses a coding system prompt (text protocol or tool mode)",
+          seen["systems"][1] in (agent.SYSTEM, agent.TOOL_SYSTEM))
     check("uses the CODE planner prompt", seen["systems"][0] == agent.PLANNER_SYSTEM)
     check("plan reached the task", "Scope: a tiny thing" in
           open(res["audit"]).read())

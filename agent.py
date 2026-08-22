@@ -117,6 +117,89 @@ def _agent_url():
     # module is first imported (e.g. by a long-lived router process) still works
     return os.environ.get("CREWE_AGENT_URL", DEFAULT_AGENT_URL)
 
+# ---- native tool calling (OpenAI function calling) --------------------------
+# A capable coder emits well-formed tool_calls, which
+# is a more robust channel than regex-parsing a ```json block out of prose. The
+# text protocol stays as the universal fallback: a model that ignores the tools
+# and replies with a WRITE:/```json block still works, and a backend that
+# rejects the `tools` param drops the whole run to text mode. One observation
+# per action either way — the verification loop is unchanged. Kill switch:
+# CREWE_AGENT_TOOLS=0.
+TOOLS_ENABLED = os.environ.get("CREWE_AGENT_TOOLS", "1") != "0"
+
+def _tool_schemas():
+    obj = lambda props, req: {"type": "object", "properties": props,
+                              "required": req, "additionalProperties": False}
+    fn = lambda name, desc, props, req: {
+        "type": "function",
+        "function": {"name": name, "description": desc,
+                     "parameters": obj(props, req)}}
+    S = {"type": "string"}
+    return [
+        fn("run", "Run a shell command in the workspace and observe its "
+           "output. Use this to install packages, run the program, and run "
+           "tests.", {"cmd": S}, ["cmd"]),
+        fn("write", "Create or overwrite a file with the given contents.",
+           {"path": S, "content": S}, ["path", "content"]),
+        fn("edit", "Replace ONE exact occurrence of `find` with `replace` in "
+           "an existing file. Prefer this over write for small changes.",
+           {"path": S, "find": S, "replace": S}, ["path", "find", "replace"]),
+        fn("read", "Read a file back from the workspace.", {"path": S}, ["path"]),
+        fn("finish", "Signal the task is complete. Only after you have run the "
+           "program or its tests and read the output.", {"summary": S},
+           ["summary"]),
+    ]
+
+AGENT_TOOLS = _tool_schemas()
+
+TOOL_SYSTEM = """You are a coding agent. You complete the task by calling the
+provided tools, ONE step at a time, in a workspace directory. The WORKSPACE
+STATE message tells you where you are, which tools exist, and what is there.
+
+The tools are: run (a shell command), write (create/overwrite a file), edit
+(replace one exact occurrence in a file), read (read a file back), and finish
+(you are done). Call a tool — do not answer in prose.
+
+Rules:
+- After each tool call you get its result. Use it. Do not imagine results.
+- Every write/edit is syntax-checked for you; fix a reported error before
+  moving on.
+- Prefer edit over write for changes to an existing file.
+- Install packages you need with pip/npm (via run).
+- VERIFY before you finish: run the program or its tests and read the output.
+  finish is REFUSED if you changed files and have not run anything since.
+- Never repeat a command that already failed the same way; change something first.
+- Relative paths resolve in the workspace. Do not cd elsewhere."""
+
+
+def _toolcall_to_action(tc):
+    """Map a tool_call {name, arguments} to the action dict _do_action wants.
+    Returns (action, error) — error is a string when the arguments were not
+    valid JSON (fed back verbatim so the model can retry), else None."""
+    name = tc.get("name") or ""
+    raw = tc.get("arguments")
+    err = None
+    if isinstance(raw, dict):
+        args = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            args = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            args, err = {}, ("the arguments for tool '" + name + "' were not "
+                             "valid JSON — send a single well-formed JSON object")
+    else:
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    # the tool NAME is authoritative — a payload key must never override it
+    # (a `write` call whose arguments carry {"action":"run"} would otherwise
+    # run a shell command), and _-prefixed keys are harness-internal
+    action = {k: v for k, v in args.items()
+              if not (isinstance(k, str) and k.startswith("_"))}
+    action["action"] = name
+    return action, err
+
+
 SYSTEM = """You are a coding agent. You complete the task by taking ONE action at
 a time in a workspace directory and observing the result. The WORKSPACE STATE
 message tells you where you are, which tools exist, and what is already there.
@@ -239,7 +322,7 @@ def _anthropic_body(messages, temperature, max_tokens, model):
 
 
 def _chat(messages, temperature=0.2, max_tokens=None, timeout=None, coder=None,
-          should_cancel=None, on_progress=None):
+          should_cancel=None, on_progress=None, tools=None):
     """One coder call, STREAMED.
 
     coder: optional {"url","key"?,"model"?,"kind"?} choosing which model drives
@@ -284,12 +367,19 @@ def _chat(messages, temperature=0.2, max_tokens=None, timeout=None, coder=None,
         }
         if coder.get("model"):
             body["model"] = coder["model"]
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+            # a hint, not a guarantee (llama.cpp may still batch) — the loop
+            # handles 1..N calls per reply either way
+            body["parallel_tool_calls"] = False
     drops = rate = 0
     lowered = False
     while True:
         try:
             return _stream_once(url, headers, body, timeout or (10, READ_TIMEOUT),
-                                should_cancel, on_progress, kind)
+                                should_cancel, on_progress, kind,
+                                want_tools=bool(tools) and kind != "anthropic")
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.ChunkedEncodingError):
             if drops:
@@ -323,8 +413,21 @@ def _chat(messages, temperature=0.2, max_tokens=None, timeout=None, coder=None,
             raise
 
 
+def _norm_tool_calls(raw):
+    """Normalise an OpenAI tool_calls array to [{id,name,arguments(str)}]."""
+    out = []
+    for c in raw or []:
+        fn = c.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args)
+        out.append({"id": c.get("id"), "name": fn.get("name"),
+                    "arguments": args if isinstance(args, str) else ""})
+    return out
+
+
 def _stream_once(url, headers, body, timeout, should_cancel, on_progress,
-                 kind="openai"):
+                 kind="openai", want_tools=False):
     started = time.time()
     with requests.post(url, timeout=timeout, headers=headers, json=body,
                        stream=True) as r:
@@ -366,12 +469,16 @@ def _stream_once(url, headers, body, timeout, should_cancel, on_progress,
                 msg = data["choices"][0]["message"]
             except (KeyError, IndexError, TypeError):
                 raise RuntimeError(f"coder reply missing choices: {str(data)[:200]}")
+            if want_tools:
+                return {"content": _strip_think(msg.get("content") or ""),
+                        "tool_calls": _norm_tool_calls(msg.get("tool_calls"))}
             return _strip_think(msg.get("content") or "")
         # byte-level reads, lines assembled by hand: iter_lines buffers up to
         # its chunk_size before yielding, which held cancel checks hostage for
         # seconds on a slow stream. A generation is ≤ ~100KB, so per-byte
         # iteration costs nothing and cancel/timeout react at wire speed.
         parts, buf = [], b""
+        tool_acc = {}                 # index -> {id,name,args}
         n = 0
         for byte in r.iter_content(chunk_size=1):
             if should_cancel and should_cancel():
@@ -419,11 +526,31 @@ def _stream_once(url, headers, body, timeout, should_cancel, on_progress,
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
                 piece = delta.get("content") or ""
+                if want_tools:
+                    for tc in (delta.get("tool_calls") or []):
+                        idx = tc.get("index", 0)
+                        acc = tool_acc.setdefault(idx, {"id": None, "name": None, "args": ""})
+                        if tc.get("id"):
+                            acc["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            acc["name"] = fn["name"]
+                        frag = fn.get("arguments")
+                        if frag:
+                            acc["args"] += frag
+                            n += len(frag)
+                            if on_progress:
+                                on_progress(n)
             if piece:
                 parts.append(piece)
                 n += len(piece)
                 if on_progress:
                     on_progress(n)
+        if want_tools:
+            calls = [{"id": tool_acc[i]["id"], "name": tool_acc[i]["name"],
+                      "arguments": tool_acc[i]["args"]}
+                     for i in sorted(tool_acc)]
+            return {"content": _strip_think("".join(parts)), "tool_calls": calls}
         return _strip_think("".join(parts))
 
 
@@ -463,6 +590,38 @@ def _condense_text(text, head=CONDENSE_HEAD, tail=CONDENSE_TAIL):
             "a file or re-run a command if you need the details]…\n" + t)
 
 
+def _msg_len(m):
+    """Byte-ish size of a message including tool-call arguments — a write's
+    file body rides in tool_calls[].function.arguments in tool mode, not in
+    content, so budgeting on content alone would miss the bulk."""
+    n = len(m.get("content") or "")
+    for tc in (m.get("tool_calls") or []):
+        n += len(((tc.get("function") or {}).get("arguments")) or "")
+    return n
+
+
+def _condense_tool_calls(tcs):
+    """Shrink big file bodies inside old tool-call arguments, keeping the JSON
+    valid and the path/cmd intact — the write already landed in the workspace."""
+    out = []
+    for tc in tcs:
+        fn = dict(tc.get("function") or {})
+        args = fn.get("arguments") or ""
+        if len(args) > CONDENSE_HEAD + CONDENSE_TAIL + 120:
+            try:
+                d = json.loads(args)
+                for k in ("content", "replace", "find", "cmd"):
+                    v = d.get(k)
+                    if isinstance(v, str) and len(v) > 200:
+                        d[k] = (v[:120] + f"…[{len(v) - 120} chars elided — the "
+                                "change landed in the workspace]…")
+                fn["arguments"] = json.dumps(d)
+            except (json.JSONDecodeError, ValueError):
+                fn["arguments"] = args[:CONDENSE_HEAD] + "…[elided]…"
+        out.append({**tc, "function": fn})
+    return out
+
+
 def _condense_history(messages, start, condensed, budget=None,
                       keep_recent=KEEP_RECENT_STEPS):
     """Condense old turns IN PLACE so the run keeps fitting the model's window.
@@ -477,7 +636,7 @@ def _condense_history(messages, start, condensed, budget=None,
     workspace briefing) is never touched. Returns (newly_condensed,
     level_reached, total_chars)."""
     def total():
-        return sum(len(m.get("content") or "") for m in messages)
+        return sum(_msg_len(m) for m in messages)
 
     new, level = 0, 0
 
@@ -487,19 +646,26 @@ def _condense_history(messages, start, condensed, budget=None,
         for i in range(start, end):
             have = condensed.get(i, 0)
             c = messages[i].get("content") or ""
+            tcs = messages[i].get("tool_calls")
             if lvl < 3:
-                if have or len(c) <= CONDENSE_OLD_AFTER:
+                if have or _msg_len(messages[i]) <= CONDENSE_OLD_AFTER:
                     continue
-                messages[i]["content"] = _condense_text(c)
+                if c:
+                    messages[i]["content"] = _condense_text(c)
+                if tcs:
+                    messages[i]["tool_calls"] = _condense_tool_calls(tcs)
             else:
-                if have >= 3 or len(c) <= 340:
+                if have >= 3 or (len(c) <= 340 and not tcs):
                     continue
-                h = c[:200]
-                if h.count("```") % 2:
-                    h += "\n```"
-                messages[i]["content"] = (
-                    h + "\n…[older turn condensed to its head — its effect "
-                    "(e.g. a full file write) is in the workspace]…")
+                if tcs:
+                    messages[i]["tool_calls"] = _condense_tool_calls(tcs)
+                if len(c) > 340:
+                    h = c[:200]
+                    if h.count("```") % 2:
+                        h += "\n```"
+                    messages[i]["content"] = (
+                        h + "\n…[older turn condensed to its head — its effect "
+                        "(e.g. a full file write) is in the workspace]…")
             condensed[i] = lvl
             new += 1
             level = max(level, lvl)
@@ -1079,7 +1245,13 @@ def run_agent(task, *, max_steps=12, network="egress", image=None, on_event=None
                   "observation shows the count. Investigate briefly, make the "
                   "change, verify it, and call finish before they run out.")
 
-    messages = [{"role": "system", "content": SYSTEM},
+    # native tool calling for capable OpenAI-kind coders (e.g. a strong local
+    # the text protocol stays the fallback (Claude, small models, a backend
+    # that rejects the tools param). One observation per action either way.
+    kind = (coder or {}).get("kind", "openai") or "openai"
+    use_tools = TOOLS_ENABLED and kind == "openai"
+    tools_fell_back = False
+    messages = [{"role": "system", "content": TOOL_SYSTEM if use_tools else SYSTEM},
                 {"role": "user", "content": user_task}]
 
     # the history budget follows the coder's REAL window when it is published
@@ -1093,6 +1265,8 @@ def run_agent(task, *, max_steps=12, network="egress", image=None, on_event=None
                            + f" — history budget ≈ {ctx_budget // 1000} KB; "
                              "older turns are condensed past it; observations "
                              f"clipped at {obs_limit // 1000} KB")
+    emit(t="harness", note="action channel: native tool calls"
+                           if use_tools else "action channel: text protocol")
 
     if backend is None:
         sb_kwargs = {"network": network}
@@ -1249,6 +1423,136 @@ def run_agent(task, *, max_steps=12, network="egress", image=None, on_event=None
                     "it into account before your next action):\n"
                     + "\n---\n".join(notes))
 
+        def _do_action(action, step, result_index=None):
+            """Execute ONE action (run/write/edit/read) and return its
+            observation. Shared by the text protocol and the tool-calling
+            path so both get identical execution, syntax checks and loop
+            hygiene. `finish` is control flow and stays in the loop."""
+            nonlocal last_run
+            a = action.get("action")
+            _obs_idx = result_index if result_index is not None else len(messages)
+            try:
+              if a == "run":
+                  cmd = action.get("cmd")
+                  if not isinstance(cmd, str) or not cmd.strip():
+                      obs = "invalid 'run' action: 'cmd' must be a non-empty string"
+                  else:
+                      code, out, err = sb.run(cmd, timeout=CMD_TIMEOUT)
+                      obs = (f"exit_code={code}\n--- stdout ---\n{out}"
+                             f"\n--- stderr ---\n{err}")
+                      last_run = {"step": step, "cmd": cmd, "exit": code}
+                      changed.clear()
+                      # the same command with the same result is a loop,
+                      # not progress — say so before it repeats again
+                      digest = hashlib.sha256(
+                          obs.encode("utf-8", "replace")).hexdigest()
+                      prev = seen_runs.get(cmd)
+                      seen_runs[cmd] = (step, digest)
+                      # a FAILING command repeated with nothing changed in
+                      # between is a loop; a passing re-run (tests after an
+                      # edit) is exactly what we want and gets no nag
+                      if (prev and prev[1] == digest and code != 0
+                              and prev[0] > last_change):
+                          obs += (f"\n(identical to the failure at step "
+                                  f"{prev[0]} and nothing changed since — "
+                                  "repeating this command changes nothing; "
+                                  "change the command or fix the cause first)")
+              elif a == "write":
+                  path, content = action.get("path"), action.get("content", "")
+                  if not isinstance(path, str) or not path.strip():
+                      obs = "invalid 'write' action: 'path' must be a non-empty string"
+                  else:
+                      if not isinstance(content, str):
+                          content = json.dumps(content)
+                      sb.write_file(path, content)
+                      obs = f"wrote {path} ({len(content.splitlines())} lines)"
+                      note, verdict = _lint_note(path, content)
+                      obs += note
+                      note_change(path, step, verdict)
+                      if action.get("_truncated"):
+                          obs += ("\nWARNING: your reply ended without a "
+                                  "closing ``` fence — the generation was "
+                                  "probably cut off, so this file may be "
+                                  "INCOMPLETE. Check its tail (tail -n 20) "
+                                  "or run it; write long files in smaller "
+                                  "pieces, or use edit.")
+              elif a == "edit":
+                  path = action.get("path")
+                  find, repl = action.get("find"), action.get("replace", "")
+                  if not isinstance(path, str) or not path.strip():
+                      obs = "invalid 'edit' action: 'path' must be a non-empty string"
+                  elif not isinstance(find, str) or not isinstance(repl, str):
+                      obs = "invalid 'edit' action: 'find' and 'replace' must be strings"
+                  else:
+                      # read past the cap so a too-big file is REFUSED,
+                      # never truncated on the way back (read_file clips)
+                      content = sb.read_file(path, max_bytes=EDIT_MAX_BYTES + 1)
+                      if content is None:
+                          obs = (f"edit failed: {path} does not exist — use "
+                                 "write to create it")
+                      elif len(content.encode("utf-8", "replace")) > EDIT_MAX_BYTES:
+                          obs = (f"edit failed: {path} is too large to edit "
+                                 "safely — change it with a shell command "
+                                 "(sed -i, python) instead")
+                      elif "\ufffd" in content:
+                          obs = (f"edit failed: {path} is not valid UTF-8 and "
+                                 "would be damaged by a round-trip — change "
+                                 "it with a shell command (sed -i) instead")
+                      else:
+                          new, why = _apply_edit(content, find, repl)
+                          if new is None:
+                              obs = f"{why} [{path}]"
+                          else:
+                              sb.write_file(path, new)
+                              obs = (f"edited {path}: replaced "
+                                     f"{len(find.splitlines())} line(s) with "
+                                     f"{len(repl.splitlines())} line(s); "
+                                     f"file is now {len(new.splitlines())} lines")
+                              note, verdict = _lint_note(path, new)
+                              obs += note
+                              note_change(path, step, verdict)
+              elif a == "read":
+                  path = action.get("path")
+                  if not isinstance(path, str) or not path.strip():
+                      obs = "invalid 'read' action: 'path' must be a non-empty string"
+                  else:
+                      content = sb.read_file(path)
+                      if content is None:
+                          obs = "(file does not exist)"
+                      else:
+                          # an identical re-read earns a short note, not
+                          # another copy: on an over-OBS_LIMIT file every
+                          # full read returns the SAME clipped view, and one
+                          # run burned 3 of 15 steps re-reading a 22KB file
+                          # hoping to see the middle the clip kept hiding
+                          digest = hashlib.sha256(
+                              content.encode("utf-8", "replace")).hexdigest()
+                          prev = seen_reads.get(path)
+                          # the observation a served read becomes is
+                          # appended at len(messages); if that turn has
+                          # since been condensed the content is NOT "still
+                          # above" — serve it again instead of pointing at
+                          # a stub. A served note keeps pointing at the
+                          # REAL copy (the note itself is never condensed).
+                          if (prev and prev[1] == digest
+                                  and prev[2] not in condensed):
+                              obs = (f"(unchanged — you already read {path} "
+                                     f"at step {prev[0]} and its content is "
+                                     "identical; that read is still above. "
+                                     "To see a part the clip omitted, use "
+                                     "grep or sed on a line range instead.)")
+                              # latest step for the wording, the index of
+                              # the real copy for the condensation check
+                              seen_reads[path] = (step, digest, prev[2])
+                          else:
+                              seen_reads[path] = (step, digest, _obs_idx)
+                              obs = content
+              else:
+                  obs = f"unknown action '{a}'. Valid: run, write, edit, read, finish."
+            except Exception as e:
+              obs = f"action failed: {e}"
+            return obs
+
         for step in range(1, max_steps + 1):
             result["steps"] = step
             if should_cancel and should_cancel():
@@ -1284,15 +1588,160 @@ def run_agent(task, *, max_steps=12, network="egress", image=None, on_event=None
                           "(head/tail/grep) and write big files in pieces")
             try:
                 reply = _chat(messages, coder=coder, should_cancel=should_cancel,
-                              on_progress=_progress(step))
+                              on_progress=_progress(step),
+                              tools=AGENT_TOOLS if use_tools else None)
             except AgentCancelled:
                 result["cancelled"] = True
                 emit(t="cancelled", step=step)
+                break
+            except requests.exceptions.HTTPError as e:
+                st = getattr(e.response, "status_code", None)
+                # a backend that does not accept the `tools` param (older
+                # llama.cpp, no --jinja): drop to the text protocol for the
+                # rest of the run instead of dying
+                _low = str(e).lower()
+                _tools_rejected = (st == 400 and ("tool" in _low or "function" in _low)
+                    and any(w in _low for w in (
+                        "not support", "unsupport", "unknown", "unrecogni",
+                        "unexpected", "not enabled", "disable", "no tools",
+                        "does not accept", "not allowed", "invalid parameter")))
+                if use_tools and _tools_rejected and not tools_fell_back:
+                    tools_fell_back = True
+                    use_tools = False
+                    messages[0] = {"role": "system", "content": SYSTEM}
+                    emit(t="harness", step=step,
+                         note="this backend rejected tool calling — using the "
+                              "text protocol for the rest of the run")
+                    continue
+                emit(t="model_error", step=step, error=str(e))
+                result["error"] = f"model error: {e}"
                 break
             except Exception as e:
                 emit(t="model_error", step=step, error=str(e))
                 result["error"] = f"model error: {e}"
                 break
+
+            # normalise: tool mode returns {content, tool_calls}; text mode a str
+            if isinstance(reply, dict):
+                tool_calls = reply.get("tool_calls") or []
+                reply_text = reply.get("content") or ""
+            else:
+                tool_calls, reply_text = None, reply
+
+            if tool_calls:
+                # ---- native tool-calling step: execute 1..N calls ----------
+                # One model round-trip is one step even when it batches calls.
+                # Every tool_call id gets exactly one result (OpenAI requires
+                # it); ids are de-duplicated; at most ONE finish is evaluated
+                # per step; a note or an accepted finish ends the batch and the
+                # remaining calls get a stub result so the history stays valid.
+                parse_fails = 0
+                norm, seen_ids = [], set()
+                for i, c in enumerate(tool_calls):
+                    cid = c.get("id")
+                    if not cid or cid in seen_ids:
+                        cid = f"call_{step}_{i}"
+                    seen_ids.add(cid)
+                    norm.append({"id": cid, "type": "function",
+                                 "function": {"name": c.get("name") or "",
+                                              "arguments": c.get("arguments") or "{}"}})
+                messages.append({"role": "assistant",
+                                 "content": reply_text or None,
+                                 "tool_calls": norm})
+                results = []          # (tool_call_id, obs) in call order
+                finished = deferred = finish_seen = False
+                for i, c in enumerate(tool_calls):
+                    cid = norm[i]["id"]
+                    action, err = _toolcall_to_action(c)
+                    a = action.get("action")
+                    emit(t="action", step=step, action=a,
+                         detail={k: (v[:200] if isinstance(v, str) else v)
+                                 for k, v in action.items()
+                                 if k != "action" and not k.startswith("_")})
+                    if err:
+                        results.append((cid, err))
+                        continue
+                    if a == "finish":
+                        # only ONE finish decision per step — a batch of
+                        # finishes must not burn the bounce budget or slip
+                        # past the gate without a real verify turn in between
+                        if finish_seen:
+                            results.append((cid, "you already tried to finish "
+                                "this turn — act on the feedback above, then "
+                                "call finish once."))
+                            continue
+                        finish_seen = True
+                        left = max_steps - step
+                        notes_txt = drain_notes(step) if left >= 2 else ""
+                        if notes_txt:
+                            emit(t="warn", step=step,
+                                 note="finish deferred: a note from the user "
+                                      "arrived during the run")
+                            results.append((cid, "NOT FINISHED — a note from "
+                                "the user arrived while you were working. Act "
+                                "on it, verify, then call finish again (if it "
+                                "changes nothing, say so in your summary)."
+                                + notes_txt))
+                            deferred = True
+                            break
+                        problems = []
+                        recheck_lint()
+                        if lint_bad:
+                            problems.append("these files still have SYNTAX "
+                                "ERRORS: " + "; ".join(f"{p} ({m})" for p, m
+                                in list(lint_bad.items())[:4]))
+                        needs_run = needs_run_now()
+                        if needs_run:
+                            problems.append(f"you changed {', '.join(needs_run[:6])} "
+                                            "and have not run anything since")
+                        if problems and bounces < MAX_FINISH_BOUNCES and left >= 2:
+                            bounces += 1
+                            emit(t="warn", step=step,
+                                 note="finish refused: " + "; ".join(problems))
+                            results.append((cid, "NOT FINISHED — finish refused: "
+                                + "; ".join(problems) + ". Verify first ("
+                                + _run_hint(needs_run or list(changed))
+                                + "), read the output, fix what fails, then "
+                                "call finish and say what you ran."))
+                            continue
+                        result["done"] = True
+                        result["summary"] = action.get("summary", "")
+                        results.append((cid, "finishing."))
+                        finished = True
+                        break
+                    # the observation lands after the assistant turn and any
+                    # results already collected this step
+                    results.append((cid, _do_action(
+                        action, step, len(messages) + len(results))))
+                # every listed tool_call MUST get a result or the re-sent
+                # history is invalid — stub the ones a note/finish cut short
+                answered = {cid for cid, _ in results}
+                for nm in norm:
+                    if nm["id"] not in answered:
+                        results.append((nm["id"], "(not executed — the turn "
+                                        "ended before this call ran)"))
+                for cid, obs in results:
+                    emit(t="observation", step=step, obs=str(obs)[:600])
+                    messages.append({"role": "tool", "tool_call_id": cid,
+                                     "content": _clip_obs(str(obs), obs_limit)})
+                if finished:
+                    break
+                if deferred:
+                    # like the text path's finish-defer: re-enter on a fresh
+                    # step, no trailer (the note was already delivered)
+                    continue
+                # budget + notes trailer (mirrors the text OBSERVATION wrapper)
+                left = max_steps - step
+                trailer = f"(step {step}/{max_steps} — {left} action(s) left)"
+                if 0 < left <= 3:
+                    trailer += ("\n[commit now: make your best fix, verify it "
+                                "quickly, and call finish.]")
+                trailer += drain_notes(step) if step < max_steps else ""
+                messages.append({"role": "user", "content": trailer})
+                continue
+
+            # ---- text protocol (unchanged) --------------------------------
+            reply = reply_text
             messages.append({"role": "assistant", "content": reply})
             action = _parse_action(reply)
             if not action:
@@ -1378,130 +1827,7 @@ def run_agent(task, *, max_steps=12, network="egress", image=None, on_event=None
                     result["summary"] = action.get("summary", "")
                     break
             else:
-              # Every action failure — wrong field type, backend hiccup, docker
-              # timeout — becomes an OBSERVATION the model can react to. An
-              # exception here used to unwind the loop and destroy the whole
-              # workspace over one bad step.
-              try:
-                if a == "run":
-                    cmd = action.get("cmd")
-                    if not isinstance(cmd, str) or not cmd.strip():
-                        obs = "invalid 'run' action: 'cmd' must be a non-empty string"
-                    else:
-                        code, out, err = sb.run(cmd, timeout=CMD_TIMEOUT)
-                        obs = (f"exit_code={code}\n--- stdout ---\n{out}"
-                               f"\n--- stderr ---\n{err}")
-                        last_run = {"step": step, "cmd": cmd, "exit": code}
-                        changed.clear()
-                        # the same command with the same result is a loop,
-                        # not progress — say so before it repeats again
-                        digest = hashlib.sha256(
-                            obs.encode("utf-8", "replace")).hexdigest()
-                        prev = seen_runs.get(cmd)
-                        seen_runs[cmd] = (step, digest)
-                        # a FAILING command repeated with nothing changed in
-                        # between is a loop; a passing re-run (tests after an
-                        # edit) is exactly what we want and gets no nag
-                        if (prev and prev[1] == digest and code != 0
-                                and prev[0] > last_change):
-                            obs += (f"\n(identical to the failure at step "
-                                    f"{prev[0]} and nothing changed since — "
-                                    "repeating this command changes nothing; "
-                                    "change the command or fix the cause first)")
-                elif a == "write":
-                    path, content = action.get("path"), action.get("content", "")
-                    if not isinstance(path, str) or not path.strip():
-                        obs = "invalid 'write' action: 'path' must be a non-empty string"
-                    else:
-                        if not isinstance(content, str):
-                            content = json.dumps(content)
-                        sb.write_file(path, content)
-                        obs = f"wrote {path} ({len(content.splitlines())} lines)"
-                        note, verdict = _lint_note(path, content)
-                        obs += note
-                        note_change(path, step, verdict)
-                        if action.get("_truncated"):
-                            obs += ("\nWARNING: your reply ended without a "
-                                    "closing ``` fence — the generation was "
-                                    "probably cut off, so this file may be "
-                                    "INCOMPLETE. Check its tail (tail -n 20) "
-                                    "or run it; write long files in smaller "
-                                    "pieces, or use edit.")
-                elif a == "edit":
-                    path = action.get("path")
-                    find, repl = action.get("find"), action.get("replace", "")
-                    if not isinstance(path, str) or not path.strip():
-                        obs = "invalid 'edit' action: 'path' must be a non-empty string"
-                    elif not isinstance(find, str) or not isinstance(repl, str):
-                        obs = "invalid 'edit' action: 'find' and 'replace' must be strings"
-                    else:
-                        # read past the cap so a too-big file is REFUSED,
-                        # never truncated on the way back (read_file clips)
-                        content = sb.read_file(path, max_bytes=EDIT_MAX_BYTES + 1)
-                        if content is None:
-                            obs = (f"edit failed: {path} does not exist — use "
-                                   "write to create it")
-                        elif len(content.encode("utf-8", "replace")) > EDIT_MAX_BYTES:
-                            obs = (f"edit failed: {path} is too large to edit "
-                                   "safely — change it with a shell command "
-                                   "(sed -i, python) instead")
-                        elif "\ufffd" in content:
-                            obs = (f"edit failed: {path} is not valid UTF-8 and "
-                                   "would be damaged by a round-trip — change "
-                                   "it with a shell command (sed -i) instead")
-                        else:
-                            new, why = _apply_edit(content, find, repl)
-                            if new is None:
-                                obs = f"{why} [{path}]"
-                            else:
-                                sb.write_file(path, new)
-                                obs = (f"edited {path}: replaced "
-                                       f"{len(find.splitlines())} line(s) with "
-                                       f"{len(repl.splitlines())} line(s); "
-                                       f"file is now {len(new.splitlines())} lines")
-                                note, verdict = _lint_note(path, new)
-                                obs += note
-                                note_change(path, step, verdict)
-                elif a == "read":
-                    path = action.get("path")
-                    if not isinstance(path, str) or not path.strip():
-                        obs = "invalid 'read' action: 'path' must be a non-empty string"
-                    else:
-                        content = sb.read_file(path)
-                        if content is None:
-                            obs = "(file does not exist)"
-                        else:
-                            # an identical re-read earns a short note, not
-                            # another copy: on an over-OBS_LIMIT file every
-                            # full read returns the SAME clipped view, and one
-                            # run burned 3 of 15 steps re-reading a 22KB file
-                            # hoping to see the middle the clip kept hiding
-                            digest = hashlib.sha256(
-                                content.encode("utf-8", "replace")).hexdigest()
-                            prev = seen_reads.get(path)
-                            # the observation a served read becomes is
-                            # appended at len(messages); if that turn has
-                            # since been condensed the content is NOT "still
-                            # above" — serve it again instead of pointing at
-                            # a stub. A served note keeps pointing at the
-                            # REAL copy (the note itself is never condensed).
-                            if (prev and prev[1] == digest
-                                    and prev[2] not in condensed):
-                                obs = (f"(unchanged — you already read {path} "
-                                       f"at step {prev[0]} and its content is "
-                                       "identical; that read is still above. "
-                                       "To see a part the clip omitted, use "
-                                       "grep or sed on a line range instead.)")
-                                # latest step for the wording, the index of
-                                # the real copy for the condensation check
-                                seen_reads[path] = (step, digest, prev[2])
-                            else:
-                                seen_reads[path] = (step, digest, len(messages))
-                                obs = content
-                else:
-                    obs = f"unknown action '{a}'. Valid: run, write, edit, read, finish."
-              except Exception as e:
-                obs = f"action failed: {e}"
+                obs = _do_action(action, step)
 
             obs = prefix + obs
             emit(t="observation", step=step, obs=obs[:600])
@@ -1546,7 +1872,7 @@ def run_agent(task, *, max_steps=12, network="egress", image=None, on_event=None
                 verified = False
                 vnote = ("nothing was run after the last change to "
                          + ", ".join(needs_run[:4]))
-            elif last_run and last_run["step"] > last_change:
+            elif last_run and last_run["step"] >= last_change:
                 if last_run["exit"] == 0:
                     verified = True
                     vnote = (f"`{last_run['cmd'][:80]}` exited 0 after the "
