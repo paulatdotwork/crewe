@@ -1212,7 +1212,7 @@ def _prune_jobs(jobs, keep_done=50):
 #   project, which is what stops steps redeclaring each other's globals — but
 #   the budgets must follow the model, which is what _budgets_for() does.
 #   Docs: code-pipeline-A.md / code-pipeline-B.md.
-CODE_AGENT_URL      = SPECIALISTS["code"]        # remote Qwen3.6-35B coder, 128k ctx
+CODE_AGENT_URL      = SPECIALISTS["code"]        # remote coder backend, 128k ctx
 CODE_AGENT_URL_FAST  = CODE_AGENT_URL   # "normal" tier; _apply_router_config sets it
 CODE_AGENT_URL_QUICK = CODE_AGENT_URL   # "fast" tier; falls back down the chain
 _BUDGETS_READY = False   # True once _refresh_budgets() exists (defined below)
@@ -1626,7 +1626,7 @@ _DIFF_ONLY_NOTE_SOFT = (
 )
 # Whether an edit-only fix round REJECTS a full-file rewrite of a large
 # existing file on attempt 0 (forcing SEARCH/REPLACE at the cost of a full
-# second generation) or ACCEPTS it. Measured on the .234 coder (job
+# second generation) or ACCEPTS it. Measured on the remote coder (job
 # 98439b25, 2026-08-05): it NEVER complies with SEARCH/REPLACE, so 'reject'
 # paid ~29k output tokens (16.8k rejected + a 12k+ retry of the same files)
 # plus a second 19k-token prompt per fix round, for zero savings. 'accept'
@@ -3573,8 +3573,8 @@ def run_audio_job(job_id: str, question: str, session_id: str):
     spawn_owned(target=summarize, args=(session_id, question, script), daemon=True).start()
 
 
-# Code-pipeline stream read timeout. Raised 600→1200 (2026-07-21): the coder on
-# .234 is single-slot at ~223 tok/s prefill, so a big multi-file step can spend
+# Code-pipeline stream read timeout. Raised 600→1200 (2026-07-21): the remote
+# coder is single-slot at ~223 tok/s prefill, so a big multi-file step can spend
 # most of 10 min just prefilling before the first token — 600s was cutting those
 # builds off as "specialist unreachable". Tune with CREWE_CODE_TIMEOUT (seconds).
 CODE_STREAM_TIMEOUT = int(os.environ.get("CREWE_CODE_TIMEOUT", "1200"))
@@ -7696,7 +7696,7 @@ def run_compare_backend(job_id: str, bid: str, url: str, question: str,
     # Thinking OFF, same as both judges. An entrant is capped at max_tokens, and
     # a reasoning model spends that entire budget on reasoning_content — the
     # pane then shows nothing, or the one sentence it managed before the cap.
-    # Measured on Qwen3.6-27B (.53): 800-token budget → 800 thinking tokens and
+    # Measured on a 27B coder: 800-token budget → 800 thinking tokens and
     # a half-finished opening sentence; with the flag → a complete answer in 243.
     payload = {"messages": [{"role": "system", "content": system or COMPARE_SYSTEM},
                             {"role": "user", "content": question}],
