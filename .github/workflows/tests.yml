@@ -99,3 +99,12 @@ jobs:
       - name: project-guard
         if: ${{ !cancelled() }}
         run: python3 tests/test_project_guard.py
+      - name: nested-fences
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_nested_fences.py
+      - name: delete-protocol
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_delete_protocol.py
+      - name: conflict-markers
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_conflict_markers.py

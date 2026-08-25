@@ -1662,6 +1662,24 @@ EDIT_ONLY_MIN_CHARS = int(os.environ.get("CREWE_EDIT_ONLY_MIN_CHARS", "4000"))
 # Deliberately NO lookahead for a following newline — with it, two adjacent
 # blocks separated by no blank line merged into one and spliced the literal
 # marker text into the file.
+# Marker text that must never survive INTO a stored file. <<<<<<< SEARCH and
+# >>>>>>> REPLACE are never legitimate anywhere. A BARE run of '=' is a
+# different matter: in markdown it is a setext H1 underline, so it only counts
+# as debris in a file that is not prose.
+_HARD_MARKER = re.compile(r"^[ \t]*(?:<{5,}[ \t]*SEARCH|>{5,}[ \t]*REPLACE)[ \t]*$",
+                          re.M | re.I)
+_BARE_SEPARATOR = re.compile(r"^[ \t]*={7,}[ \t]*$", re.M)
+
+
+def _has_conflict_marker(name, text):
+    """True when `text` carries SEARCH/REPLACE debris that must not be stored."""
+    if _HARD_MARKER.search(text or ""):
+        return True
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext in _MD_EXTS:
+        return False
+    return bool(_BARE_SEPARATOR.search(text or ""))
+
 _DIFF_BLOCK = re.compile(
     r"<{5,} *SEARCH *\n([\s\S]*?)\n={5,} *\n([\s\S]*?)\n>{5,}", re.I)
 
@@ -1676,6 +1694,13 @@ def _apply_diff(code, text):
     for m in _DIFF_BLOCK.finditer(text):
         total += 1
         search, replace = m.group(1), m.group(2)
+        # A malformed block — one SEARCH, TWO separators — leaves the extra
+        # "=======" as the tail of the REPLACE payload, and the non-greedy
+        # regex hands it over as if it were code. Written out, it is a
+        # conflict marker in the middle of a source file: observed live on
+        # 2026-08-25, csvjson.py line 52, SyntaxError. The models will keep
+        # miscounting separators; the harness must not copy them into files.
+        replace = re.sub(r"(?:\n[ \t]*={5,}[ \t]*)+$", "", replace)
         if not search.strip():
             # an empty SEARCH matches everywhere (and normalizes to [''] in
             # the flex tier) — it can only corrupt the file
@@ -1701,6 +1726,17 @@ def _apply_diff(code, text):
         else:
             failed.append(search)
     return code, applied, total, failed
+
+
+# A step that CONSOLIDATES (three scripts into one) has to be able to remove
+# the files it folded in. There was no way to say that, so models said it the
+# only way they could — an empty block — which the elision guard read as a lazy
+# fragment and refused, leaving the dead files in place for every later step to
+# trip over. An explicit directive is unambiguous and, unlike an empty block,
+# cannot happen by accident from a stray fence.
+DELETE_FILE = "\x00CREWE_DELETE_FILE\x00"
+_DELETE_DIRECTIVE = re.compile(
+    r"^\s*(?:#|//|<!--|;)?\s*DELETE(?:\s+(?:THIS\s+)?FILE)?\s*(?:-->)?\s*$", re.I)
 
 
 def _merge_output_file(name, content, files, allowed, warnings, tag, mem=None):
@@ -1801,6 +1837,43 @@ def _merge_output_file(name, content, files, allowed, warnings, tag, mem=None):
         _mem_note(mem, f"{tag}: a SEARCH/REPLACE for {name} was REJECTED — "
                        f"only {ok}/{tot} blocks matched the real file.{detail}"
                        f"Next edit must quote the current file EXACTLY.")
+        return None
+    if _DELETE_DIRECTIVE.match(content or ""):
+        if name not in files:
+            warnings.append(f"{tag}: asked to delete {name}, which does not exist")
+            return None
+        # NOT a warning: doing what was asked must not surface under
+        # "⚠ Automated checks still flag", which is how a clean run ends up
+        # looking broken. The user sees it in the answer's "Deleted:" line.
+        _mem_note(mem, f"{tag}: deleted {name}, as the step asked.")
+        return DELETE_FILE
+    if name in files and not (content or "").strip():
+        # An EMPTY block for an existing file is not a lazy rewrite, and saying
+        # so sends the model round the same loop: it is either "delete this"
+        # (a consolidation step folding three scripts into one) or a dangling
+        # closing fence. There is no delete protocol, so refuse either way —
+        # but say what actually happened, or the retry repeats it verbatim.
+        warnings.append(f"{tag}: {name} came back EMPTY; kept the previous "
+                        f"version (no file was deleted)")
+        _mem_note(mem, f"{tag}: you returned an EMPTY block for {name}. An "
+                       f"empty block does NOT delete anything and was IGNORED. "
+                       f"To remove {name}, emit its path line and a block "
+                       f"containing only the word DELETE. If it is unchanged, "
+                       f"omit it entirely; otherwise rewrite it in full.")
+        return None
+    if (_has_conflict_marker(name, content)
+            and not _has_conflict_marker(name, files.get(name) or "")):
+        # No source file legitimately gains a SEARCH/REPLACE marker. Whatever
+        # produced it (a miscounted separator, a half-quoted edit) the result
+        # is corrupt, and shipping it costs a whole extra fix round that may
+        # not succeed — the final foreman tried and failed on the live run.
+        warnings.append(f"{tag}: {name} came back with a leftover "
+                        f"SEARCH/REPLACE marker; kept the previous version")
+        _mem_note(mem, f"{tag}: {name} was REJECTED — the text you sent still "
+                       f"contained a conflict marker (<<<<<<<, =======, or "
+                       f">>>>>>>). Each edit is exactly one SEARCH block, ONE "
+                       f"======= separator, and one REPLACE block. Re-send it "
+                       f"with the markers balanced, or write the file in full.")
         return None
     if _looks_elided(content, files.get(name)):
         warnings.append(f"{tag}: {name} came back as a fragment; "
@@ -2087,6 +2160,134 @@ def _looks_elided(code, old=None):
     return bool(old) and len(code) < 0.5 * len(old)
 
 
+# A filename sitting on its own line directly above an opening fence — the
+# documented output format. Used to stop markdown absorption running into the
+# next real file.
+_LABEL_FENCE = re.compile(
+    r"^[ \t]*[*_`>#]*[ \t]*([A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-.]+)*\.[A-Za-z0-9]+)"
+    r"[*_`:.\t ]*\n[ \t]*\n?[ \t]*`{3,}", re.M)
+
+_MD_EXTS = ("md", "markdown", "mdx", "rst", "txt")
+
+
+def _label_starts_here(lines, k):
+    """True when lines[k] is a bare filename label and a fence opens just below."""
+    m = re.match(r"^[ \t]*[*_`>#]*[ \t]*"
+                 r"([A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-.]+)*\.[A-Za-z0-9]+)"
+                 r"[*_`:.\t ]*$", lines[k])
+    if not m or not _plausible_filename(m.group(1)):
+        return False
+    for nxt in (k + 1, k + 2):
+        if nxt < len(lines) and re.match(r"^[ \t]*`{3,}", lines[nxt]):
+            return True
+        if nxt < len(lines) and lines[nxt].strip():
+            return False
+    return False
+
+
+def _scan_fences(md_text):
+    """Split a reply into fenced blocks, honouring CommonMark fence LENGTH.
+
+    A fence opened with N backticks is closed only by a line of N OR MORE
+    backticks, so a file whose own contents contain ``` can be wrapped in
+    ````…```` and survives intact. The old scanner was a non-greedy
+    ```...``` regex, which ended every block at the FIRST inner fence: a
+    README documenting three shell commands was cut off at its first example,
+    the remaining examples became junk 'fileN.txt' blocks, and the truncated
+    README was then rejected as "a fragment" — telling the model it had been
+    lazy when it had in fact sent the whole file. That loop cannot converge,
+    because the model's correct output is what gets destroyed.
+
+    Returns (lang, code, before, content_start, content_end) per block. A
+    fence that never closes yields the rest of the text: a reply cut off
+    mid-file must keep what arrived or recovery is impossible.
+    """
+    open_re = re.compile(r"^([ \t]*)(`{3,})[ \t]*(\w*)[ \t]*$")
+    lines = md_text.split("\n")
+    # character offset of the start of each line
+    offs, at = [], 0
+    for ln in lines:
+        offs.append(at)
+        at += len(ln) + 1
+
+    blocks, i, last_end = [], 0, 0
+    while i < len(lines):
+        m = open_re.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        ticks, lang = len(m.group(2)), (m.group(3) or "").lower()
+        close_re = re.compile(r"^[ \t]*`{%d,}[ \t]*$" % ticks)
+        j = i + 1
+        while j < len(lines) and not close_re.match(lines[j]):
+            # A THREE-backtick block is ambiguous: the model may have nested
+            # three inside three, and greedy pairing then lets one bogus block
+            # swallow the next real file, label and all. A filename sitting
+            # directly above a fence always starts a new file — trust the
+            # label over the fence arithmetic. Four or more backticks is
+            # unambiguous by construction, so leave those blocks alone.
+            if ticks == 3 and _label_starts_here(lines, j):
+                break
+            j += 1
+        hit_label = j < len(lines) and not close_re.match(lines[j])
+        cs = offs[i + 1] if i + 1 < len(lines) else len(md_text)
+        if hit_label:
+            # stop BEFORE the label; it opens the next block
+            ce = max(cs, offs[j])
+            nxt, end_off = j, offs[j]
+        elif j < len(lines):
+            # up to the START of the closing-fence line, so the last content
+            # line KEEPS its terminating newline — the old regex captured it,
+            # and a file one byte short of what the model sent is a rewrite
+            # that silently never matches.
+            ce = max(cs, offs[j])
+            nxt, end_off = j + 1, offs[j] + len(lines[j])
+        else:
+            ce, nxt, end_off = len(md_text), len(lines), len(md_text)
+        blocks.append((lang, md_text[cs:ce], md_text[last_end:offs[i]], cs, ce))
+        last_end, i = end_off, nxt
+    return blocks
+
+
+def _absorb_nested_markdown(parsed, md_text):
+    """Give a markdown file back the fenced examples that follow it.
+
+    Models write a README containing ```powershell examples using the SAME
+    three backticks as the wrapper. That is ambiguous markdown, and no parser
+    can split it by fences alone — but LABELS are unambiguous: everything
+    between a labelled .md block and the next LABELLED block belongs to that
+    document. Re-slice it from the source so the inner fences and the prose
+    between them come back verbatim.
+
+    Only ever ADDS text to a markdown-ish file, and only from blocks that
+    would otherwise have become junk 'fileN.txt' and been thrown away.
+    """
+    out, i = [], 0
+    while i < len(parsed):
+        name, lang, code, cs, ce = parsed[i]
+        ext = (name or "").rsplit(".", 1)[-1].lower()
+        if name and ext in _MD_EXTS:
+            j = i + 1
+            while j < len(parsed) and parsed[j][0] is None:
+                j += 1
+            if j > i + 1:
+                # Unbalanced 3-in-3 fences can make ONE bogus block swallow the
+                # next real file, label and all. Never absorb past a label:
+                # a filename sitting directly above a fence starts a new file,
+                # whatever the fence arithmetic says.
+                stop = parsed[j - 1][4]
+                lab = _LABEL_FENCE.search(md_text, ce, stop)
+                if lab:
+                    stop = lab.start()
+                code = md_text[cs:stop].rstrip()
+                while code.endswith("`"):        # drop a dangling closing fence
+                    code = code[:-1].rstrip()
+                i = j - 1
+        out.append((name, lang, code))
+        i += 1
+    return out
+
+
 def _extract_files(md_text, existing=None, default_name=None):
     """Parse fenced code blocks into {path: content}. Same heuristics as the
     compare page's extractFiles(): filename from the prose right before the
@@ -2095,24 +2296,16 @@ def _extract_files(md_text, existing=None, default_name=None):
     `existing` when parsing edits to a live project — unlabeled blocks then
     get junk-pattern names (which the merge guard rejects) instead of an
     'index.*' guess that could clobber a real file."""
-    blocks, last = [], 0
-    for m in re.finditer(r"```(\w*)[ \t]*\n([\s\S]*?)```", md_text):
-        blocks.append(((m.group(1) or "").lower(), m.group(2), md_text[last:m.start()]))
-        last = m.end()
-    # A trailing fence that never closed means the generation was cut off
-    # mid-file. Keep what arrived — losing it makes recovery impossible.
-    tail = re.search(r"```(\w*)[ \t]*\n([\s\S]+)", md_text[last:])
-    if tail:
-        blocks.append(((tail.group(1) or "").lower(), tail.group(2),
-                       md_text[last:last + tail.start()]))
+    blocks = _scan_fences(md_text)
 
     parsed = []
-    for lang, code, before in blocks:
+    for lang, code, before, _cs, _ce in blocks:
         if lang in _CMD_LANGS and not code.strip().startswith("#!/"):
             continue
         cands, near = [], []
         for line in reversed(before.rstrip().split("\n")[-4:]):
-            line = re.sub(r"[`*_#>]+", " ", line).strip()
+            line = re.sub(r"(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])", " ",
+                         re.sub(r"[`*#>]+", " ", line)).strip()
             hits = []
             for fm in re.finditer(
                     r"([A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-.]+)*\.[A-Za-z0-9]+)", line):
@@ -2127,7 +2320,9 @@ def _extract_files(md_text, existing=None, default_name=None):
         cm = re.search(r"(?://|#|<!--|/\*)\s*([A-Za-z0-9_\-./]+\.[A-Za-z0-9]+)", first)
         if cm and not cm.group(1).startswith("http"):
             cands.append(cm.group(1))
-        parsed.append((_resolve_label(cands, existing, near), lang, code))
+        parsed.append((_resolve_label(cands, existing, near), lang, code,
+                       _cs, _ce))
+    parsed = _absorb_nested_markdown(parsed, md_text)
 
     # Name the leftovers in a SECOND pass so block ORDER is preserved (callers
     # rely on the last file being the one a truncated reply cut off).
@@ -2160,6 +2355,12 @@ def _extract_files(md_text, existing=None, default_name=None):
                     name = owners.pop()
             if name is None and last_named:
                 name = last_named
+        if name is None and _DELETE_DIRECTIVE.match(code or ""):
+            # NEVER guess the target of a delete. Every other fallback below
+            # trades a wrong guess for a rejected block; here it would trade it
+            # for destroyed work. Leave it unnamed: the merge guard then says
+            # "asked to delete X, which does not exist" and nothing is lost.
+            name = "unnamed-delete.txt"
         if name is None:
             ext = _EXT_BY_LANG.get(lang, lang or "txt")
             if unresolved == 1 and default_name:
@@ -2203,7 +2404,8 @@ def _extract_files(md_text, existing=None, default_name=None):
         for m in _DIFF_BLOCK.finditer(md_text):
             cands = []
             for line in reversed(md_text[:m.start()].rstrip().split("\n")[-6:]):
-                line = re.sub(r"[`*_#>]+", " ", line).strip()
+                line = re.sub(r"(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])", " ",
+                         re.sub(r"[`*#>]+", " ", line)).strip()
                 for fm in re.finditer(
                         r"([A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-.]+)*\.[A-Za-z0-9]+)",
                         line):
@@ -2233,6 +2435,24 @@ def _files_context(files, limit=80000,
     if omitted:
         out += f"\n\n(omitted for length: {', '.join(omitted)})"
     return out
+
+
+def _forget_files(session_id, names):
+    """Drop deleted files from session memory.
+
+    _store_files only ever ADDS, so a file a step deleted came straight back on
+    the next request and every later step saw the corpse it had just folded in.
+    A consolidation that cannot make the old files stay gone is not a
+    consolidation."""
+    if not names:
+        return
+    with SESSIONS_LOCK:
+        cur = (sessions().get(session_id) or {}).get("files")
+        if not cur:
+            return
+        for n in names:
+            cur.pop(n, None)
+    _save_memory()
 
 
 def _store_files(session_id, new_files, force=False):
@@ -5116,6 +5336,10 @@ def _foreman_fix_loop(job_id, step, changed, files, warnings, mem,
                                    default_name=f_target).items():
             merged = _merge_output_file(n, c, files, set(f_shown), warnings,
                                         f"{tag} foreman", mem)
+            if merged is DELETE_FILE:
+                # the foreman's job is to fix the step, not to change its scope
+                warnings.append(f"{tag} foreman: refused to delete {n}")
+                merged = None
             if merged is not None:
                 fixes[n] = merged
         if not fixes:
@@ -5428,9 +5652,15 @@ def _execute_step(job_id, step, idx, total, goal, outline, files,
         _mem_note(mem, f"Step {idx} '{step['title']}': produced NO usable "
                        f"files (output empty, truncated, or rejected)")
         return True
+    deleted = sorted(n for n, v in changed.items() if v is DELETE_FILE)
+    for n in deleted:
+        changed.pop(n, None)
+        files.pop(n, None)
     files.update(changed)
-    _mem_note(mem, f"Step {idx} '{step['title']}': edited "
-                   + ", ".join(sorted(changed)))
+    _mem_note(mem, f"Step {idx} '{step['title']}': "
+                   + ", ".join(filter(None, [
+                       ("edited " + ", ".join(sorted(changed))) if changed else "",
+                       ("deleted " + ", ".join(deleted)) if deleted else ""])))
 
     # ---- foreman: keep the step in line before the next one builds on it ----
     note = None
@@ -5980,14 +6210,21 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
 
     # ---- assemble the answer ----
     changed_overall = {n: c for n, c in files.items() if proj_files.get(n) != c}
+    deleted_overall = sorted(n for n in proj_files if n not in files)
     final_warnings = _static_check_files(changed_overall) + warnings
     prose = f"**Build:** {plan['goal']}\n\n" + "\n".join(step_notes)
-    if changed_overall:
-        unchanged = [n for n in proj_files if n not in changed_overall]
+    if deleted_overall:
+        prose += "\n\nDeleted: " + ", ".join(f"`{n}`" for n in deleted_overall)
+    if changed_overall or deleted_overall:
+        # a deleted file is neither changed nor unchanged — listing it as
+        # "unchanged from earlier" is how a removed file looks like it survived
+        unchanged = [n for n in proj_files
+                     if n not in changed_overall and n in files]
         final_answer = _files_to_markdown(changed_overall, prose=prose,
                                           unchanged=unchanged,
                                           warnings=final_warnings)
         _store_files(session_id, changed_overall, force=True)
+        _forget_files(session_id, deleted_overall)
     else:
         detail = f" — {warnings[-1]}" if warnings else ""
         final_answer = (prose
@@ -6000,7 +6237,8 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
     for n in stream_notes:
         final_warnings.append(n)
         _mem_note(mem, f"Stream note: {n}")
-    _trace(job_id, "job_end", files_changed=sorted(changed_overall),
+    _trace(job_id, "job_end", files_deleted=deleted_overall,
+           files_changed=sorted(changed_overall),
            warnings=len(final_warnings), steps=len(step_notes))
     _mem_note(mem, "Job finished. Files changed overall: "
                    + (", ".join(sorted(changed_overall)) or "none"))
@@ -7785,7 +8023,14 @@ _FILE_FORMAT_NOTE = (
     "Never write an example or placeholder file — only real project files.\n"
     "Do not combine multiple files into one block. Do not show terminal commands — just the files. "
     "Every file must be COMPLETE from first line to last. NEVER stand in for code with "
-    "placeholder comments like '// ... rest unchanged' or '// lines 1-349' — that destroys the file."
+    "placeholder comments like '// ... rest unchanged' or '// lines 1-349' — that destroys the file.\n"
+    "To DELETE a file that should no longer exist — folding three scripts into "
+    "one, say — put its path on the line before a fenced block whose entire "
+    "contents are the word DELETE. An empty block deletes nothing and is ignored.\n"
+    "If a file's OWN CONTENTS contain a code fence — a README with usage examples is the "
+    "usual case — wrap that file in FOUR backticks so its inner three-backtick fences "
+    "cannot be mistaken for the end of the file. Three inside three is ambiguous and "
+    "gets the document cut off at its first example."
 )
 
 
@@ -8550,10 +8795,13 @@ function isCommandBlock(lang, code){
 }
 function extractFiles(mdText){
   const files=[]; const seen=new Set();
-  const re=/```(\w*) *\n([\s\S]*?)```/g;
+  // Fence LENGTH matters: a block opened with N backticks closes only on N or
+  // more, so a README wrapped in ````…```` keeps its own ``` examples instead
+  // of being cut off at the first one.
+  const re=/^(`{3,})([\w-]*)[ \t]*\n([\s\S]*?)^\1`*[ \t]*$/gm;
   let m,lastIndex=0;
   while((m=re.exec(mdText))!==null){
-    const lang=m[1].trim()||''; const code=m[2];
+    const lang=m[2].trim()||''; const code=m[3];
     const before=mdText.slice(lastIndex,m.index); lastIndex=re.lastIndex;
     if(isCommandBlock(lang,code)) continue;
     const beforeLines=before.trimEnd().split('\n');
@@ -11163,11 +11411,13 @@ function isCommandBlock(lang, code) {
 function extractFiles(md) {
   const files = [];
   const seen = new Set();
-  const re = /```(\w*) *\n([\s\S]*?)```/g;
+  // Fence LENGTH matters: a block opened with N backticks closes only on N or
+  // more, so a README wrapped in ````…```` keeps its own ``` examples.
+  const re = /^(`{3,})([\w-]*)[ \t]*\n([\s\S]*?)^\1`*[ \t]*$/gm;
   let m, lastIndex = 0;
   while ((m = re.exec(md)) !== null) {
-    const lang = m[1].trim() || '';
-    const code = m[2];
+    const lang = m[2].trim() || '';
+    const code = m[3];
     const before = md.slice(lastIndex, m.index);
     lastIndex = re.lastIndex;
 
