@@ -1175,11 +1175,22 @@ def _upsample_wav(src: str, dst: str, target_rate: int = AUDIO_OUT_RATE):
 SYSTEM_PROMPTS = {
     "recipes":  "You are a concise, practical cooking assistant. Begin EVERY recipe with a markdown heading naming the dish, e.g. '## Honey Garlic Chicken Thighs'. If the user asks for several recipes, give each its own '## Dish Name' heading. Under each heading, return a clear ingredients list with quantities followed by numbered steps. Note prep/cook time and servings. Keep commentary minimal.",
     "creative": "You are an imaginative creative-writing partner. Write vivid, characterful prose. Favor strong imagery, varied sentence rhythm, and emotional texture. Continue collaboratively and keep the established tone, characters, and plot consistent across turns.",
-    "code":     "You are an expert software engineer. Return correct, idiomatic, production-quality code with minimal preamble. Prefer complete, runnable solutions. Explain only when asked or when a non-obvious decision needs justifying. Default to the user's language/framework if evident.",
-    "general":   "You are a knowledgeable, helpful general assistant. Answer questions clearly and accurately across any topic. Be concise but complete, and say when you are unsure rather than inventing facts.",
+    # A small chat backend under-drives itself on a vague prompt, and the old
+    # wording here ("minimal preamble", "explain only when asked") read as
+    # permission to do less. Measured on three under-specified prompts: this
+    # version roughly doubles the code produced and is the difference between
+    # tests present and tests absent. The negative constraints are
+    # load-bearing — keep them.
+    "code":     "You are an expert software engineer. Return correct, idiomatic, production-quality code with minimal prose preamble \u2014 the depth goes into the code, not the commentary.\nEvery solution you write MUST:\n- be complete and runnable \u2014 never emit a stub, a placeholder, '...', or a comment standing in for code you did not write;\n- validate its inputs and handle the failure cases explicitly, raising rather than silently returning wrong answers;\n- carry type hints and a short docstring stating what it does and what it raises;\n- enumerate the edge cases before you finish, and cover the tricky ones with runnable assert-based tests;\n- end with a one-line note of the approach's real limitation.\nTreat a terse answer that merely satisfies the happy path as a wrong answer. Default to the user's language/framework if evident.",
+    # general/reasoning share a backend with ordinary chat, and the classifier
+    # sends real coding work here whenever it reads as debugging or "make this
+    # better" rather than "write me X" (which goes to the coder). Neither
+    # persona mentioned code at all, so the model defaulted to the laziest
+    # passable answer — see the note on "code" above.
+    "general":   "You are a knowledgeable, helpful general assistant. Answer questions clearly and accurately across any topic. Be concise but complete, and say when you are unsure rather than inventing facts. When your answer includes code, that code must be complete and runnable \u2014 never a stub, a placeholder, '...', or a comment standing in for code you did not write. Validate inputs and handle the failure cases explicitly, give functions type hints and a short docstring, and cover the tricky edge cases with runnable assert-based tests. A terse answer that only satisfies the happy path is a wrong answer.",
     "review": "You are a senior software engineer performing a code review. Ground every finding in the actual code shown — name the file path and quote the offending lines. Every finding MUST end with working suggested code: the file path on its own line, then a fenced code block containing the corrected version, complete enough to paste — a whole function or coherent block, never a fragment with '...' elisions. Keep each suggestion minimal: change what the finding requires and preserve the surrounding style. Order findings by impact: correctness first, then security, then performance, then clarity. Say clearly when something is already good, and when you could not review a file because it was omitted. Never invent files, lines, or APIs that were not shown to you; if a fix depends on code you cannot see, say so instead of guessing.",
     "summarize": "You condense material the user already has. Be faithful above all: keep names, numbers, dates, decisions and conclusions exactly as written, never infer a fact that is not present, and say so plainly when the source does not cover something. Lead with the single most important point, then structure the rest to match the material — bullets for lists of findings, short prose for an argument. Match the requested length if one is given; otherwise aim for roughly a tenth of the original. Do not add opinion, praise, or advice unless asked.",
-    "reasoning": "You are a precise analytical reasoner. Work through problems step by step, showing your reasoning clearly. Handle math, logic, science, and multi-step analysis. Check your work before giving a final answer. Acknowledge uncertainty rather than guessing.",
+    "reasoning": "You are a precise analytical reasoner. Work through problems step by step, showing your reasoning clearly. Handle math, logic, science, multi-step analysis, and the debugging and optimisation questions that land here rather than on the coder. Check your work before giving a final answer. Acknowledge uncertainty rather than guessing. When your answer includes code, that code must be complete and runnable \u2014 never a stub, a placeholder, '...', or a comment standing in for code you did not write. Validate inputs and handle the failure cases explicitly, give functions type hints and a short docstring, and cover the tricky edge cases with runnable assert-based tests. A terse answer that only satisfies the happy path is a wrong answer.",
     "search":    "You are a research assistant answering with the help of live web search results supplied in the user message. Base your answer on those results and synthesize across them — do not rely on a single source when several are given. Cite sources inline as [n] matching the numbered results, and attach a date to any fact that can change over time (prices, rankings, counts, 'latest' anything). When the question compares things across several items, present the comparison as a markdown table with a source/date column. Prefer recent, agreeing sources; when sources disagree or a figure is uncertain, say so explicitly rather than averaging silently. If the results don't actually answer the question, state that plainly instead of guessing. Never fabricate URLs, numbers, or facts beyond what the sources support.",
 }
 
@@ -1854,6 +1865,30 @@ _ERRORISH = re.compile(
     r"is not defined|undefined|stack trace|errno|error:|uncaught|"
     r"doesn'?t work|not working|broken|fails?\b|"
     r"truncat|cut\s*off|didn'?t finish|incomplete|unfinished", re.I)
+
+# A session holding stored files is an ACTIVE BUILD, and once one exists
+# "please add settings so I can change the wallpaper" is a code job however
+# casually it is phrased. The classifier reads that as conversation and sends
+# it to a chat route, which cannot see sess["files"] at all -- so the model
+# answers from the file NAMES in a 2000-char-truncated history and invents a
+# replacement app, then rationalises the loss ("too large for one code block").
+# That is how a live 11-file project was lost to one "add a setting" request.
+# Same shape as _ERRORISH: with an active build, state decides the route,
+# not wording.
+_EDITISH = re.compile(
+    r"\b(add|adding|remove|removing|delete|drop|change|changing|rename|"
+    r"fix|update|implement|refactor|replace|swap|revert|undo|restore|"
+    r"redesign|rework|improve|optimi[sz]e|extend|integrate|hook up|wire up|"
+    r"enable|disable|tweak|adjust|resize|restyle|get rid of|put back|"
+    r"bring back|make it|make the|give it)\b", re.I)
+
+# ...but a question ABOUT the build is a conversation, not a build request.
+# "why did you remove everything?" contains two edit verbs and must NOT kick
+# off a rebuild. These keep their chat route -- and now arrive with the
+# project manifest attached, so the model can see the files exist.
+_ASKS_ABOUT = re.compile(
+    r"^\s*(why|how come|what happened|what did you|what have you|did you|"
+    r"do you|are you|explain|tell me why|i thought)\b", re.I)
 
 # Short replies that continue the previous exchange (game answers, yes/no,
 # "keep going") — these stay on the previous route without asking the
@@ -3620,6 +3655,32 @@ THINK_RETRY_NOTE = (
     "Your previous attempt was aborted because it produced only hidden "
     "reasoning and no answer. Do NOT deliberate, plan, or think out loud. "
     "Begin writing the final answer immediately.")
+
+# Opt-in thinking for the CHAT routes (the code pipeline is deliberately not
+# covered -- see _stream_chat, which measured thinking as pure cost there).
+#
+# Some chat templates PRE-FILL an empty thought block when thinking is off, so
+# a route left out of this set answers with zero deliberation. That is the
+# right default nearly everywhere: measured on a local chat backend, thinking
+# changed no answers on 'reasoning', and on 'review' it bought 3/4 vs 2.5/4
+# planted defects for ~10x the tokens and ~10x the latency. It is worth having
+# a switch anyway, because the one 'review' run that did think caught a
+# wall-clock-vs-monotonic bug no non-thinking run ever found.
+#
+# CREWE_THINK_ROUTES="reasoning,review" turns it on for those routes; "all"
+# turns it on for every chat route. Empty (the default) is byte-identical to
+# not having the flag at all. Routes that think are still covered by the
+# THINK_MAX_TOKENS runaway guard in run_job.
+THINK_ROUTES = {r.strip().lower()
+                for r in os.environ.get("CREWE_THINK_ROUTES", "").split(",")
+                if r.strip()}
+
+
+def route_thinks(route: str) -> bool:
+    """True when this chat route should run with the model's thinking channel on."""
+    if not THINK_ROUTES:
+        return False
+    return "all" in THINK_ROUTES or (route or "").lower() in THINK_ROUTES
 
 
 # ---------------------------------------------------------------------------
@@ -6028,6 +6089,27 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
     if summary:
         system += f"\n\nConversation context (older exchanges, summarized):\n{summary}"
 
+    # A chat route can still be ASKED about a project it cannot see: the files
+    # live in sess["files"] but only the code pipeline ever injects their
+    # contents (_files_context). Blind, the model answers by inventing a
+    # replacement and presenting it as an upgrade. It gets the manifest here
+    # -- names and sizes only, which stays small even for a big project -- so
+    # it knows the work exists and can say it cannot read it.
+    proj_files = dict(sess.get("files") or {})
+    if proj_files:
+        listing = "\n".join(f"- {n} ({len(c):,} chars)"
+                             for n, c in sorted(proj_files.items()))
+        system += (
+            f"\n\nThis session has an ACTIVE PROJECT of {len(proj_files)} files. "
+            "You are being shown their NAMES AND SIZES ONLY — you cannot see "
+            f"one line of their contents:\n{listing}\n"
+            "Never rewrite, consolidate, replace, or 'simplify' this project, "
+            "and never offer a fresh single-file version of it: you would be "
+            "destroying working code you cannot read. If answering properly "
+            "needs the actual source, say plainly that you cannot see it and "
+            "ask the user to phrase the request as a change to the project, "
+            "which routes it to the builder that can load these files.")
+
     user_content = question
     search_sources: list = []
 
@@ -6137,9 +6219,11 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
         messages.append({"role": "assistant", "content": turn.get("a", "")})
     messages.append({"role": "user", "content": user_content})
 
-    payload = {"messages": messages, "stream": True}
+    payload = {"messages": messages, "stream": True,
+               "chat_template_kwargs": {"enable_thinking": route_thinks(route)}}
     answer_parts = []
     usage = None
+    think_n = content_n = 0
     try:
         payload = _with_usage(_inject_model(payload, url, route), url)
         with requests.post(url, json=payload, headers=_hdrs(url),
@@ -6166,6 +6250,22 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
                         delta = d.get("content", "")
                         if delta:
                             answer_parts.append(delta)
+                            content_n += 1
+                        elif d.get("reasoning_content"):
+                            think_n += 1
+                            # Same pathology _stream_chat guards: all hidden
+                            # reasoning, no visible answer. Only reachable when
+                            # the route opted in via CREWE_THINK_ROUTES.
+                            if (THINK_MAX_TOKENS and not content_n
+                                    and think_n >= THINK_MAX_TOKENS):
+                                print(f"[{route}] think runaway: {think_n} "
+                                      "reasoning tokens, no content -- aborting")
+                                answer_parts.append(
+                                    f"\n\n*[stopped: the model spent {think_n} "
+                                    "tokens thinking without starting an answer. "
+                                    f"Drop '{route}' from CREWE_THINK_ROUTES, or "
+                                    "raise CREWE_THINK_MAX_TOKENS.]*")
+                                break
                         # count hidden reasoning too, so the UI counter moves
                         # while a thinking model is still in its think phase
                         if delta or d.get("reasoning_content"):
@@ -6734,6 +6834,11 @@ def ask():
     # Pasted errors about an in-progress build must reach the code route even
     # when the classifier would call them 'general'.
     if has_files and _ERRORISH.search(question):
+        route = "code"
+    # A change requested against an ACTIVE build belongs to the code route,
+    # which is the only one that can actually load the files and edit them.
+    elif (has_files and _EDITISH.search(question)
+            and not _ASKS_ABOUT.match(question)):
         route = "code"
     # Short continuation replies ("no", "keep going") stay with the previous
     # specialist — its history has the conversation state (e.g. a game in
