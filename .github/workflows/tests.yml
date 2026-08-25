@@ -93,3 +93,9 @@ jobs:
       - name: agent-toolcalls
         if: ${{ !cancelled() }}
         run: python3 tests/test_agent_toolcalls.py
+      - name: think-routes
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_think_routes.py
+      - name: project-guard
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_project_guard.py
