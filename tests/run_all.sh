@@ -16,7 +16,7 @@ FILES=(test_auth.py test_tenancy.py test_invite.py test_harden.py
        test_agent_notes.py test_agent_symlink.py test_agent_toolcalls.py
        test_think_routes.py test_project_guard.py
        test_nested_fences.py test_delete_protocol.py
-       test_conflict_markers.py)
+       test_conflict_markers.py test_history_budget.py)
 
 fail=0
 for t in "${FILES[@]}"; do

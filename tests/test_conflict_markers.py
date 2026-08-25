@@ -116,5 +116,19 @@ check("deleting a file emits NO warning", warns2 == [], str(warns2))
 check("...but is still recorded for later steps",
       any("deleted gone.py" in e for e in mem2["events"]), str(mem2["events"]))
 
+# --- 9. a marker rejection must EARN A RETRY, not lose the work ------------
+# Live run: 4 SEARCH, 5 separators, 3 REPLACE. The guard correctly refused to
+# write "<<<<<<< SEARCH" into the README, but the reason was not in
+# _RECOVERABLE_REJECT, so no retry fired and the step went PARTIAL with the
+# edit simply lost. Miscounted markers are the most fixable mistake there is.
+for w, want in (
+        ("step 1: README.md came back with a leftover SEARCH/REPLACE marker; "
+         "kept the previous version", True),
+        ("step 1: x.ps1 came back EMPTY; kept the previous version "
+         "(no file was deleted)", True),
+        ("step 1: refused a blind rewrite of x.py (not shown to the model)", False)):
+    got = bool(router._RECOVERABLE_REJECT.search(w))
+    check(f"retryable={want}: {w.split(': ', 1)[1][:44]}", got == want, str(got))
+
 print(f"\n{len(P)} passed, {len(F)} failed")
 sys.exit(1 if F else 0)

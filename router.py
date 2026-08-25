@@ -57,6 +57,20 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, request, jsonify, Response
 
+# Python block-buffers stdout when it is a FILE rather than a tty, so a router
+# started with `>> router.log` accumulated its output in an 8KB buffer and lost
+# it on every restart: the log sat untouched from 2026-08-04 to 2026-08-25
+# while builds ran daily, and the one time it mattered (a think-runaway) the
+# evidence only survived because it happened to fill the buffer. Line-buffer
+# both streams HERE rather than relying on `python3 -u` at the call site, so
+# every launcher -- systemd unit, nohup, a shell -- gets a live log.
+import sys as _sys
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 app = Flask(__name__)
 
 # ==== accounts / auth (Phase 1, 2026-07-20) ==================================
@@ -1009,14 +1023,61 @@ def _save_memory():
 # ten seconds later" — it is written synchronously when an answer completes,
 # so the very next request is guaranteed to see it (the summary is not).
 HISTORY_TURNS = 6      # exchanges kept per session
-HISTORY_CHARS = 2000   # max chars stored per question/answer
+# Max chars STORED per question/answer. This was 2000, which cut a code answer
+# off mid-tag ("...<script src=\"js/game.js\"></script>\n  <sc") and, worse,
+# gave the model no sign it was looking at a fragment: it read the stub as the
+# whole project and rewrote it. Store generously, and REPLAY within a budget
+# (below) so a bigger store can never overflow a small specialist.
+HISTORY_CHARS = int(os.environ.get("CREWE_HISTORY_CHARS", "12000"))
+# Total chars of history replayed into a prompt, newest turn first. 24000 is
+# exactly what the old 6 turns x 2 x 2000 worst case already sent, so prompt
+# size does not grow — but a single long answer may now use the whole budget
+# instead of being sliced to 2000, which is the trade that matters.
+HISTORY_REPLAY_CHARS = int(os.environ.get("CREWE_HISTORY_REPLAY_CHARS", "24000"))
+
+
+def _clip_for_history(text, limit=None):
+    """Trim to `limit`, on a LINE boundary, and say so.
+
+    Silent truncation is the dangerous kind: the reader cannot tell a stub from
+    a complete answer. Cutting on a newline keeps the last line intact, and the
+    marker means a model reading this back knows there is more it cannot see."""
+    limit = HISTORY_CHARS if limit is None else limit
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    nl = head.rfind("\n")
+    if nl > limit * 0.5:          # only if it does not cost half the budget
+        head = head[:nl]
+    return (head.rstrip() +
+            f"\n\n[... truncated: {len(text) - len(head):,} more characters "
+            f"were not kept in conversation history ...]")
+
+
+def _history_messages(history, budget=None):
+    """Replay turns as chat messages, NEWEST first, within a char budget.
+
+    Oldest turns drop out rather than every turn being sliced thin — a whole
+    recent exchange is worth more than six mutilated ones."""
+    budget = HISTORY_REPLAY_CHARS if budget is None else budget
+    out, used = [], 0
+    for turn in reversed(history or []):
+        q, a = turn.get("q", "") or "", turn.get("a", "") or ""
+        if used and used + len(q) + len(a) > budget:
+            break
+        used += len(q) + len(a)
+        out[:0] = [{"role": "user", "content": q},
+                   {"role": "assistant", "content": a}]
+    return out
 
 
 def _append_history(session_id: str, question: str, answer: str, route: str):
     with SESSIONS_LOCK:
         sess = sessions().setdefault(session_id, {})
         hist = sess.setdefault("history", [])
-        hist.append({"q": question[:HISTORY_CHARS], "a": answer[:HISTORY_CHARS]})
+        hist.append({"q": _clip_for_history(question),
+                     "a": _clip_for_history(answer)})
         del hist[:-HISTORY_TURNS]
         sess["last_route"] = route
     _save_memory()
@@ -1396,7 +1457,12 @@ _TRUNC_RETRY_NOTE = (
 # refusal is policy, not a mistake, so retrying it just burns a call.
 _RECOVERABLE_REJECT = re.compile(
     r"fragment|didn'?t match|cut off|unlabeled|no complete file|shorter than"
-    r"|doesn'?t exist|full-file rewrite",
+    r"|doesn'?t exist|full-file rewrite"
+    # Unbalanced SEARCH/REPLACE (observed: 4 SEARCH, 5 separators, 3 REPLACE)
+    # is the most fixable mistake there is — the model knows the file, it just
+    # miscounted markers. Without this the step went PARTIAL and the edit was
+    # simply lost, which is the outcome the guard exists to prevent.
+    r"|leftover SEARCH/REPLACE marker|came back EMPTY",
     re.I)
 
 
@@ -3771,11 +3837,9 @@ def run_audio_job(job_id: str, question: str, session_id: str):
     if summary:
         system += f"\n\nConversation context (older exchanges, summarized):\n{summary}"
 
-    messages = [{"role": "system", "content": system}]
-    for turn in history:
-        messages.append({"role": "user",      "content": turn.get("q", "")})
-        messages.append({"role": "assistant", "content": turn.get("a", "")})
-    messages.append({"role": "user", "content": question})
+    messages = ([{"role": "system", "content": system}]
+                + _history_messages(history)
+                + [{"role": "user", "content": question}])
     payload = {"messages": messages, "stream": True}
     parts = []
     try:
@@ -6451,11 +6515,9 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
 
     # Recent turns go in as real chat history so follow-ups ("no", "the second
     # one", a 20-questions answer) land mid-conversation, not cold.
-    messages = [{"role": "system", "content": system}]
-    for turn in history:
-        messages.append({"role": "user",      "content": turn.get("q", "")})
-        messages.append({"role": "assistant", "content": turn.get("a", "")})
-    messages.append({"role": "user", "content": user_content})
+    messages = ([{"role": "system", "content": system}]
+                + _history_messages(history)
+                + [{"role": "user", "content": user_content}])
 
     payload = {"messages": messages, "stream": True,
                "chat_template_kwargs": {"enable_thinking": route_thinks(route)}}

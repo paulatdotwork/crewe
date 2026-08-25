@@ -108,3 +108,6 @@ jobs:
       - name: conflict-markers
         if: ${{ !cancelled() }}
         run: python3 tests/test_conflict_markers.py
+      - name: history-budget
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_history_budget.py
