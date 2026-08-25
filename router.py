@@ -2890,9 +2890,30 @@ def _backend_ctx(url, timeout=6):
                     if k.endswith(".context_length") and v:
                         return int(v)
             return None
-        d = requests.get(f"{base}/props", timeout=timeout).json()
-        n = (d.get("default_generation_settings") or {}).get("n_ctx") or d.get("n_ctx")
-        return int(n) if n else None
+        # llama-swap fronts several models on ONE port and answers a bare
+        # /props with "no model id could be identified" -- it has to be told
+        # WHICH model. Plain llama.cpp ignores the unknown query param and
+        # still reports its own n_ctx, so asking with the id first is safe for
+        # both, and the bare retry keeps backends with no model id working.
+        # Silence here is expensive: an unprobed backend keeps the 160k-char
+        # default, so a 32k window gets ~40k tokens of files stuffed into it,
+        # every rewrite is truncated mid-file, and the continuation call --
+        # prompt PLUS the whole truncated reply -- 400s on context size.
+        model = (BACKEND_INFO.get(url, {}) or {}).get("model", "")
+        # A swap proxy may have to load the model before it can answer.
+        tries = [({"model": model}, max(timeout, 30))] if model else []
+        tries.append((None, timeout))
+        for params, tmo in tries:
+            try:
+                d = requests.get(f"{base}/props", params=params,
+                                 timeout=tmo).json()
+            except Exception:
+                continue
+            n = ((d.get("default_generation_settings") or {}).get("n_ctx")
+                 or d.get("n_ctx"))
+            if n:
+                return int(n)
+        return None
     except Exception:
         return None
 
