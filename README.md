@@ -39,7 +39,15 @@
 **Routing**
 - A lightweight classifier picks the specialist per question; short continuations ("no", "keep going") stick with the previous route
 - **Settings UI** (`/settings`): register backends by type — **llama.cpp**, **Ollama**, **Claude (Anthropic)**, or any OpenAI-compatible server or hosted API — and point any route at any backend, add custom routes — with an AI helper that drafts the routing rule and a **live routing test** that runs your example questions through the real classifier before you commit. Changes apply live, no restart.
+- A chat keeps the specialist it settles on, so a recipes conversation stays
+  one; the header shows the chat's mode and changes it in one click, and when a
+  question looks like it belongs to another mode, a **switch & ask again**
+  link appears under the answer
 - Route health dots in the header — see a dead backend at a glance
+- **Health check** for admins: every backend in use, plus routing, summaries,
+  search, photos, voice and disk space, probed every 6 hours
+  (`CREWE_HEALTH_INTERVAL_HOURS`) and every 10 minutes while something fails;
+  results on `/admin` and a red pill in the header
 - **Effort tiers for coding** — *fast*, *normal* and *extra*: register your
   quickest model, your everyday one, and your strongest (often a paid API),
   then pick per question. Budgets are sized automatically from each backend's
@@ -77,7 +85,10 @@
 **Polish**
 - Warm light/dark theme across every page, one toggle, no CDN dependencies — fonts and JS vendored, fully offline
 - Conversation memory per session (recent turns verbatim, older summarized)
-- Web search route via self-hosted SearXNG with cited sources
+- Web search route via self-hosted SearXNG with cited sources. Mid-chat
+  follow-ups ("how much is it now?") are rewritten into standalone queries;
+  questions about what is next, latest or current search the past year first;
+  the model is told today's date and each page's own date
 
 ## Architecture
 

@@ -438,6 +438,9 @@ th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line)}
 th{color:var(--muted);font-weight:500;font-size:12.5px;text-transform:uppercase;letter-spacing:.03em}
 .tag{display:inline-block;padding:1px 8px;border-radius:99px;background:var(--line);color:var(--muted);font-size:11.5px;font-weight:600}
 .tag.admin{background:color-mix(in srgb,var(--gold) 22%,transparent);color:var(--gold)}
+.tag.ok{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+.tag.warn{background:color-mix(in srgb,var(--gold) 22%,transparent);color:var(--gold)}
+.tag.fail{background:color-mix(in srgb,var(--err) 14%,transparent);color:var(--err)}
 .linkbox{display:flex;gap:8px;margin-top:8px}
 .linkbox input{font-family:ui-monospace,monospace;font-size:12.5px}
 .muted{color:var(--muted);font-size:13px}
@@ -763,6 +766,7 @@ def admin():
 </div>"""
 
     body = f"""{msg}
+{_health_card()}
 <div class="card">
   <h2>Invite someone</h2>
   <p class="hint">Generates a one-time link. They set their own password — you never see it.</p>
@@ -1022,7 +1026,11 @@ def _save_memory():
 # The rolling summary covers the long tail; this covers "the user replied
 # ten seconds later" — it is written synchronously when an answer completes,
 # so the very next request is guaranteed to see it (the summary is not).
-HISTORY_TURNS = 6      # exchanges kept per session
+# Exchanges kept per session. Was 6, which made a recipe-planning or debugging
+# chat forget its own start by message 7 even on a 128k model. What actually
+# gets REPLAYED is bounded by _history_budget below, so storing more costs
+# disk (avg ~3.2k chars/turn), never prompt overflow.
+HISTORY_TURNS = int(os.environ.get("CREWE_HISTORY_TURNS", "20"))
 # Max chars STORED per question/answer. This was 2000, which cut a code answer
 # off mid-tag ("...<script src=\"js/game.js\"></script>\n  <sc") and, worse,
 # gave the model no sign it was looking at a fragment: it read the stub as the
@@ -1055,6 +1063,45 @@ def _clip_for_history(text, limit=None):
             f"were not kept in conversation history ...]")
 
 
+# A search answer ends in the Sources list run_job appends. Replayed, the
+# model copied it: live 2026-11-19, a follow-up search answer carried the
+# model's own "---\n**Sources**" list (links from memory, not from what was
+# fetched) and then the real one. Earlier answers replay without it, and the
+# query rewriter never sees it either — URLs are not topic.
+SOURCES_MARK = "\n\n---\n**Sources**"
+
+
+def _without_sources(answer):
+    return answer.split(SOURCES_MARK)[0]
+
+
+_SOURCES_HEAD = re.compile(r"^\s*(\*\*|#{1,6}\s*)?(sources|references)\s*:?\s*(\*\*)?\s*:?\s*$", re.I)
+_SOURCE_ITEM = re.compile(r"^\s*(\d+[.)]|[-*])\s+.*(https?://|\]\()", re.I)
+_SOURCES_LINE = re.compile(r"^\s*(\*\*)?(sources|references)\s*:?\s*(\*\*)?\s*:?\s*\[\d+\]", re.I)
+
+
+def _drop_model_sources(answer):
+    """Cut a references list the answer model wrote at the END of its answer
+    — a Sources/References heading followed only by linked list items, or
+    one closing "Sources: [1] NASA, [2] ..." line — since the real list is
+    appended after it. Anything else is left alone."""
+    lines = answer.rstrip().split("\n")
+    cut = None
+    if _SOURCES_LINE.match(lines[-1]):
+        cut = len(lines) - 1
+    else:
+        for i in range(len(lines) - 1, -1, -1):
+            if _SOURCES_HEAD.match(lines[i]):
+                tail = [ln for ln in lines[i + 1:] if ln.strip()]
+                if tail and all(_SOURCE_ITEM.match(ln) for ln in tail):
+                    cut = i
+                break
+    kept = "\n".join(lines[:cut or 0]).rstrip()
+    if kept.endswith("---"):
+        kept = kept[:-3].rstrip()
+    return kept if cut and kept else answer
+
+
 def _history_messages(history, budget=None):
     """Replay turns as chat messages, NEWEST first, within a char budget.
 
@@ -1063,13 +1110,59 @@ def _history_messages(history, budget=None):
     budget = HISTORY_REPLAY_CHARS if budget is None else budget
     out, used = [], 0
     for turn in reversed(history or []):
-        q, a = turn.get("q", "") or "", turn.get("a", "") or ""
+        q, a = turn.get("q", "") or "", _without_sources(turn.get("a", "") or "")
         if used and used + len(q) + len(a) > budget:
             break
+        if not used and len(q) + len(a) > budget:
+            # The newest turn always replays, but on a small model a single
+            # 12k+12k stored turn can overflow the window by itself. Clip it
+            # (visibly) rather than let llama.cpp cut the system prompt.
+            q = _clip_for_history(q, max(500, budget // 4))
+            a = _clip_for_history(a, max(1000, budget - len(q)))
         used += len(q) + len(a)
         out[:0] = [{"role": "user", "content": q},
                    {"role": "assistant", "content": a}]
     return out
+
+
+# Replay sized to the model that will READ it. A fixed 24k chars (~6k tokens)
+# was both too much and too little: it could overflow an 8k E4B once the
+# question and answer were added (the recipes ratatouille overflow), and it
+# threw away all but ~5% of a 128k model's window. The share leaves the rest
+# for the system prompt, the question and the whole answer; attached documents
+# take half the window (see run_job), so history gets less when they are there.
+HISTORY_CTX_SHARE = 0.40
+HISTORY_CTX_SHARE_WITH_UPLOADS = 0.25
+HISTORY_REPLAY_MAX = int(os.environ.get("CREWE_HISTORY_REPLAY_MAX", "400000"))
+_CTX_CACHE: dict = {}          # url -> (ctx_or_None, fetched_at)
+
+
+def _backend_ctx_cached(url):
+    """_backend_ctx, cached: this runs on every chat message, and a dead backend
+    would otherwise add its probe timeout to each one. Misses are cached too,
+    briefly, so a backend that comes back is noticed within a minute."""
+    hit = _CTX_CACHE.get(url)
+    now = time.time()
+    if hit and now - hit[1] < (300 if hit[0] else 60):
+        return hit[0]
+    n = _backend_ctx(url, timeout=3)
+    _CTX_CACHE[url] = (n, now)
+    return n
+
+
+def _history_budget(url, with_uploads=False):
+    """Chars of conversation history to replay to the backend at `url`.
+
+    An explicit CREWE_HISTORY_REPLAY_CHARS always wins (same rule as the code
+    budgets); an unknown window falls back to it."""
+    if os.environ.get("CREWE_HISTORY_REPLAY_CHARS"):
+        return HISTORY_REPLAY_CHARS
+    ctx = _backend_ctx_cached(url)
+    if not ctx:
+        return HISTORY_REPLAY_CHARS
+    share = HISTORY_CTX_SHARE_WITH_UPLOADS if with_uploads else HISTORY_CTX_SHARE
+    # ~4 chars/token, the same estimate the upload budget uses
+    return max(4000, min(HISTORY_REPLAY_MAX, int(ctx * share) * 4))
 
 
 def _append_history(session_id: str, question: str, answer: str, route: str):
@@ -2785,6 +2878,11 @@ def _bundle_check(files):
     return issues
 
 
+# How much of each exchange the summarizer reads. The summarizer is an 8k-ctx
+# E4B: memory (~300 tokens) + 2k + 6k chars stays well inside it.
+SUMMARY_QUESTION_CHARS = int(os.environ.get("CREWE_SUMMARY_QUESTION_CHARS", "2000"))
+SUMMARY_ANSWER_CHARS = int(os.environ.get("CREWE_SUMMARY_ANSWER_CHARS", "6000"))
+
 SUMMARIZER_SYSTEM = (
     "You maintain a concise conversation memory. "
     "Given the current memory (if any) and a new exchange, produce an updated summary "
@@ -3436,26 +3534,14 @@ def summarize(session_id: str, question: str, answer: str):
     with SESSIONS_LOCK:
         current = sessions().get(session_id, {}).get("summary", "")
         turns   = sessions().get(session_id, {}).get("turns", 0)
-
-    user_content = (
-        f"Current memory:\n{current}\n\nNew exchange:\nUser: {question}\nAssistant: {answer[:800]}"
-        if current else
-        f"New exchange:\nUser: {question}\nAssistant: {answer[:800]}"
-    )
-    payload = {
-        "messages": [
-            {"role": "system",  "content": SUMMARIZER_SYSTEM},
-            {"role": "user",    "content": user_content},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 200,
-        "stream": False,
-    }
     try:
-        r = requests.post(SUMMARIZER, json=_inject_model(payload, SUMMARIZER),
-                          headers=_hdrs(SUMMARIZER), timeout=60)
-        r.raise_for_status()
-        new_summary = _resp_json(r)["choices"][0]["message"]["content"].strip()
+        new_summary = _summarize_reply(current, question, answer)
+        if not new_summary:
+            # An empty reply is a summarizer failure, never "the conversation
+            # is now about nothing": keep the memory we had.
+            print(f"[summarize] empty reply — keeping the previous summary "
+                  f"(session {session_id})")
+            return
         with SESSIONS_LOCK:
             # update in place — the session dict also carries project files
             sess = sessions().setdefault(session_id, {})
@@ -3466,17 +3552,230 @@ def summarize(session_id: str, question: str, answer: str):
         print(f"[summarize] error: {e}")
 
 
-def web_search(query: str) -> list:
-    """Query the local SearXNG JSON API. Returns the raw result list (possibly empty)."""
+def _summarize_reply(current: str, question: str, answer: str) -> str:
+    """One summarizer call: the updated memory text, '' if the model returned
+    nothing. Raises on transport errors. Shared by summarize() and the health
+    check, so the check sends exactly the request real conversations do."""
+    # The summary is the ONLY memory of a conversation older than the replayed
+    # history, so it reads far more of the answer than the old 800 chars — a
+    # recipe's quantities or a design decision live past the first paragraph.
+    q = _clip_for_history(question, SUMMARY_QUESTION_CHARS)
+    a = _clip_for_history(answer, SUMMARY_ANSWER_CHARS)
+    user_content = (
+        f"Current memory:\n{current}\n\nNew exchange:\nUser: {q}\nAssistant: {a}"
+        if current else
+        f"New exchange:\nUser: {q}\nAssistant: {a}"
+    )
+    payload = {
+        "messages": [
+            {"role": "system",  "content": SUMMARIZER_SYSTEM},
+            {"role": "user",    "content": user_content},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 300,
+        "stream": False,
+        # Thinking must be OFF. The Gemma 4 E4B thinks by default, spent all
+        # 200 tokens of the old budget on "Thinking Process:" and returned
+        # EMPTY content — so from at least Aug to Nov 2026 every summary was
+        # '' (102 of 112 summarized sessions), and each '' overwrote any
+        # earlier good summary. Measured fix: 4.9s on the E4B, real summary.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    r = requests.post(SUMMARIZER, json=_inject_model(payload, SUMMARIZER),
+                      headers=_hdrs(SUMMARIZER), timeout=60)
+    r.raise_for_status()
+    return _strip_think(
+        _resp_json(r)["choices"][0]["message"]["content"] or "").strip()
+
+
+def web_search(query: str, time_range=None) -> list:
+    """Query the local SearXNG JSON API. Returns the result list (possibly empty).
+
+    Results whose URL has no host are dropped: an engine whose scraper has
+    drifted can hand back links like ``http:///go/v1/...`` (brave did, 11/2026),
+    and each one would take a numbered slot the fetcher can't fill. An empty
+    answer is logged with SearXNG's unresponsive engines, because the route
+    falls back to model knowledge quietly — engines blocking us (CAPTCHAs,
+    rate limits) once emptied every search for weeks without a trace here."""
     try:
-        r = requests.get(SEARXNG_URL,
-                         params={"q": query, "format": "json"},
-                         timeout=10)
-        r.raise_for_status()
-        return r.json().get("results", []) or []
+        results, dead = _searxng_query(query, time_range)
     except Exception as e:
         print(f"[search] searxng error: {e}")
         return []
+    if not results:
+        print(f"[search] no results for {query[:80]!r}"
+              + (f" (past {time_range})" if time_range else "")
+              + (f" — unresponsive engines: {dead}" if dead else ""))
+    return results
+
+
+# ---- search query rewrite ---------------------------------------------------
+# The search route sent the user's message to SearXNG verbatim. Mid-chat that
+# is often no query at all — "how much is a can of them at Walmart?", "and in
+# Portland?", "more" — so the engines got the pronoun and the answer came back
+# about something else. With earlier turns in the chat, the summarizer model
+# (small, its own server: the 8087 prompt cache is left alone) rewrites the
+# message into a standalone query; the first message of a chat is searched as
+# typed. Any failure falls back to the message itself.
+SEARCH_REWRITE_TURNS = 3       # exchanges shown to the rewriter
+SEARCH_REWRITE_Q_CHARS = 400   # per earlier question
+SEARCH_REWRITE_A_CHARS = 900   # per earlier answer (its opening names the topic)
+SEARCH_REWRITE_SYSTEM = (
+    "You turn the user's latest message into ONE web search query. Use the "
+    "conversation only to work out what the message refers to (it, them, that, "
+    "there, the second one, and the follow-up questions that leave the subject "
+    "out). Keep names, places, products, models and numbers exactly as written. "
+    "If the latest message already makes sense on its own, return it unchanged. "
+    "Today is {today}; add a year only when the user asks about something "
+    "current, latest or recent. Write it the way a person types into a search "
+    "engine: the subject and what they want to know about it, not a sentence "
+    "copied from the conversation. Reply with the query alone: no quotes, no "
+    "explanation, no answer.")
+
+
+def _adds_context(query: str, question: str) -> bool:
+    """True when the rewrite brought in words the user did not type — the
+    case worth showing under Sources. A trimmed or reworded copy of the
+    message ("latest news bird flu outbreak") is not."""
+    typed = set(re.findall(r"\w+", question.lower()))
+    return any(w not in typed for w in re.findall(r"\w+", query.lower()))
+
+
+def _search_query(question: str, history: list, today=None) -> str:
+    """The query to search for `question` given the chat so far — the message
+    itself when there is no history or the rewrite fails."""
+    if not history:
+        return question
+    convo = []
+    for h in history[-SEARCH_REWRITE_TURNS:]:
+        a = _without_sources(h.get("a") or "")
+        convo.append(f"User: {(h.get('q') or '')[:SEARCH_REWRITE_Q_CHARS]}\n"
+                     f"Assistant: {a[:SEARCH_REWRITE_A_CHARS]}")
+    today = today or time.strftime("%B %-d, %Y")
+    payload = {
+        "messages": [
+            {"role": "system",
+             "content": SEARCH_REWRITE_SYSTEM.format(today=today)},
+            {"role": "user",
+             "content": "Conversation so far:\n" + "\n\n".join(convo)
+                        + f"\n\nLatest message: {question[:1500]}"},
+        ],
+        "temperature": 0,
+        "max_tokens": 60,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},  # see _summarize_reply
+    }
+    try:
+        r = requests.post(SUMMARIZER, json=_inject_model(payload, SUMMARIZER),
+                          headers=_hdrs(SUMMARIZER), timeout=20)
+        r.raise_for_status()
+        out = _strip_think(_resp_json(r)["choices"][0]["message"]["content"] or "")
+    except Exception as e:
+        print(f"[search] query rewrite failed ({e}) — searching the message as typed")
+        return question
+    line = next((ln for ln in out.splitlines() if ln.strip()), "")
+    q = re.sub(r"^\s*(search\s+)?query\s*:\s*", "", line, flags=re.I).strip(" \t\"'`*")
+    # A runaway reply is an answer, not a query; searching it finds nothing.
+    if not q or len(q) > 200 or len(q.split()) > 25:
+        print(f"[search] query rewrite unusable ({out[:80]!r}) — searching the message as typed")
+        return question
+    return q
+
+
+# ---- recent pages -------------------------------------------------------------
+# Live 11/2026: "When is the next launch?" was answered from pages written
+# before the launch it called upcoming, contradicting the answer just before
+# it. The engines rank an old, well-linked page above this month's news, and
+# the model knew neither today's date nor how old each page was. So the answer
+# prompt carries today's date, each fetched page carries its own dates, and a
+# question about what is next, latest or current searches the past year
+# first, topped up from the unfiltered search when that finds too little.
+SEARCH_RECENT_RANGE = "year"   # SearXNG time_range for those questions
+_RECENT_RE = re.compile(
+    r"\b(next|upcoming|latest|newest|current(ly)?|recent(ly)?|now|today|"
+    r"tonight|this (week|weekend|month|season|year)|so far|as of|anymore|"
+    r"these days|nowadays|still)\b", re.I)
+_YEAR_RE = re.compile(r"\b(19\d\d|20\d\d)\b")
+
+
+def _wants_recent(query: str, question: str, year=None) -> bool:
+    """Is this about what is next, latest or current? An earlier year makes
+    it history ("the latest iPhone in 2019"); this year or a later one makes
+    it current without the words."""
+    year = year or int(time.strftime("%Y"))
+    text = f"{query} {question}"
+    years = [int(y) for y in _YEAR_RE.findall(text)]
+    if years:
+        return max(years) >= year
+    return bool(_RECENT_RE.search(text))
+
+
+def _search_results(query: str, recent: bool) -> list:
+    """web_search, with past-year pages first when `recent`: an evergreen
+    page the filter drops comes back in the unfiltered top-up."""
+    if not recent:
+        return web_search(query)
+    results = web_search(query, time_range=SEARCH_RECENT_RANGE)
+    kept = len(results)
+    if kept < SEARCH_RESULTS:
+        seen = {r.get("url") for r in results}
+        results += [r for r in web_search(query) if r.get("url") not in seen]
+    print(f"[search] past {SEARCH_RECENT_RANGE}: {kept} results"
+          + (f", topped up to {len(results)}" if len(results) > kept else ""))
+    return results
+
+
+# A page's own metadata: Open Graph / article meta tags and schema.org JSON-LD.
+# Not <time> (any date on the page) nor Last-Modified (often the render time).
+_PUBLISHED_KEYS = ("article:published_time", "datepublished", "pubdate",
+                   "publish-date", "publication_date", "date", "dc.date",
+                   "dc.date.issued")
+_UPDATED_KEYS = ("article:modified_time", "og:updated_time", "datemodified")
+_META_RE = re.compile(r"<meta\s[^>]*>", re.I)
+_META_KEY_RE = re.compile(r"""(?:property|name|itemprop)\s*=\s*["']([^"']+)""", re.I)
+_META_VAL_RE = re.compile(r"""content\s*=\s*["']([^"']+)""", re.I)
+_LD_DATE_RE = re.compile(r'"(datePublished|dateModified)"\s*:\s*"([^"]+)"')
+
+
+def _page_dates(html: str, today=None) -> tuple:
+    """-> (published, updated) as YYYY-MM-DD from the page's own metadata,
+    "" where it gives none. A date after today is an event, not the page's."""
+    today = today or time.strftime("%Y-%m-%d")
+    found = {}
+    def keep(kind, value):
+        m = re.match(r"\s*((?:19|20)\d\d-[01]\d-[0-3]\d)", value)
+        if m and m.group(1) <= today:
+            found.setdefault(kind, m.group(1))
+    head = html[:300000]
+    for tag in _META_RE.findall(head):
+        k, v = _META_KEY_RE.search(tag), _META_VAL_RE.search(tag)
+        if k and v:
+            key = k.group(1).lower()
+            if key in _PUBLISHED_KEYS:
+                keep("published", v.group(1))
+            elif key in _UPDATED_KEYS:
+                keep("updated", v.group(1))
+    for key, value in _LD_DATE_RE.findall(html):   # Wikipedia's is at the very end
+        keep("published" if key == "datePublished" else "updated", value)
+    published, updated = found.get("published", ""), found.get("updated", "")
+    return published, (updated if updated > published else "")
+
+
+def _searxng_query(query: str, time_range=None):
+    """-> (results with a usable URL, "engine: why; ..." for engines that
+    failed). Raises on transport errors. Shared with the health check.
+    `time_range` (day/week/month/year) skips engines that can't filter."""
+    params = {"q": query, "format": "json"}
+    if time_range:
+        params["time_range"] = time_range
+    r = requests.get(SEARXNG_URL, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    results = [res for res in (data.get("results") or [])
+               if urlparse(res.get("url") or "").hostname]
+    dead = "; ".join(f"{name}: {why}" for name, why
+                     in (data.get("unresponsive_engines") or []))
+    return results, dead
 
 
 _TAG_RE   = re.compile(r"(?s)<[^>]+>")
@@ -3519,7 +3818,14 @@ def _url_is_public(url: str) -> bool:
 
 
 def _fetch_page_text(url: str) -> str:
+    """_fetch_page without the dates."""
+    return _fetch_page(url)[0]
+
+
+def _fetch_page(url: str) -> tuple:
     """Best-effort fetch + readable-text extraction. Handles HTML and PDF.
+    -> (text, published, updated); the dates come from an HTML page's own
+    metadata (_page_dates), "" when it gives none.
 
     Redirects are followed manually so each hop is re-checked against the SSRF
     guard — otherwise a public page could 302 the fetcher to an internal host."""
@@ -3527,7 +3833,7 @@ def _fetch_page_text(url: str) -> str:
         hops = 0
         while True:
             if not _url_is_public(url):
-                return ""      # internal/loopback/link-local target — refuse (SSRF)
+                return "", "", ""  # internal/loopback/link-local target — refuse (SSRF)
             r = requests.get(url, timeout=8, allow_redirects=False, headers={
                 "User-Agent": "Mozilla/5.0 (compatible; router-search/1.0)"})
             if r.is_redirect and r.headers.get("location") and hops < 4:
@@ -3538,16 +3844,17 @@ def _fetch_page_text(url: str) -> str:
         r.raise_for_status()
         ctype = r.headers.get("content-type", "").lower()
         if "pdf" in ctype or url.lower().endswith(".pdf"):
-            return _pdf_to_text(r.content)
+            return _pdf_to_text(r.content), "", ""
         if "html" not in ctype and "text" not in ctype:
-            return ""
+            return "", "", ""
+        published, updated = _page_dates(r.text)
         html = _DROP_RE.sub(" ", r.text)
         text = _TAG_RE.sub(" ", html)
         text = text.replace("&nbsp;", " ").replace("&amp;", "&")
-        return _WS_RE.sub(" ", text).strip()
+        return _WS_RE.sub(" ", text).strip(), published, updated
     except Exception as e:
         print(f"[search] fetch error {url}: {e}")
-        return ""
+        return "", "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -3881,7 +4188,7 @@ def build_search_context(results: list):
         url = r.get("url", "")
         if not url:
             continue
-        t = threading.Thread(target=lambda u=url: fetched.__setitem__(u, _fetch_page_text(u)),
+        t = threading.Thread(target=lambda u=url: fetched.__setitem__(u, _fetch_page(u)),
                              daemon=True)
         t.start(); threads.append(t)
     for t in threads:
@@ -3892,10 +4199,14 @@ def build_search_context(results: list):
         title   = (r.get("title") or "").strip()
         url     = r.get("url") or ""
         snippet = (r.get("content") or "").strip()
+        page, published, updated = fetched.get(url) or ("", "", "")
         block = f"[{i}] {title}\nURL: {url}"
+        dates = ", ".join(f"{k} {d}" for k, d in (("published", published),
+                                                  ("updated", updated)) if d)
+        if dates:
+            block += f"\nPage date: {dates}"
         if snippet:
             block += f"\nSnippet: {snippet}"
-        page = fetched.get(url, "")
         if page:
             block += f"\nExcerpt: {page[:SEARCH_FETCH_CHARS]}"
         blocks.append(block)
@@ -6818,14 +7129,14 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
         return
     url = SPECIALISTS[route]
 
-    # inject conversation memory into the system prompt if available
+    # conversation memory (the rolling summary) is added below, and only when
+    # the replayed history does not already cover the whole conversation
     system = SYSTEM_PROMPTS[route]
     with SESSIONS_LOCK:
         sess = sessions().get(session_id, {})
         summary = sess.get("summary", "")
+        summarized_turns = sess.get("turns", 0) or 0
         history = list(sess.get("history") or [])
-    if summary:
-        system += f"\n\nConversation context (older exchanges, summarized):\n{summary}"
 
     # A chat route can still be ASKED about a project it cannot see: the files
     # live in sess["files"] but only the code pipeline ever injects their
@@ -6927,22 +7238,35 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
         with JOBS_LOCK:
             JOBS[job_id]["stage"] = "searching"
         JOBS[job_id]["stage_ts"] = time.time()
-        results = web_search(question)
+        search_q = _search_query(question, history)
+        if search_q != question:
+            print(f"[search] query {search_q!r} (for {question[:80]!r})")
+        recent = _wants_recent(search_q, question)
+        results = _search_results(search_q, recent)
+        if not results and search_q != question:
+            # the rewrite found nothing; the words as typed still might
+            search_q = question
+            results = _search_results(question, recent)
         with JOBS_LOCK:
             JOBS[job_id]["stage"] = "reading"
         JOBS[job_id]["stage_ts"] = time.time()
         context, search_sources = build_search_context(results)
+        today = time.strftime("%B %-d, %Y")
         if context:
+            searched = (f' (searched for "{search_q}")'
+                        if search_q != question else "")
             user_content = (
-                "Live web search results for the question are below. Use them to "
-                "answer and cite sources inline as [n] matching the numbered "
-                f"results.\n\n{context}\n\n---\nQuestion: {question}"
+                f"Today is {today}. Live web search results for the question are "
+                f"below{searched}, each with its page's own date where the page "
+                "gives one. Use them to answer and cite sources inline as [n] "
+                f"matching the numbered results.\n\n{context}\n\n---\n"
+                f"Question: {question}"
             )
         else:
             user_content = (
-                "(Web search returned no usable results — answer from your own "
-                "knowledge and tell the user you could not verify this online.)\n\n"
-                f"{question}"
+                f"(Today is {today}. Web search returned no usable results — answer "
+                "from your own knowledge and tell the user you could not verify "
+                f"this online.)\n\n{question}"
             )
         # results are in hand; the model is now drafting the synthesized answer
         with JOBS_LOCK:
@@ -6951,8 +7275,18 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
 
     # Recent turns go in as real chat history so follow-ups ("no", "the second
     # one", a 20-questions answer) land mid-conversation, not cold.
+    replay = _history_messages(history, _history_budget(url, bool(ups)))
+    # The summary only earns its place when older exchanges are NOT replayed
+    # verbatim — dropped for budget, or already rotated out of storage. When
+    # every exchange is in the replay it is redundant, and since it changes
+    # every turn, putting it in the system prompt would also stop llama.cpp
+    # reusing its cached prompt: the whole history re-read on every message.
+    if summary and (len(replay) // 2 < len(history)
+                    or summarized_turns > len(history)):
+        system += ("\n\nConversation context (older exchanges, summarized):\n"
+                   f"{summary}")
     messages = ([{"role": "system", "content": system}]
-                + _history_messages(history)
+                + replay
                 + [{"role": "user", "content": user_content}])
 
     payload = {"messages": messages, "stream": True,
@@ -7023,8 +7357,14 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
     # Search route: append the sources the model was given, as a clickable list,
     # so the user can follow the [n] citations back to the originals.
     if route == "search" and search_sources and not final_answer.startswith("\n\n[router error"):
+        final_answer = _drop_model_sources(final_answer)
         lines = "\n".join(f"{i}. [{title or url}]({url})" for i, title, url in search_sources)
-        final_answer += f"\n\n---\n**Sources**\n{lines}"
+        # Say what was searched when it is not what the user typed, so a
+        # wrong guess about "it" is visible rather than silently answered.
+        shown = re.sub(r"[`*_\[\]<>]", "", search_q)
+        how = (f" · searched for *{shown}*"
+               if _adds_context(search_q, question) and shown else "")
+        final_answer += f"{SOURCES_MARK}{how}\n{lines}"
 
     if final_answer:
         # Non-code routes can still produce code — capture real files into
@@ -7537,8 +7877,54 @@ def upload_remove(session_id, up_id):
     return jsonify({"ok": True, "removed": removed})
 
 
-def _route_request(question, has_files, last_route, prev_q="", prev_a=""):
+# A conversation keeps the PERSONA it started with. Every message used to be
+# re-classified from scratch by a 2B model shown 300 chars of the last
+# exchange, so a recipes chat drifted to general/reasoning on "how long will
+# leftovers keep?" and lost its persona mid-conversation. Now the first
+# specific route becomes the session's mode and later messages stay on it.
+#
+# Not modes: 'general' is the classifier's fallback (an error or a bare "hi"
+# lands there), so it never locks a chat — the first real specialist does.
+# The breakout routes are ACTIONS a persona cannot perform — build code, search
+# the web, record audio, condense a document — so the classifier can still send
+# one message there; the mode survives it and the next message comes back.
+_NOT_A_MODE = {"general", "code", "search", "audio", "summarize"}
+_BREAKOUT_ROUTES = {"code", "search", "audio", "summarize"}
+
+
+# The classifier's search rule is broad ("any fact you can't be sure of"), so
+# inside a locked chat it pulled ordinary follow-ups out to the web: live
+# check 2026-11-19, a recipes chat's "How long will the leftovers keep in the
+# fridge?" went to search. Within a mode, search must be ASKED for — fresh,
+# local or priced information, or an explicit lookup.
+_NEEDS_WEB = re.compile(
+    r"https?://|\b(search|look\s*(it\s*)?up|google|latest|current(ly)?|today|"
+    r"tonight|tomorrow|yesterday|this (week|month|year)|right now|news|"
+    r"prices?|cost|cheapest|on sale|in stock|near me|nearby|open now|"
+    r"opening hours|weather|forecast|scores?|release date|recent(ly)?|"
+    r"20\d\d)\b", re.I)
+
+
+def _is_mode(route):
+    return route in SPECIALISTS and route not in _NOT_A_MODE
+
+
+# When the lock holds a message back from the persona the classifier picked,
+# the chat offers a one-click switch ("switch & ask again") under the answer.
+# Never INTO reasoning: every "why…?" follow-up lands there. Live check
+# 2026-11-19, 17 real follow-ups and 6 real changes of subject inside recipes,
+# creative and reasoning chats: offering any other mode was noise on 4 of 17
+# follow-ups; leaving out reasoning cut that to 1 and still caught 4 of 6.
+def _suggest_switch(held, mode):
+    return held if (_is_mode(held) and held != mode
+                    and held != "reasoning") else ""
+
+
+def _route_request(question, has_files, last_route, prev_q="", prev_a="",
+                   mode="", held=None):
     """Pick the route for one message. Returns (route, ask_only).
+    Pass a list as `held` to learn what the classifier wanted when the
+    persona lock overrode it (it gets that route appended).
 
     Extracted from ask() so the decision can be tested without a request, a
     session, or a live classifier — three separate bugs have landed in this
@@ -7572,7 +7958,16 @@ def _route_request(question, has_files, last_route, prev_q="", prev_a=""):
     if has_files and (question.rstrip().endswith("?")
                       or _ASKS_PROJECT.match(question)):
         return "code", True
-    return classify(question, prev_q, prev_a, last_route), False
+    route = classify(question, prev_q, prev_a, last_route)
+    # Persona lock (see _NOT_A_MODE): only a breakout ACTION leaves the mode,
+    # and a web search only when the message actually asks for the web.
+    if _is_mode(mode) and route != mode and (
+            route not in _BREAKOUT_ROUTES
+            or (route == "search" and not _NEEDS_WEB.search(question))):
+        if held is not None:
+            held.append(route)
+        return mode, False
+    return route, False
 
 
 @app.route("/ask", methods=["POST"])
@@ -7604,11 +7999,21 @@ def ask():
     history, last_route = _recent_context(session_id)
     prev_q = history[-1]["q"] if history else ""
     prev_a = history[-1]["a"] if history else ""
+    with SESSIONS_LOCK:
+        mode = sessions().get(session_id, {}).get("mode", "")
 
     # Pasted errors about an in-progress build must reach the code route even
     # when the classifier would call them 'general'.
+    held = []
     route, ask_only = _route_request(question, has_files, last_route,
-                                     prev_q, prev_a)
+                                     prev_q, prev_a, mode, held)
+    suggest = _suggest_switch(held[0], mode) if held else ""
+    if not _is_mode(mode) and _is_mode(route):
+        # the first specific persona this chat reaches becomes its mode
+        mode = route
+        with SESSIONS_LOCK:
+            sessions().setdefault(session_id, {})["mode"] = mode
+        _save_memory()
 
     # The code route is the only one that EXECUTES model-written code on this box
     # (headless browser + node). Limit it to admins. Non-admins get a clean
@@ -7643,7 +8048,9 @@ def ask():
 
     spawn_owned(target=run_job, args=(job_id, route, question, session_id, effort),
                 daemon=True).start()
-    return jsonify({"job_id": job_id, "route": route, "effort": effort})
+    return jsonify({"job_id": job_id, "route": route, "effort": effort,
+                    "mode": mode if _is_mode(mode) else "",
+                    "suggest": suggest})
 
 
 @app.route("/progress/<job_id>")
@@ -7836,7 +8243,38 @@ def get_memory(session_id):
             "turns": sess.get("turns", 0),
             # names only — file contents can be large
             "files": sorted((sess.get("files") or {}).keys()),
+            "mode": sess.get("mode", "") if _is_mode(sess.get("mode", "")) else "",
         })
+
+
+@app.route("/modes")
+def list_modes():
+    """The specialists a chat can be held to (see _NOT_A_MODE) — what the
+    header pill and the welcome screen offer. Not under /settings: every
+    user picks modes, and routes_meta there is admin-only."""
+    with CONFIG_LOCK:
+        routes = {n: dict(r) for n, r in ROUTER_CONFIG["routes"].items()}
+    return jsonify([{"name": n, "color": r.get("color", ""),
+                     "custom": bool(r.get("custom")),
+                     "subject": str(r.get("subject", ""))[:200]}
+                    for n, r in routes.items() if _is_mode(n)])
+
+
+@app.route("/memory/<session_id>/mode", methods=["POST"])
+def set_mode(session_id):
+    """Hold this chat to a specialist, or '' to let Crewe pick again — the
+    next specialist question then becomes the mode, as in a new chat."""
+    mode = str((request.json or {}).get("mode") or "").strip()
+    if mode and not _is_mode(mode):
+        return jsonify({"error": f"'{mode}' is not a specialist a chat can "
+                                 "stay with"}), 400
+    with SESSIONS_LOCK:
+        if mode:
+            sessions().setdefault(session_id, {})["mode"] = mode
+        elif session_id in sessions():
+            sessions()[session_id].pop("mode", None)
+    _save_memory()
+    return jsonify({"ok": True, "mode": mode})
 
 
 @app.route("/memory/<session_id>", methods=["DELETE"])
@@ -8971,6 +9409,39 @@ PAGE = r"""<!DOCTYPE html>
   .spend-tag { font:500 11.5px 'DM Sans',sans-serif; color:var(--muted);
                border:1px solid var(--border); border-radius:999px;
                padding:3px 9px; cursor:default; }
+  .spend-tag.health-bad { color:#c0392b; border-color:#c0392b; cursor:pointer;
+                          text-decoration:none; }
+
+  /* ---- chat mode: header pill + menu, welcome badges, switch hint ---- */
+  .mode-wrap { position:relative; display:inline-flex; }
+  .mode-pill { height:auto; margin-bottom:0; border:0; cursor:pointer; }
+  .badge.auto { background:transparent; color:var(--muted);
+                box-shadow:inset 0 0 0 1px var(--border); }
+  .mode-menu { position:absolute; top:calc(100% + 6px); right:0; z-index:70;
+               min-width:260px; max-width:calc(100vw - 24px); padding:6px;
+               background:var(--panel); border:1px solid var(--border); border-radius:10px;
+               box-shadow:0 6px 24px rgba(80,50,20,.14);
+               display:flex; flex-direction:column; gap:2px; }
+  .mode-menu[hidden] { display:none; }
+  .mode-opt { display:flex; align-items:center; gap:10px; width:100%; height:auto;
+              background:none; color:var(--ink); border:0; border-radius:7px;
+              padding:7px 9px; text-align:left; letter-spacing:0;
+              font:400 12.5px/1.35 'DM Sans',sans-serif; cursor:pointer; }
+  .mode-opt:hover, .mode-opt:focus-visible { background:var(--panel2); opacity:1; outline:none; }
+  .mode-opt .badge { margin-bottom:0; flex:0 0 auto; }
+  .mo-desc { color:var(--muted); flex:1; min-width:0; overflow:hidden;
+             text-overflow:ellipsis; white-space:nowrap; }
+  .mo-on { color:var(--accent); font-weight:700; flex:0 0 auto; }
+  .es-legend .badge.pick { cursor:pointer; transition:transform .15s, box-shadow .15s; }
+  .es-legend .badge.pick:hover { transform:translateY(-1px); }
+  .es-legend .badge.sel { box-shadow:0 0 0 1.5px currentColor; }
+  .mode-sug { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:12px;
+              padding-top:10px; border-top:1px dashed var(--border);
+              font-size:12.5px; color:var(--muted); }
+  .mode-sug .badge { margin-bottom:0; }
+  .mode-sug-x { background:none; border:0; color:var(--muted); cursor:pointer;
+                height:auto; padding:2px 4px; font-size:12px; margin-left:auto; }
+  .mode-sug-x:hover { color:var(--accent); }
 
   /* ---- attachments ---- */
   .attach-row { max-width:820px; margin:0 auto 8px; display:flex; flex-wrap:wrap;
@@ -9159,6 +9630,8 @@ PAGE = r"""<!DOCTYPE html>
       <a href="/agent" class="admin-only" style="display:none">🛠 agent</a>
       <a href="/settings" class="admin-only" style="display:none">⚙ settings</a>
       <span id="spendTag" class="spend-tag" style="display:none"></span>
+      <a href="/admin#health" id="healthTag" class="spend-tag health-bad" style="display:none"
+         title="Crewe's health check found a problem — click for details"></a>
       <a href="/help">? help</a>
       <a href="/account">👤 account</a>
       <a href="__SOURCE_URL__" target="_blank" rel="noopener"
@@ -9168,10 +9641,23 @@ PAGE = r"""<!DOCTYPE html>
     // Hide admin-only nav items from non-admins (the routes are server-gated
     // regardless; this just avoids showing links that 403).
     fetch('/whoami').then(r=>r.json()).then(w=>{
-      if(w && w.is_admin) document.querySelectorAll('.admin-only').forEach(e=>e.style.display='');
+      if(!(w && w.is_admin)) return;
+      document.querySelectorAll('.admin-only').forEach(e=>e.style.display='');
+      // Admins see a red tag while the background health check finds a failure.
+      fetch('/admin/health.json').then(r=>r.json()).then(h=>{
+        const n=(h&&h.fails)||0, t=document.getElementById('healthTag');
+        if(!n || !t) return;
+        t.textContent='⚠ '+n+(n===1?' check failing':' checks failing');
+        t.style.display='';
+      }).catch(()=>{});
     }).catch(()=>{});
     </script>
     <div class="mem-row">
+      <span class="mode-wrap">
+        <button id="modePill" class="badge auto mode-pill" aria-haspopup="true" aria-expanded="false"
+                title="This chat's specialist — click to change">auto ▾</button>
+        <div id="modeMenu" class="mode-menu" role="menu" hidden></div>
+      </span>
       <span id="memBadge" class="mem-badge">💭 loading…</span>
       <button id="memClear" class="mem-btn">Clear memory</button>
       <label class="theme-toggle" title="Toggle dark mode">
@@ -9200,7 +9686,7 @@ PAGE = r"""<!DOCTYPE html>
       <div id="emptyState">
         <div class="es-card">
           <h2 class="es-title">Ask anything.</h2>
-          <p class="es-sub">Crewe reads your question and routes it to the right specialist.</p>
+          <p class="es-sub" id="esSub">Crewe reads your question and routes it to the right specialist.</p>
           <div class="es-legend">
             <span class="badge recipes"   data-route="recipes">recipes</span>
             <span class="badge creative"  data-route="creative">creative</span>
@@ -9257,6 +9743,9 @@ const emptyState = document.getElementById('emptyState');
 // stashed node would be an orphan nothing can see).
 const LIVE = Object.create(null);
 function liveJob(){ return LIVE[sessionId] || null; }
+// The visible chat's mode (the specialist it is held to, '' = Crewe picks)
+// and the specialists a chat can be held to, from /modes.
+let chatMode = '', MODES = [];
 
 // Send ⇄ Stop reflects only the chat you are LOOKING at.
 function syncGo(){
@@ -9299,10 +9788,13 @@ function shuffle(a){ for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.rand
 function renderExamples(){
   const box=document.getElementById('esExamples'); if(!box) return;
   const byRoute={}; EXAMPLE_POOL.forEach(e=>{ (byRoute[e.route]=byRoute[e.route]||[]).push(e); });
-  const routes=shuffle(Object.keys(byRoute)).slice(0,4);
+  // A chat already held to a specialist only offers that specialist's
+  // examples — any other would be answered in its voice.
+  const picks=chatMode
+    ? shuffle((byRoute[chatMode]||[]).slice())
+    : shuffle(Object.keys(byRoute)).slice(0,4).map(r=>byRoute[r][Math.floor(Math.random()*byRoute[r].length)]);
   box.innerHTML='';
-  routes.forEach(r=>{
-    const arr=byRoute[r]; const e=arr[Math.floor(Math.random()*arr.length)];
+  picks.forEach(e=>{
     const b=document.createElement('button'); b.className='es-ex'; b.dataset.q=e.q;
     b.innerHTML=`<span class="es-ex-q">${escapeHtml(e.label)}</span><span class="badge ${e.route}">${e.route}</span>`;
     b.addEventListener('click',()=>{ q.value=e.q; q.style.height='auto'; q.style.height=Math.min(q.scrollHeight,160)+'px'; ask(); });
@@ -9468,7 +9960,7 @@ function switchSession(id){
   sessionId=id; localStorage.setItem('routerCurrentSession',id);
   currentMsgs=getMsgs(id);
   inner.innerHTML='';
-  currentMsgs.forEach(renderStoredMsg);
+  currentMsgs.forEach(renderStoredMsg); restoreSuggestion();
   attachLive();
   scrollDown(); renderSidebar(); loadMemory(); updateEmptyState(); closeSb();
   refreshAttachments(); syncGo();
@@ -9497,7 +9989,7 @@ function deleteSession(id){
     else sessionId=sessions[0].id;
     localStorage.setItem('routerCurrentSession',sessionId);
     currentMsgs=getMsgs(sessionId);
-    inner.innerHTML=''; currentMsgs.forEach(renderStoredMsg); attachLive();
+    inner.innerHTML=''; currentMsgs.forEach(renderStoredMsg); restoreSuggestion(); attachLive();
     scrollDown(); loadMemory(); updateEmptyState();
   }
   renderSidebar(); syncGo();
@@ -9526,6 +10018,7 @@ document.getElementById('newChat').addEventListener('click',()=>{
   // its own answer, so starting a new chat never costs you the old answer.
   const s=createSession(); sessionId=s.id;
   localStorage.setItem('routerCurrentSession',sessionId);
+  chatMode=''; renderModePill();
   currentMsgs=[]; inner.innerHTML=''; renderSidebar(); loadMemory();
   updateEmptyState(); closeSb(); syncGo(); q.focus();
 });
@@ -9565,17 +10058,21 @@ function renderStoredMsg(msg){
 }
 
 // restore current session on load
-currentMsgs.forEach(renderStoredMsg);
+currentMsgs.forEach(renderStoredMsg); restoreSuggestion();
 scrollDown(); updateEmptyState();
 
 // ---- memory -----------------------------------------------------------------
 async function loadMemory(){
+  const sid=sessionId;
   try{
-    const m=await fetch('/memory/'+sessionId).then(r=>r.json());
-    updateMemoryUI(m);
+    const m=await fetch('/memory/'+sid).then(r=>r.json());
+    if(sid===sessionId) updateMemoryUI(m);   // not a chat you have since left
   }catch(e){}
 }
 function updateMemoryUI(m){
+  const was=chatMode;
+  chatMode=(m&&m.mode)||''; renderModePill();
+  if(was!==chatMode && !inner.children.length) renderExamples();
   const turns=(m&&m.turns)||0, summary=(m&&m.summary)||'', files=(m&&m.files)||[];
   let badge=turns>0?`💭 ${turns} turn${turns!==1?'s':''}`:'💭 no memory';
   if(files.length) badge+=` · 📁 ${files.length}`;
@@ -9599,6 +10096,140 @@ document.getElementById('memClear').addEventListener('click',async()=>{
   document.getElementById('memPanelWrap').style.display='none';
 });
 loadMemory();
+
+// ---- chat mode --------------------------------------------------------------
+// A chat stays with the specialist it starts with (the server's persona
+// lock). The header pill shows and changes it, the welcome badges pick it
+// before the first message, and a hint under an answer offers a switch when
+// the lock kept a message from the specialist the classifier wanted.
+const MODE_DESC = {recipes:'cooking, meals, what to make',
+                   creative:'stories, poems, names, ideas',
+                   reasoning:'explanations, step-by-step thinking',
+                   review:'reviewing code you paste or attach'};
+const modePill=document.getElementById('modePill');
+const modeMenu=document.getElementById('modeMenu');
+function escAttr(s){ return escapeHtml(String(s)).replace(/"/g,'&quot;'); }
+function modeDesc(name){
+  const m=MODES.find(x=>x.name===name);
+  return MODE_DESC[name] || (m&&m.subject) || '';
+}
+
+function renderModePill(){
+  const m=chatMode;
+  modePill.className='badge mode-pill '+(m||'auto');
+  modePill.textContent=(m||'auto')+' ▾';
+  modePill.title=m ? `This chat stays with ${m} — click to change`
+                   : 'Crewe picks the specialist from your first question — click to choose one';
+  document.querySelectorAll('.es-legend .badge').forEach(b=>
+    b.classList.toggle('sel', !!m && b.dataset.route===m));
+  const sub=document.getElementById('esSub');
+  if(sub) sub.innerHTML = m
+    ? `This chat will stay with <b>${escapeHtml(m)}</b> — pick it again to let Crewe choose.`
+    : 'Crewe reads your question and routes it to the right specialist'
+      + (MODES.length ? ' — or pick one below to start with it.' : '.');
+  // a switch hint for the mode the chat is now in has done its job
+  inner.querySelectorAll('.mode-sug').forEach(x=>{ if(x.dataset.mode===m) x.remove(); });
+}
+
+async function setMode(sid,mode){
+  try{
+    const r=await(await fetch('/memory/'+encodeURIComponent(sid)+'/mode',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode})})).json();
+    if(r.error) throw new Error(r.error);
+    if(sid===sessionId){
+      chatMode=r.mode||''; renderModePill();
+      if(!inner.children.length) renderExamples();
+    }
+    return true;
+  }catch(e){ alert('Could not change this chat\'s mode: '+e.message); return false; }
+}
+
+function closeModeMenu(){ modeMenu.hidden=true; modePill.setAttribute('aria-expanded','false'); }
+function openModeMenu(){
+  const opt=(name,desc)=>`<button class="mode-opt" role="menuitem" data-mode="${escAttr(name)}">
+      <span class="badge ${escAttr(name||'auto')}">${escapeHtml(name||'auto')}</span>
+      <span class="mo-desc" title="${escAttr(desc)}">${escapeHtml(desc)}</span>
+      ${name===chatMode?'<span class="mo-on">✓</span>':''}</button>`;
+  modeMenu.innerHTML=opt('','Crewe picks from your next question')
+    + MODES.map(m=>opt(m.name,modeDesc(m.name))).join('');
+  modeMenu.style.left=''; modeMenu.style.right='';
+  modeMenu.hidden=false; modePill.setAttribute('aria-expanded','true');
+  // the pill sits at the right of a header that wraps on phones
+  if(modeMenu.getBoundingClientRect().left<8){ modeMenu.style.right='auto'; modeMenu.style.left='0'; }
+  const cur=modeMenu.querySelector(`.mode-opt[data-mode="${escAttr(chatMode)}"]`);
+  (cur||modeMenu.querySelector('.mode-opt')).focus();
+}
+modePill.addEventListener('click',e=>{
+  e.stopPropagation();
+  modeMenu.hidden ? openModeMenu() : closeModeMenu();
+});
+modeMenu.addEventListener('click',e=>{
+  const o=e.target.closest('.mode-opt'); if(!o) return;
+  e.stopPropagation(); closeModeMenu();
+  if(o.dataset.mode!==chatMode) setMode(sessionId,o.dataset.mode);
+});
+document.addEventListener('click',e=>{
+  if(!modeMenu.hidden && !e.target.closest('.mode-wrap')) closeModeMenu();
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape' && !modeMenu.hidden){ closeModeMenu(); modePill.focus(); }
+});
+
+// Welcome screen: the badges that are modes start the chat with that mode;
+// picking the chosen one again goes back to letting Crewe choose.
+function wireLegend(){
+  document.querySelectorAll('.es-legend .badge').forEach(b=>{
+    const ok=MODES.some(m=>m.name===b.dataset.route);
+    b.classList.toggle('pick',ok);
+    if(ok){ b.setAttribute('role','button'); b.tabIndex=0;
+            b.setAttribute('aria-label','Start this chat with '+b.dataset.route); }
+  });
+}
+function pickLegend(e){
+  const b=e.target.closest('.es-legend .badge.pick'); if(!b) return;
+  if(e.type==='keydown'){ if(e.key!=='Enter'&&e.key!==' ') return; e.preventDefault(); }
+  setMode(sessionId, chatMode===b.dataset.route ? '' : b.dataset.route);
+}
+document.querySelector('.es-legend').addEventListener('click',pickLegend);
+document.querySelector('.es-legend').addEventListener('keydown',pickLegend);
+
+fetch('/modes').then(r=>r.json()).then(list=>{
+  MODES=Array.isArray(list)?list:[];
+  wireLegend(); renderModePill();
+}).catch(()=>{});
+renderModePill();
+
+// "This one may suit creative better" under an answer the lock kept in the
+// chat's mode. One click switches the chat and asks the question again.
+function addModeSuggestion(el,mode,question,sid){
+  if(!mode || mode===chatMode || !el) return;
+  const d=document.createElement('div');
+  d.className='mode-sug'; d.dataset.mode=mode;
+  d.innerHTML=`<span>This one may suit</span><span class="badge ${escAttr(mode)}">${escapeHtml(mode)}</span>
+    <span>better.</span><button class="fall">Switch &amp; ask again</button>
+    <button class="mode-sug-x" title="Dismiss">✕</button>`;
+  d.querySelector('.fall').addEventListener('click',async()=>{
+    if(liveJob()) return;
+    if(!(await setMode(sid,mode))) return;
+    const draft=q.value; q.value=question; ask(); q.value=draft;   // keep what you were typing
+  });
+  d.querySelector('.mode-sug-x').addEventListener('click',()=>{ d.remove(); dropSuggestion(sid); });
+  el.appendChild(d);
+}
+function dropSuggestion(sid){
+  const msgs = sid===sessionId ? currentMsgs : getMsgs(sid);
+  const last=msgs[msgs.length-1];
+  if(last && last.suggest){ delete last.suggest; saveMsgs(sid,msgs); }
+}
+// Only the newest answer carries the hint, so history never fills up with them.
+function restoreSuggestion(){
+  const last=currentMsgs[currentMsgs.length-1];
+  if(!last || last.type!=='assistant' || !last.suggest) return;
+  const asked=[...currentMsgs].reverse().find(m=>m.type==='user');
+  const els=inner.querySelectorAll('.msg:not(.user)');
+  if(asked) addModeSuggestion(els[els.length-1],last.suggest,asked.content,sessionId);
+}
 
 // ---- chat -------------------------------------------------------------------
 function addUser(question){
@@ -9667,6 +10298,7 @@ async function ask(){
   // the user switches sessions before the answer lands.
   const sid=sessionId;
   q.value=''; q.style.height='auto'; go.disabled=true;
+  inner.querySelectorAll('.mode-sug').forEach(x=>x.remove());
 
   addUser(question);
   pushMsg({type:'user',content:question,timestamp:Date.now()});
@@ -9688,9 +10320,10 @@ async function ask(){
     return;
   }
 
-  const route=res.route, jobId=res.job_id;
+  const route=res.route, jobId=res.job_id, suggest=res.suggest||'';
   const job={jobId,route,tokens:0,stage:'drafting',stageAge:0,el:reply,poll:null};
   LIVE[sid]=job;
+  if(sid===sessionId && 'mode' in res){ chatMode=res.mode||''; renderModePill(); }
   if(sid===sessionId){ syncGo(); renderPending(reply,route,0); }
   renderSidebar();
 
@@ -9700,9 +10333,12 @@ async function ask(){
     if(p.done){
       clearInterval(job.poll); delete LIVE[sid];
       // File it FIRST, so the answer is saved even for a chat nobody is watching.
-      pushMsgTo(sid,{type:'assistant',content:p.answer,route,audio:p.audio,timestamp:Date.now()});
+      const msg={type:'assistant',content:p.answer,route,audio:p.audio,timestamp:Date.now()};
+      if(suggest) msg.suggest=suggest;
+      pushMsgTo(sid,msg);
       if(sid===sessionId){
         renderAnswer(job.el,route,p.answer,p.audio);
+        addModeSuggestion(job.el,suggest,question,sid);
         syncGo(); q.focus(); setTimeout(loadMemory,3000);
       }
       renderSidebar();
@@ -14341,7 +14977,281 @@ def agent_test(run_id):
         AGENT_ACTIVE.release()
 
 
+# ---- health check -------------------------------------------------------------
+# /healthz only proves Flask is up, and it said ok all through 2026's silent
+# failures: the summarizer returned '' for months (thinking ate its budget), its
+# server was down after a reboot, and every web search came back empty. This
+# exercises each piece the way real requests do, on a timer, and shows admins
+# the result: a card on /admin and a red tag in the chat header while anything
+# fails. Metered APIs are only asked for their model list — no tokens spent.
+HEALTH_FILE = os.environ.get("CREWE_HEALTH_FILE",
+                             os.path.expanduser("~/crewe_health.json"))
+HEALTH_INTERVAL = float(os.environ.get("CREWE_HEALTH_INTERVAL_HOURS", "6")) * 3600
+HEALTH_RETRY = 600          # while something fails, look again every 10 min
+HEALTH_FIRST_DELAY = 90     # after a start: let the model servers finish loading
+HEALTH_PROBE_TIMEOUT = 90
+_HEALTH_RUN_LOCK = threading.Lock()
+
+
+def _load_health():
+    try:
+        with open(HEALTH_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+_HEALTH: dict = _load_health()   # the last report, shown until the next run
+
+
+def _health_targets():
+    """Every backend a route or role actually uses, one entry per URL (two
+    config ids can share a server, e.g. brain-26b and quickqwen on 8087)."""
+    cfg = ROUTER_CONFIG or {}
+    routes, roles = cfg.get("routes") or {}, cfg.get("roles") or {}
+    by_url: dict = {}
+    for b in cfg.get("backends") or []:
+        uses = ([n for n, r in routes.items() if r.get("backend") == b["id"]]
+                + [role for role, bid in roles.items() if bid == b["id"]])
+        if not uses:
+            continue                      # configured but unused: not our problem
+        url = _chat_url(b)
+        t = by_url.setdefault(url, {"url": url, "ids": [], "uses": [], "backend": b})
+        t["ids"].append(b["id"])
+        t["uses"] += [u for u in uses if u not in t["uses"]]
+    return list(by_url.values())
+
+
+def _health_alive(base):
+    for path in ("/health", ""):          # llama.cpp has /health; Ollama answers on /
+        try:
+            if requests.get(base + path, timeout=5).ok:
+                return True
+        except requests.RequestException:
+            pass
+    return False
+
+
+def _health_backend(t):
+    url, b = t["url"], t["backend"]
+    base = url.rsplit("/v1/", 1)[0]
+    if b.get("paid") or _kind(b) == "anthropic":
+        # Metered: prove the server and the key without spending tokens.
+        r = requests.get(f"{base}/v1/models", headers=_hdrs(url), timeout=15)
+        if r.status_code in (401, 403):
+            return "fail", f"API key rejected (HTTP {r.status_code})"
+        r.raise_for_status()
+        return "ok", "reachable, key accepted (no tokens spent)"
+    payload = {"messages": [{"role": "user",
+                             "content": "Reply with the single word: ready"}],
+               "temperature": 0.0, "max_tokens": 400, "stream": False,
+               "chat_template_kwargs": {"enable_thinking": False}}
+    try:
+        r = requests.post(url, json=_inject_model(payload, url), headers=_hdrs(url),
+                          timeout=HEALTH_PROBE_TIMEOUT)
+    except requests.Timeout:
+        if _health_alive(base):
+            return "warn", f"busy — no reply within {HEALTH_PROBE_TIMEOUT} s"
+        return "fail", "not answering"
+    r.raise_for_status()
+    choice = (_resp_json(r).get("choices") or [{}])[0]
+    text = _strip_think((choice.get("message") or {}).get("content") or "").strip()
+    if not text:
+        return "fail", ("replied with nothing (finish_reason "
+                        f"{choice.get('finish_reason')!r}) — every answer from it will be blank")
+    return "ok", "answered"
+
+
+def _health_classifier():
+    if "recipes" not in VALID:
+        return "ok", "skipped — no recipes route to test routing with"
+    got = classify("Give me a recipe for banana pancakes.")
+    if got == "recipes":
+        return "ok", "sent a recipe question to recipes"
+    return "fail", (f"sent a recipe question to '{got}' (it falls back to "
+                    "'general' when the classifier fails)")
+
+
+def _health_summarizer():
+    text = _summarize_reply("", "I'm making chickpea curry for six people.",
+                            "Here is a chickpea and spinach curry that serves six.")
+    if not text:
+        return "fail", "summary came back empty — chats lose their memory"
+    return "ok", f"wrote a {len(text.split())}-word summary"
+
+
+def _health_search():
+    results, dead = _searxng_query("python requests timeout example")
+    engines = sorted({e for r in results for e in r.get("engines") or []})
+    failing = f"; failing: {dead}" if dead else ""
+    if not results:
+        return "fail", "no results — the search route answers from model memory" + failing
+    if len(engines) < 2:
+        return "warn", f"only {engines[0] if engines else 'one engine'} answered" + failing
+    return "ok", f"{len(results)} results from {', '.join(engines)}" + failing
+
+
+def _health_images():
+    n = len(_image_search("banana pancakes", n=3))
+    if not n:
+        return "warn", "no images found — new recipe cards get no photo"
+    return "ok", f"{n} photo candidates"
+
+
+def _health_voice():
+    missing = [os.path.basename(p) for p in (PIPER_BIN, PIPER_VOICE)
+               if not os.path.exists(p)]
+    if missing:
+        return "fail", "audio replies can't be recorded — missing " + ", ".join(missing)
+    return "ok", "Piper and its voice are installed"
+
+
+def _health_disk():
+    du = shutil.disk_usage(USERDATA_ROOT if os.path.isdir(USERDATA_ROOT)
+                           else os.path.expanduser("~"))
+    gb, pct = du.free / 1e9, du.free * 100 / du.total
+    msg = f"{gb:.0f} GB free ({pct:.0f}%)"
+    if gb < 2:
+        return "fail", msg
+    if gb < 10 or pct < 5:
+        return "warn", msg
+    return "ok", msg
+
+
+def _health_timed(fn, *args):
+    t0 = time.time()
+    try:
+        status, detail = fn(*args)
+    except requests.ConnectionError:
+        status, detail = "fail", "can't connect — is it running?"
+    except requests.Timeout:
+        status, detail = "fail", "timed out"
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        status, detail = "fail", f"HTTP {code}"
+    except Exception as e:
+        status, detail = "fail", f"{type(e).__name__}: {e}"[:200]
+    return status, detail, int((time.time() - t0) * 1000)
+
+
+def run_health_check():
+    """Run every check in parallel, keep and save the report, log what's wrong."""
+    global _HEALTH
+    from concurrent.futures import ThreadPoolExecutor
+    with _HEALTH_RUN_LOCK:
+        t0 = time.time()
+        jobs = [(f"backend:{t['url']}", "Model server: " + ", ".join(t["ids"]),
+                 "used by " + ", ".join(t["uses"]), _health_backend, (t,))
+                for t in _health_targets()]
+        jobs += [("routing", "Routing", "the classifier picks each chat's type",
+                  _health_classifier, ()),
+                 ("summarizer", "Conversation memory", "the rolling summary",
+                  _health_summarizer, ()),
+                 ("search", "Web search", "SearXNG engines", _health_search, ()),
+                 ("images", "Recipe photos", "SearXNG image search", _health_images, ()),
+                 ("voice", "Audio replies", "Piper text-to-speech", _health_voice, ()),
+                 ("disk", "Disk space", "user data", _health_disk, ())]
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [(key, label, uses, ex.submit(_health_timed, fn, *args))
+                    for key, label, uses, fn, args in jobs]
+        prev = {c["key"]: c for c in (_HEALTH.get("checks") or [])}
+        now = time.time()
+        checks = []
+        for key, label, uses, fut in futs:
+            status, detail, ms = fut.result()
+            was = prev.get(key) or {}
+            since = None
+            if status != "ok":
+                since = (was.get("since") if was.get("status", "ok") != "ok"
+                         and was.get("since") else now)
+            checks.append({"key": key, "label": label, "uses": uses,
+                           "status": status, "detail": detail, "ms": ms,
+                           "since": since})
+        report = {"ts": now, "took_ms": int((now - t0) * 1000), "checks": checks,
+                  "fails": sum(c["status"] == "fail" for c in checks),
+                  "warns": sum(c["status"] == "warn" for c in checks)}
+        _HEALTH = report
+        try:
+            tmp = f"{HEALTH_FILE}.tmp{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(report, f, indent=1)
+            os.replace(tmp, HEALTH_FILE)
+        except OSError as e:
+            print(f"[health] could not save {HEALTH_FILE}: {e}")
+    for c in checks:
+        if c["status"] != "ok":
+            print(f"[health] {c['status'].upper()} {c['label']}: {c['detail']}")
+    print(f"[health] {len(checks) - report['fails'] - report['warns']} ok, "
+          f"{report['warns']} warn, {report['fails']} fail "
+          f"({report['took_ms'] / 1000:.1f} s)")
+    return report
+
+
+def _health_next_delay(report):
+    return HEALTH_RETRY if report.get("fails") else HEALTH_INTERVAL
+
+
+def _health_loop():
+    time.sleep(HEALTH_FIRST_DELAY)
+    while True:
+        try:
+            report = run_health_check()
+        except Exception as e:            # never let the checker itself die
+            print(f"[health] check crashed: {e}")
+            report = {"fails": 1}
+        time.sleep(_health_next_delay(report))
+
+
+def _health_when(ts):
+    return _dt.fromtimestamp(ts).strftime("%b %-d, %-I:%M %p")
+
+
+def _health_card():
+    rep = _HEALTH
+    run_btn = ('<form class="inline" method="POST" action="/admin/health/run">'
+               '<button type="submit">Run checks now</button></form>')
+    if not rep.get("checks"):
+        return (f'<div class="card" id="health"><h2>System health</h2>'
+                f'<p class="hint">No check has run yet — the first runs about '
+                f'{HEALTH_FIRST_DELAY} s after Crewe starts, then every '
+                f'{HEALTH_INTERVAL / 3600:g} hours.</p>{run_btn}</div>')
+    n, fails, warns = len(rep["checks"]), rep.get("fails", 0), rep.get("warns", 0)
+    if fails or warns:
+        parts = ([f"{fails} failing"] if fails else []) + \
+                ([f"{warns} warning{'s' if warns != 1 else ''}"] if warns else [])
+        summary = " &middot; ".join(parts) + f" of {n} checks"
+    else:
+        summary = f"All {n} checks passed"
+    order = {"fail": 0, "warn": 1, "ok": 2}
+    rows = ""
+    for c in sorted(rep["checks"], key=lambda c: order.get(c["status"], 3)):
+        since = (f'<br><span class="muted">since {_esc(_health_when(c["since"]))}</span>'
+                 if c.get("since") else "")
+        rows += (f'<tr><td><span class="tag {c["status"]}">{c["status"]}</span></td>'
+                 f'<td>{_esc(c["label"])}<br><span class="muted">{_esc(c["uses"])}</span></td>'
+                 f'<td>{_esc(c["detail"])}{since}</td></tr>')
+    return (f'<div class="card" id="health"><h2>System health</h2>'
+            f'<p class="hint">{summary} &middot; checked {_esc(_health_when(rep["ts"]))} '
+            f'(took {rep.get("took_ms", 0) / 1000:.0f} s). Runs every '
+            f'{HEALTH_INTERVAL / 3600:g} hours, every {HEALTH_RETRY // 60} minutes '
+            f'while something fails.</p>'
+            f'<table><tr><th></th><th>Check</th><th>Result</th></tr>{rows}</table>'
+            f'{run_btn}</div>')
+
+
+@app.route("/admin/health.json")
+def admin_health_json():
+    return jsonify(_HEALTH or {})
+
+
+@app.route("/admin/health/run", methods=["POST"])
+def admin_health_run():
+    run_health_check()
+    return redirect("/admin#health")
+
+
 if __name__ == "__main__":
+    threading.Thread(target=_health_loop, daemon=True, name="health").start()
     _start_photo_backfill()
     _start_meta_backfill()
     _reap_sandbox_containers()   # a restart mid-run leaves its container behind

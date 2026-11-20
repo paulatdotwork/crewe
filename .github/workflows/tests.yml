@@ -111,3 +111,21 @@ jobs:
       - name: history-budget
         if: ${{ !cancelled() }}
         run: python3 tests/test_history_budget.py
+      - name: conversation-memory
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_conversation_memory.py
+      - name: web-search
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_web_search.py
+      - name: health-check
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_health_check.py
+      - name: mode-switcher
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_mode_switcher.py
+      - name: search-rewrite
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_search_rewrite.py
+      - name: search-recent
+        if: ${{ !cancelled() }}
+        run: python3 tests/test_search_recent.py

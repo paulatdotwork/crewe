@@ -1,6 +1,6 @@
 # Testing
 
-Crewe's suite lives in `tests/` — twenty-five standalone scripts and a runner:
+Crewe's suite lives in `tests/` — thirty-eight standalone scripts and a runner:
 
 ```bash
 cd tests
@@ -60,6 +60,12 @@ These keep the suite trustworthy; new tests should follow them.
 | `test_compare.py` | compare mode and the judge |
 | `test_compare_thinking.py` | judges with thinking models |
 | `test_truncation.py` | cut-off replies, continuation, vision critic frame |
+| `test_conversation_memory.py` | summaries, history sized to the model, a chat keeping its mode |
+| `test_web_search.py` | SearXNG results, empty searches logged with the engines that failed |
+| `test_health_check.py` | backend and service probes, /admin card, header pill |
+| `test_mode_switcher.py` | choosing a chat's mode, the switch hint, the header pill |
+| `test_search_rewrite.py` | mid-chat search queries, one Sources list per answer |
+| `test_search_recent.py` | past-year search for next/latest/current, page dates, today's date |
 
 CI runs the same `run_all.sh` on every push and pull request
 (`.github/workflows/tests.yml`).
