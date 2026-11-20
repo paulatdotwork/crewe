@@ -20,6 +20,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -165,7 +166,10 @@ Rules:
 - Every write/edit is syntax-checked for you; fix a reported error before
   moving on.
 - Prefer edit over write for changes to an existing file.
-- Install packages you need with pip/npm (via run).
+- Install packages you need with pip/npm (via run) — and RECORD them in
+  requirements.txt (or package.json). The user receives the FILES, not this
+  workspace: a package you only installed here is one they cannot install at
+  all, and finish is refused while an import has nothing recording it.
 - VERIFY before you finish: run the program or its tests and read the output.
   finish is REFUSED if you changed files and have not run anything since.
 - Never repeat a command that already failed the same way; change something first.
@@ -234,7 +238,10 @@ Rules:
 - Every write/edit is syntax-checked for you; fix a reported error before moving on.
 - Prefer edit over write for changes to an existing file: an edit is small and
   exact, while rewriting a big file is slow and risks a truncated reply.
-- Install packages you need with pip/npm.
+- Install packages you need with pip/npm — and RECORD them in requirements.txt
+  (or package.json). The user receives the FILES, not this workspace: a package
+  you only installed here is one they cannot install at all, and finish is
+  refused while an import has nothing recording it.
 - VERIFY before you finish: run the program or its tests and read the output.
   finish is REFUSED if you changed files and have not run anything since.
 - Never repeat a command that already failed the same way; change something first.
@@ -1088,6 +1095,117 @@ def _lint_note(path, content):
             "finishing."), res
 
 
+# Import name -> the distribution you actually install. Only the ones that
+# differ; anything absent installs under its own name.
+_PIP_NAME = {
+    "yaml": "PyYAML", "PIL": "Pillow", "cv2": "opencv-python",
+    "bs4": "beautifulsoup4", "dotenv": "python-dotenv", "jwt": "PyJWT",
+    "sklearn": "scikit-learn", "serial": "pyserial", "attr": "attrs",
+    "dateutil": "python-dateutil", "Crypto": "pycryptodome", "git": "GitPython",
+    "OpenSSL": "pyOpenSSL", "psycopg2": "psycopg2-binary", "fitz": "PyMuPDF",
+    "MySQLdb": "mysqlclient", "docx": "python-docx", "pptx": "python-pptx",
+    "usb": "pyusb", "zmq": "pyzmq", "skimage": "scikit-image",
+}
+_PY_IMPORT_RE = re.compile(
+    r"^[ \t]*(?:from[ \t]+([A-Za-z_][\w.]*)[ \t]+import"
+    r"|import[ \t]+([A-Za-z_][\w.]*(?:[ \t]*,[ \t]*[A-Za-z_][\w.]*)*))", re.M)
+_JS_IMPORT_RE = re.compile(
+    r"""(?:require\(\s*|\bfrom\s+)['"]([^'".][^'"]*)['"]""")
+_NODE_BUILTINS = {
+    "assert", "buffer", "child_process", "cluster", "crypto", "dns", "events",
+    "fs", "http", "http2", "https", "net", "os", "path", "process", "querystring",
+    "readline", "stream", "string_decoder", "timers", "tls", "tty", "url",
+    "util", "v8", "vm", "worker_threads", "zlib",
+}
+
+
+def _py_third_party(texts, all_files):
+    """Top-level modules the project imports that are neither stdlib nor its own."""
+    local = set()
+    for p in all_files:
+        norm = p.replace("\\", "/")
+        base = norm.rsplit("/", 1)[-1]
+        if base.endswith(".py"):
+            local.add(base[:-3])
+        if "/" in norm:
+            local.add(norm.split("/", 1)[0])      # a package dir is local too
+    std = set(getattr(sys, "stdlib_module_names", ()))
+    out = set()
+    for text in texts.values():
+        for m in _PY_IMPORT_RE.finditer(text):
+            for name in (m.group(1) or m.group(2) or "").split(","):
+                root = name.strip().split(".")[0]
+                if root and root not in std and root not in local \
+                        and not root.startswith("_"):
+                    out.add(root)
+    return out
+
+
+def _dependency_problems(sb):
+    """Third-party imports that nothing in the project records.
+
+    The agent installs what it needs INSIDE its own workspace, verifies the app
+    there and finishes — but the user receives the FILES, not the container. A
+    dependency that exists only as a pip command in the transcript is one they
+    cannot install at all, which is the commonest way a 'verified' build still
+    will not start anywhere else."""
+    try:
+        files = sb.list_files(limit=200)
+    except Exception:
+        return []                                  # never block on a listing failure
+    problems = []
+    py = [f for f in files if f.endswith(".py")][:40]
+    if py:
+        texts = {}
+        for p in py:
+            try:
+                c = sb.read_file(p, max_bytes=200_000)
+            except Exception:
+                c = None
+            if c:
+                texts[p] = c
+        third = _py_third_party(texts, files)
+        if third:
+            recorded = ""
+            for name in ("requirements.txt", "pyproject.toml", "setup.py",
+                         "setup.cfg", "Pipfile", "environment.yml"):
+                if name in files:
+                    try:
+                        recorded += (sb.read_file(name, max_bytes=100_000) or "") + "\n"
+                    except Exception:
+                        pass
+            low = recorded.lower()
+            missing = sorted(m for m in third
+                             if m.lower() not in low
+                             and _PIP_NAME.get(m, m).lower() not in low)
+            if missing:
+                problems.append(
+                    "these packages are imported but recorded nowhere: "
+                    + ", ".join(_PIP_NAME.get(m, m) for m in missing)
+                    + " — add a requirements.txt listing them (installing them "
+                      "in this workspace does not help the user, who gets the "
+                      "files, not the container)")
+    js = [f for f in files
+          if f.endswith((".js", ".mjs", ".ts")) and "node_modules" not in f][:40]
+    if js and "package.json" not in files:
+        bare = set()
+        for p in js:
+            try:
+                c = sb.read_file(p, max_bytes=200_000)
+            except Exception:
+                c = None
+            for m in _JS_IMPORT_RE.finditer(c or ""):
+                root = m.group(1).split("/")[0]
+                if root and root not in _NODE_BUILTINS and not root.startswith("node:"):
+                    bare.add(root)
+        if bare:
+            problems.append(
+                "these npm packages are imported but there is no package.json: "
+                + ", ".join(sorted(bare)[:8])
+                + " — add one so the project can be installed elsewhere")
+    return problems
+
+
 def _run_hint(paths):
     """What 'verify it' concretely means for the files that changed."""
     for p in paths:
@@ -1694,6 +1812,7 @@ def run_agent(task, *, max_steps=12, network="egress", image=None, on_event=None
                         if needs_run:
                             problems.append(f"you changed {', '.join(needs_run[:6])} "
                                             "and have not run anything since")
+                        problems += _dependency_problems(sb)
                         if problems and bounces < MAX_FINISH_BOUNCES and left >= 2:
                             bounces += 1
                             emit(t="warn", step=step,
@@ -1813,6 +1932,7 @@ def run_agent(task, *, max_steps=12, network="egress", image=None, on_event=None
                 if needs_run:
                     problems.append(f"you changed {', '.join(needs_run[:6])} "
                                     "and have not run anything since")
+                problems += _dependency_problems(sb)
                 if problems and bounces < MAX_FINISH_BOUNCES and left >= 2:
                     bounces += 1
                     obs = ("NOT FINISHED — finish refused: "

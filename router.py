@@ -1353,12 +1353,30 @@ PLANNER_SYSTEM = (
     'tile and a distinct town map loads\'"],\n'
     ' "design": "2-4 sentences of visual direction: art method (layered SVG / '
     'canvas pixel sprites and tile size), palette, UI style",\n'
+    ' "server": {"install": "pip install flask", "cmd": "python3 server.py", '
+    '"port": 8000, "entry": "/"},   (OPTIONAL - see the rules)\n'
     ' "steps": [\n'
     '   {"title": "short imperative title",\n'
     '    "detail": "exactly what to implement in this step and nothing more",\n'
     '    "files": ["files this step creates or edits"],\n'
     '    "done_when": "objective, checkable completion criterion"}]}\n'
     "Rules:\n"
+    '- "server" is OPTIONAL, and belongs in the plan whenever the request '
+    "cannot be built HONESTLY as a static page: it needs a third-party API, "
+    "an API key or token, a login, a shared database, or writes that another "
+    "person could see. Plan a REAL backend then — the browser calls YOUR OWN "
+    "endpoints and the server holds the secret in an environment variable. A "
+    "key or token sitting in client-side JS or localStorage is not a design "
+    "choice, it is a leak. Faking the integration with hardcoded sample data "
+    "and localStorage is a FAILURE, not a small version: say what the server "
+    "does and plan the steps that build it.\n"
+    '- Omit "server" entirely when the request genuinely IS just a page — a '
+    "game, a tool that only manipulates what the user typed, a visualisation. "
+    "Those keep the self-contained static rules.\n"
+    '- With "server": "cmd" is ONE command run from the project root (no shell '
+    "operators), the server MUST bind 0.0.0.0 on the declared port — not "
+    "127.0.0.1, which nothing outside the container can reach — and \"entry\" "
+    'is the route to open in a browser. "install" is optional and runs first.\n'
     "- The steps must collectively deliver EVERY feature in the list.\n"
     "- 1 to 10 steps. A genuinely small request (one fix, one widget) is ONE "
     "step; an ambitious build uses as many as it needs.\n"
@@ -2029,6 +2047,52 @@ _ASKS_ABOUT = re.compile(
     r"^\s*(why|how come|what happened|what did you|what have you|did you|"
     r"do you|are you|explain|tell me why|i thought)\b", re.I)
 
+# An edit verb sitting inside a QUESTION is a NOUN, not a command: "explain how
+# the update check works" asks about updating, it does not request an update,
+# and "what does the delete button do" must never delete anything. This vetoes
+# the edit branch wherever it appears in the message, not just at the start.
+# Deliberately generous: rebuilding a project because someone asked a question
+# can cost the whole build, while answering when they wanted a change costs one
+# rephrase.
+_EXPLAINS = re.compile(
+    r"\b(explain|describe|walk me through|tell me about|what does|what do|"
+    r"what is|what are|what's|how does|how do|how did|how is|where is|"
+    r"where are|which|is there|are there|do i need|should i|can i)\b", re.I)
+
+# A follow-up that plainly names ONE small change does not need a plan. The
+# full pipeline — planner, N steps, three fix rounds per gate — is what a real
+# build is worth; spending it on "change the port to 9000" cost 51 minutes and
+# rewrote whole files, which is how working code gets lost. Size and shape
+# only: anything long, multi-part, or pasted in bulk still gets planned.
+SMALL_CHANGE_CHARS = int(os.environ.get("CREWE_SMALL_CHANGE_CHARS", "240"))
+
+# Server logs are full of colour codes; they make a one-line failure report
+# unreadable and leak escape sequences into the answer.
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+def _is_small_change(question):
+    q = (question or "").strip()
+    if not q or len(q) > SMALL_CHANGE_CHARS or q.count("\n") > 2:
+        return False
+    # Enumeration is the real signal, not length: "add a catalog with search,
+    # filter chips, a grid view, and a Load from Winget button" is only ~130
+    # characters and is five features. Commas and joiners counted together —
+    # three or more parts gets a plan.
+    parts = (q.count(",")
+             + len(re.findall(r"\b(and|also|then|plus|as well as)\b", q, re.I)))
+    if parts >= 3:
+        return False
+    return bool(_EDITISH.search(q) or _ERRORISH.search(q))
+
+# Any QUESTION asked while a build is active. Broader than _ASKS_ABOUT, which
+# only covers questions about what the builder DID: this also catches "what do
+# I need to install", "how do I run this", "which port does it use" — questions
+# about the project that need its source to answer.
+_ASKS_PROJECT = re.compile(
+    r"^\s*(what|which|where|when|who|whose|why|how|is|are|was|were|does|do|"
+    r"did|can|could|should|would|will|has|have|am\s+i|should\s+i|tell me|"
+    r"show me|list|explain|walk me)\b", re.I)
+
 # Short replies that continue the previous exchange (game answers, yes/no,
 # "keep going") — these stay on the previous route without asking the
 # classifier, which can't be trusted with a bare "no".
@@ -2486,12 +2550,26 @@ def _extract_files(md_text, existing=None, default_name=None):
     return files
 
 
+def _fence_for(code):
+    """A fence longer than any run of backticks inside the content.
+
+    Every file used to be emitted in a hardcoded ``` block, so a README with
+    its own ```bash example closed the block early: the rest of the README
+    became loose markdown and the leftovers parsed as a phantom extra file.
+    The READING side already did CommonMark fence lengths — the writing side
+    never did, which is why the bug survived that fix."""
+    longest = max((len(m) for m in re.findall(r"`+", code)), default=0)
+    return "`" * max(3, longest + 1)
+
+
 def _files_context(files, limit=80000,
                    header="Current project files (complete, latest versions):"):
     parts, total, omitted = [], 0, []
     for name, code in files.items():
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-        block = f"**`{name}`**\n```{_LANG_BY_EXT.get(ext, '')}\n{code}\n```"
+        fence = _fence_for(code)
+        block = (f"**`{name}`**\n{fence}{_LANG_BY_EXT.get(ext, '')}\n"
+                 f"{code}\n{fence}")
         if total + len(block) > limit:
             omitted.append(name)
             continue
@@ -2548,7 +2626,9 @@ def _files_to_markdown(files, prose=None, unchanged=None, fixed_note=None, warni
         parts.append(prose)
     for name, code in files.items():
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-        parts.append(f"**`{name}`**\n```{_LANG_BY_EXT.get(ext, '')}\n{code.rstrip()}\n```")
+        fence = _fence_for(code)
+        parts.append(f"**`{name}`**\n{fence}{_LANG_BY_EXT.get(ext, '')}\n"
+                     f"{code.rstrip()}\n{fence}")
     if unchanged:
         parts.append(f"_Unchanged from earlier: {', '.join(unchanged)}_")
     if fixed_note:
@@ -4632,6 +4712,21 @@ def _parse_plan(text, question):
     except Exception as e:
         print(f"[code] plan validation error: {e}")
         steps = []
+    # A server the pipeline cannot boot or reach is worse than no server: it
+    # would drag the build down the backend path and then fail every gate on
+    # an unreachable URL. Anything incomplete degrades to "no server".
+    server = None
+    if isinstance(plan, dict) and isinstance(plan.get("server"), dict):
+        sv = plan["server"]
+        cmd = str(sv.get("cmd") or "").strip()
+        try:
+            port = int(sv.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if cmd and 1 <= port <= 65535:
+            server = {"cmd": cmd, "port": port,
+                      "install": str(sv.get("install") or "").strip(),
+                      "entry": str(sv.get("entry") or "/").strip() or "/"}
     features, design = [], ""
     if isinstance(plan, dict):
         raw_f = plan.get("features")
@@ -4646,11 +4741,13 @@ def _parse_plan(text, question):
         print(f"[code] plan fallback: could not parse a plan from "
               f"{len(text)} chars of planner output")
         return {"goal": question[:200], "features": features, "design": design,
+                "server": server,
                 "steps": [{
                     "title": "build the request", "detail": question, "files": [],
                     "done_when": "the user's request is fulfilled"}]}
     goal = str(plan.get("goal") or question)[:200]
-    return {"goal": goal, "features": features, "design": design, "steps": steps}
+    return {"goal": goal, "features": features, "design": design,
+            "server": server, "steps": steps}
 
 
 _BROWSER_ERR_CAPTURE = """<script>
@@ -4710,11 +4807,165 @@ def _inject_html(html, snippet):
     return snippet + html
 
 
-def _browser_check(files, offline=False):
+class _BuildBackend:
+    """Runs a build's OWN server so the gates can drive a real app.
+
+    Everything the server does happens inside the docker sandbox: non-root,
+    cap-drop ALL, no host mounts, and the INTERNAL egress network. It can
+    install packages through the allowlisted proxy but cannot reach the open
+    internet — so a verification run can never fire real requests at a third
+    party, which starts to matter the moment a build holds real credentials.
+    It is reached on the container IP, so nothing is bound in this host's port
+    space and there is no published port for the LAN to find.
+
+    sync() runs before EVERY gate, not once: the fix rounds keep rewriting the
+    files underneath, and a server still holding last round's code would have
+    the gates checking bytes that no longer exist."""
+
+    def __init__(self, spec):
+        self.spec = spec
+        self.sb = None
+        self.pid = None
+        self.note = ""          # why it is unavailable, in the user's words
+        self.log = ""
+
+    @staticmethod
+    def _entry_html(files):
+        return ("index.html" if "index.html" in files
+                else next((n for n in files if n.endswith((".html", ".htm"))), None))
+
+    def start(self):
+        try:
+            from sandbox import Sandbox
+        except Exception as e:
+            self.note = (f"the build declared a server but the sandbox is "
+                         f"unavailable ({type(e).__name__}) — checked as "
+                         f"static files instead")
+            return False
+        try:
+            self.sb = Sandbox(network="egress", serve_port=self.spec["port"],
+                              memory="1g", cpus="2",
+                              name_prefix="crewe-bes-").start()
+        except Exception as e:
+            self.sb = None
+            self.note = f"the build's server could not be sandboxed: {str(e)[:160]}"
+            return False
+        install = self.spec.get("install")
+        if install:
+            code, out, err = self.sb.run(install, timeout=420)
+            if code != 0:
+                # Not fatal by itself: boot anyway, so the user gets the real
+                # ImportError rather than a bare "install failed".
+                self.note = (f"dependency install failed ({install[:60]}): "
+                             f"{(err or out).strip()[-200:]}")
+        return True
+
+    def _listening_inside(self):
+        """Is anything listening on the port from INSIDE the container?"""
+        code, out, _ = self.sb.run(
+            "python3 -c \"import socket,sys;s=socket.socket();"
+            "s.settimeout(2);"
+            f"sys.exit(0 if s.connect_ex(('127.0.0.1',{int(self.spec['port'])}))==0 "
+            "else 1)\"", timeout=20)
+        return code == 0
+
+    def _wait_boot(self, timeout):
+        """Wait for the server to listen, but give up the moment the process is
+        gone. Sitting out a 45s timeout for a server that died in the first
+        second spends the verification budget on nothing — and that budget is
+        exactly what ran out on the build that prompted all this."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.sb.wait_for_port(timeout=2):
+                return True
+            code, out, _ = self.sb.run(
+                f"kill -0 {int(self.pid)} 2>/dev/null && echo alive", timeout=10)
+            if "alive" not in out:
+                return False
+        return False
+
+    def sync(self, files):
+        """Push the current files, restart the server, wait for it to listen.
+        Returns (base_url or None, error text)."""
+        if not self.sb:
+            return None, self.note
+        try:
+            if self.pid:
+                # WAIT for it to actually die. Launching the replacement while
+                # the old process still holds the port fails with EADDRINUSE,
+                # and that error reads like a bug in the build rather than in
+                # the restart. One exec does the whole dance: TERM, wait up to
+                # 4s, then KILL.
+                pid = int(self.pid)
+                self.sb.run(f"kill {pid} 2>/dev/null; "
+                            f"for i in $(seq 1 40); do "
+                            f"kill -0 {pid} 2>/dev/null || break; sleep 0.1; done; "
+                            f"kill -9 {pid} 2>/dev/null; true", timeout=25)
+                self.pid = None
+            entry = self._entry_html(files)
+            for name, code in files.items():
+                # Best effort: the JS error hook can only be injected into an
+                # entry html FILE. A page the server renders from a template or
+                # a string gets no hook, so window.__router_errors stays empty
+                # and 'assert no_errors' passes vacuously for those builds —
+                # the behaviour and visual gates are what cover them.
+                if entry and name == entry:
+                    code = _inject_html(code, _BROWSER_ERR_CAPTURE)
+                self.sb.write_file(name, code)
+            # exec so the recorded pid IS the server, not a shell wrapper that
+            # would leave it orphaned and still holding the port on restart.
+            detail = "it produced no output"
+            for attempt in range(3):
+                self.pid = self.sb.run_bg(f"exec {self.spec['cmd']}")
+                if self._wait_boot(45 if attempt == 0 else 20):
+                    return self.sb.base_url(), ""
+                self.log = _ANSI.sub("", self.sb.read_file("/tmp/crewe-bg.log") or "")
+                tail = self.log.strip().splitlines()
+                detail = tail[-1][:200] if tail else "it produced no output"
+                # A server that IS listening inside but not from here bound the
+                # container's loopback. Flask's app.run() and `flask run` both
+                # default to 127.0.0.1, so this is the common case, and its log
+                # says "Running on http://127.0.0.1:8000" / "Press CTRL+C to
+                # quit" — which reads like a healthy start and is why this used
+                # to be reported as "never listened".
+                if self._listening_inside():
+                    return None, (
+                        f"the build's server is listening on port "
+                        f"{self.spec['port']} but only on the container's own "
+                        f"127.0.0.1, so nothing outside can reach it — it must "
+                        f"bind 0.0.0.0 (Flask: app.run(host=\"0.0.0.0\", "
+                        f"port={self.spec['port']}))")
+                # Sockets from the gate's own requests sit in TIME_WAIT and can
+                # refuse the rebind for a moment even after the old process is
+                # gone. Retry only THAT — every other failure is the build's
+                # and deserves to be reported immediately, not after 3 waits.
+                if "Address already in use" not in self.log:
+                    break
+                time.sleep(2.0)
+            return None, (f"the build's server never listened on port "
+                          f"{self.spec['port']}: {detail}")
+        except Exception as e:
+            return None, f"the build's server failed to run: {str(e)[:160]}"
+
+    def stop(self):
+        if self.sb:
+            try:
+                self.sb.cleanup()
+            except Exception:
+                pass
+            self.sb = None
+
+
+def _browser_check(files, offline=False, base_url=None, entry_path="/"):
     """Write the project to a run dir, load its entry html in headless
     Firefox, and return (runtime errors, screenshot path). Degrades to
     ([], None) whenever selenium/geckodriver are unavailable — the pipeline
     must work without a browser, just with one less safety net.
+
+    base_url = the build runs its OWN server (see _BuildBackend) and is
+    already serving these files from there; entry_path is the route to open
+    on it. Writing the static run dir in that case would serve stale copies
+    the real server never sees, so it is skipped entirely.
 
     offline=True routes every request except the local test server into a
     closed port: the page's JS runs on THIS host, and model-written (or
@@ -4722,7 +4973,10 @@ def _browser_check(files, offline=False):
     router's network position."""
     entry = ("index.html" if "index.html" in files
              else next((n for n in files if n.endswith((".html", ".htm"))), None))
-    if not entry:
+    # A server-rendered build has NO entry html file — the server owns the
+    # route and generates the page. Vetoing on a missing file would silently
+    # skip the browser gate for exactly the builds that most need it.
+    if not entry and not base_url:
         return [], None
     try:
         from selenium import webdriver
@@ -4733,6 +4987,10 @@ def _browser_check(files, offline=False):
     run_dir = os.path.join(checks_dir(), uuid.uuid4().hex[:12])
     driver = None
     httpd = None
+    serving_self = bool(base_url)
+    if serving_self:
+        bind = urlparse(base_url).hostname or "127.0.0.1"
+        page_url = base_url.rstrip("/") + "/" + entry_path.lstrip("/")
     try:
         runs = sorted(os.listdir(checks_dir()),
                       key=lambda d: os.path.getmtime(
@@ -4743,39 +5001,40 @@ def _browser_check(files, offline=False):
     except OSError:
         pass
     try:
-        for name, code in files.items():
-            path = os.path.abspath(os.path.join(run_dir, name))
-            if not path.startswith(os.path.abspath(run_dir) + os.sep):
-                continue  # no path escapes from model-named files
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            if name == entry:
-                # error hook must run before any page script
-                code = _inject_html(code, _BROWSER_ERR_CAPTURE)
-            with open(path, "w") as f:
-                f.write(code)
-        # Serve over HTTP, the way builds actually run: file:// silently
-        # blocks ES modules and local fetch(), which fails working builds
-        # (Pal diagnosed this by spinning up a python web host by hand).
-        class _Quiet(SimpleHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-        # offline mode serves from 127.0.0.2: the proxy exemption is then
-        # THIS page's address only, and 127.0.0.1 (the router, local model
-        # servers) is routed into the closed port like everything else
-        bind = "127.0.0.2" if offline else "127.0.0.1"
-        try:
-            httpd = ThreadingHTTPServer(
-                (bind, 0), functools.partial(_Quiet, directory=run_dir))
-        except OSError:
-            if offline:
-                # without the separate address the exemption would re-open
-                # 127.0.0.1 — report the check as unavailable instead
-                print("[code] offline browser check unavailable: cannot bind 127.0.0.2")
-                return [], None
-            bind = "127.0.0.1"
-            httpd = ThreadingHTTPServer(
-                (bind, 0), functools.partial(_Quiet, directory=run_dir))
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        if not serving_self:
+            for name, code in files.items():
+                path = os.path.abspath(os.path.join(run_dir, name))
+                if not path.startswith(os.path.abspath(run_dir) + os.sep):
+                    continue  # no path escapes from model-named files
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if name == entry:
+                    # error hook must run before any page script
+                    code = _inject_html(code, _BROWSER_ERR_CAPTURE)
+                with open(path, "w") as f:
+                    f.write(code)
+            # Serve over HTTP, the way builds actually run: file:// silently
+            # blocks ES modules and local fetch(), which fails working builds
+            # (Pal diagnosed this by spinning up a python web host by hand).
+            class _Quiet(SimpleHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+            # offline mode serves from 127.0.0.2: the proxy exemption is then
+            # THIS page's address only, and 127.0.0.1 (the router, local model
+            # servers) is routed into the closed port like everything else
+            bind = "127.0.0.2" if offline else "127.0.0.1"
+            try:
+                httpd = ThreadingHTTPServer(
+                    (bind, 0), functools.partial(_Quiet, directory=run_dir))
+            except OSError:
+                if offline:
+                    # without the separate address the exemption would re-open
+                    # 127.0.0.1 — report the check as unavailable instead
+                    print("[code] offline browser check unavailable: cannot bind 127.0.0.2")
+                    return [], None
+                bind = "127.0.0.1"
+                httpd = ThreadingHTTPServer(
+                    (bind, 0), functools.partial(_Quiet, directory=run_dir))
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
         opts = Options()
         opts.add_argument("--headless")
@@ -4797,7 +5056,8 @@ def _browser_check(files, offline=False):
         driver = webdriver.Firefox(options=opts, service=service)
         driver.set_page_load_timeout(25)
         try:
-            driver.get(f"http://{bind}:{httpd.server_address[1]}/{entry}")
+            driver.get(page_url if serving_self
+                       else f"http://{bind}:{httpd.server_address[1]}/{entry}")
         except Exception as e:
             # a page that never finishes loading is a FAILURE — the old
             # catch-all reported it as 'loads clean'
@@ -4897,6 +5157,7 @@ CHECKWRITER_SYSTEM = (
     '  {"do":"snap"}                        (remember how the page looks now)\n'
     '  {"do":"goto","page":"other.html"}    (open another page of the project)\n'
     '  {"assert":"text","sel":"<css>","equals":"..."}   (or "contains":"...")\n'
+    '      on <input>/<textarea>/<select> this reads the field VALUE\n'
     '  {"assert":"exists","sel":"<css>"}\n'
     '  {"assert":"js","expr":"<js expression that must be true>","desc":"short name"}\n'
     '  {"do":"js","expr":"<js statement run for side effects — seed state, dispatch events>"}\n'
@@ -5021,7 +5282,7 @@ def _write_checks(job_id, goal_text, files, patch_bug=None, mem=None):
     return checks
 
 
-def _run_behavior_checks(files, checks):
+def _run_behavior_checks(files, checks, base_url=None, entry_path="/"):
     """Execute checks against the served build in headless Firefox.
     Returns (results, fatal): results = [{desc, ok, detail, action_error}];
     fatal is a string when the ENVIRONMENT failed (no selenium, page never
@@ -5029,7 +5290,9 @@ def _run_behavior_checks(files, checks):
     build failure."""
     entry = ("index.html" if "index.html" in files
              else next((n for n in files if n.endswith((".html", ".htm"))), None))
-    if not entry or not checks:
+    # Same as _browser_check: with a live server there is a route to drive even
+    # when the project contains no .html file at all.
+    if (not entry and not base_url) or not checks:
         return [], "no entry html or no checks"
     try:
         from selenium import webdriver
@@ -5041,23 +5304,28 @@ def _run_behavior_checks(files, checks):
         return [], "selenium unavailable"
     run_dir = os.path.join(checks_dir(), "chk-" + uuid.uuid4().hex[:12])
     driver = httpd = None
+    # base_url: the build serves itself (see _BuildBackend), so the static run
+    # dir is skipped — checking copies the real server never reads would test
+    # the wrong bytes.
+    serving_self = bool(base_url)
     try:
-        for name, code in files.items():
-            path = os.path.abspath(os.path.join(run_dir, name))
-            if not path.startswith(os.path.abspath(run_dir) + os.sep):
-                continue
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            if name == entry:
-                code = _inject_html(code, _BROWSER_ERR_CAPTURE)
-            with open(path, "w") as f:
-                f.write(code)
+        if not serving_self:
+            for name, code in files.items():
+                path = os.path.abspath(os.path.join(run_dir, name))
+                if not path.startswith(os.path.abspath(run_dir) + os.sep):
+                    continue
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if name == entry:
+                    code = _inject_html(code, _BROWSER_ERR_CAPTURE)
+                with open(path, "w") as f:
+                    f.write(code)
 
-        class _Quiet(SimpleHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-        httpd = ThreadingHTTPServer(
-            ("127.0.0.1", 0), functools.partial(_Quiet, directory=run_dir))
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            class _Quiet(SimpleHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+            httpd = ThreadingHTTPServer(
+                ("127.0.0.1", 0), functools.partial(_Quiet, directory=run_dir))
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
         opts = Options()
         opts.add_argument("--headless")
@@ -5065,9 +5333,10 @@ def _run_behavior_checks(files, checks):
         service = Service(executable_path=gecko) if os.path.exists(gecko) else Service()
         driver = webdriver.Firefox(options=opts, service=service)
         driver.set_page_load_timeout(25)
-        base = f"http://127.0.0.1:{httpd.server_address[1]}/"
+        base = (base_url.rstrip("/") + "/" if serving_self
+                else f"http://127.0.0.1:{httpd.server_address[1]}/")
         try:
-            driver.get(base + entry)
+            driver.get(base + (entry_path.lstrip("/") if serving_self else entry))
         except Exception as e:
             return [], f"page never finished loading [{type(e).__name__}]"
         time.sleep(1.5)
@@ -5126,13 +5395,36 @@ return {ok:c.toDataURL()!==b.toDataURL(),d:'webgl canvas vs blank compare'};
                                     "action_error": False})
                 elif c.get("assert") == "text":
                     el = driver.find_element(By.CSS_SELECTOR, c["sel"])
-                    actual = (el.text or "").strip()
-                    if "equals" in c:
-                        ok = actual == str(c["equals"]).strip()
+                    # A form field's rendered text is ALWAYS '' — what it holds
+                    # lives in .value. Reading .text on an <input> makes the
+                    # check unpassable BY CONSTRUCTION, and the coder then gets
+                    # told to repair a feature that already works. (Observed
+                    # 2026-08-27: four checks stuck at "actual text: ''" for
+                    # three rounds while the handler was setting .value
+                    # correctly the whole time; the retries ate the budget and
+                    # the real defects shipped unfixed.)
+                    tag = (el.tag_name or "").lower()
+                    is_field = tag in ("input", "textarea", "select")
+                    if is_field:
+                        actual = (driver.execute_script(
+                            "return arguments[0].value", el) or "").strip()
                     else:
-                        ok = str(c.get("contains", "")) in actual
+                        actual = (el.text or "").strip()
+                    cands = [actual]
+                    if tag == "select":
+                        # A check author can reasonably mean either the option's
+                        # value or the label a human reads on screen, so accept
+                        # whichever one matches.
+                        cands.append((driver.execute_script(
+                            "var o = arguments[0].selectedOptions[0];"
+                            "return o ? o.textContent : '';", el) or "").strip())
+                    if "equals" in c:
+                        ok = any(a == str(c["equals"]).strip() for a in cands)
+                    else:
+                        ok = any(str(c.get("contains", "")) in a for a in cands)
                     results.append({"desc": desc, "ok": ok,
-                                    "detail": f"actual text: '{actual[:80]}'",
+                                    "detail": f"actual {'value' if is_field else 'text'}"
+                                              f": '{actual[:80]}'",
                                     "action_error": False})
                 elif c.get("assert") == "exists":
                     n_found = len(driver.find_elements(By.CSS_SELECTOR, c["sel"]))
@@ -5883,19 +6175,36 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
     plan_user += (("Follow-up request on the existing build (change ONLY "
                    "what it asks):\n" if followup else "Build request:\n")
                   + question)
-    try:
-        # Generous budget: a reasoning model's think-text counts against
-        # max_tokens, and a starved cap truncates the JSON mid-object —
-        # the same failure mode that once broke the classifier.
-        plan_text = _stream_chat(
-            coder_url(),
-            [{"role": "system", "content": planner_system},
-             {"role": "user", "content": plan_user}],
-            job_id, temperature=0.15, max_tokens=16384, label="planner")
-    except Exception as e:
-        print(f"[code] planner error: {e}")
-        plan_text = ""
-    plan = _parse_plan(plan_text, question)
+    small = followup and _is_small_change(question)
+    if small:
+        # One edit-only step, straight to work. The previous plan's server
+        # block is carried over so a backend project's follow-up is still
+        # verified against its own running server, and the request becomes the
+        # single feature so the checkwriter can still check what was asked for.
+        prev_plan = sess.get("last_plan") or {}
+        plan = {"goal": question[:200], "features": [question[:200]],
+                "design": "", "server": prev_plan.get("server"),
+                "steps": [{"title": "make the requested change",
+                           "detail": question, "files": [], "edit_only": True,
+                           "done_when": "the requested change is in place"}]}
+        _trace(job_id, "fast_path", reason="small follow-up",
+               chars=len(question.strip()))
+        print(f"[code] fast path: small follow-up, no planner "
+              f"({len(question.strip())} chars)")
+    else:
+        try:
+            # Generous budget: a reasoning model's think-text counts against
+            # max_tokens, and a starved cap truncates the JSON mid-object —
+            # the same failure mode that once broke the classifier.
+            plan_text = _stream_chat(
+                coder_url(),
+                [{"role": "system", "content": planner_system},
+                 {"role": "user", "content": plan_user}],
+                job_id, temperature=0.15, max_tokens=16384, label="planner")
+        except Exception as e:
+            print(f"[code] planner error: {e}")
+            plan_text = ""
+        plan = _parse_plan(plan_text, question)
     steps = plan["steps"]
     total = len(steps)
     with SESSIONS_LOCK:
@@ -5927,6 +6236,16 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
         if _job_cancelled(job_id):
             step_notes.append("⏹ build stopped by user")
             break
+        # A FOLLOW-UP edits an existing project, so its steps ask for targeted
+        # SEARCH/REPLACE sections instead of whole-file rewrites. Until now
+        # edit_only was set only in the three autofix rounds, so "change the
+        # port" re-emitted every touched file end to end — and every full
+        # rewrite of working code is another chance to drop it (which is how
+        # an 11-file project was lost, and why the elision guards exist at
+        # all). In the default 'accept' mode this only ASKS; a model that
+        # sends a whole file anyway is still taken, just traced.
+        if followup:
+            step.setdefault("edit_only", True)
         if not _execute_step(job_id, step, idx, total, plan["goal"], outline,
                              files, step_notes, warnings,
                              step_system, foreman_system, mem):
@@ -6017,13 +6336,55 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
             JOBS.setdefault(job_id, {})["foreman_final_done"] = True
 
     AUTOFIX = os.environ.get("CREWE_AUTOFIX", "doa")
+    # A small change gets ONE repair round per gate, not three. Three rounds
+    # exist for a fresh build with many interacting failures; on a one-line
+    # change they mostly re-litigate the same finding, and that is where the
+    # verification budget went on the build that started this.
+    fix_rounds = 1 if small else 3
     VERIFY_BUDGET = int(os.environ.get("CREWE_VERIFY_BUDGET", "600"))
     verify_t0 = time.time()
+
+    # A build that planned its own server gets verified against that server
+    # instead of against static copies of its files. CREWE_BACKEND=0 turns the
+    # whole path off and every build falls back to the static file server.
+    backend = None
+    entry_path = (plan.get("server") or {}).get("entry", "/")
+    if os.environ.get("CREWE_BACKEND", "1") != "0" and plan.get("server"):
+        _set_stage(job_id, "starting the build's server")
+        _trace(job_id, "gate", gate="backend", phase="start",
+               cmd=plan["server"]["cmd"][:80], port=plan["server"]["port"])
+        backend = _BuildBackend(plan["server"])
+        if not backend.start():
+            warnings.append(backend.note)
+            _mem_note(mem, backend.note)
+            backend = None
+
+    def _gate_url():
+        """Base URL for the next gate run: the build's own server, resynced to
+        whatever the fix rounds have just written, or None to use the static
+        file server. A server that will not boot is reported ONCE and then
+        stops being retried — repeating an unreachable-server warning per gate
+        buries every other finding."""
+        if not backend:
+            return None
+        url, err = backend.sync(files)
+        if not url:
+            if err and err not in warnings:
+                warnings.append(err)
+                _mem_note(mem, err)
+                _trace(job_id, "gate", gate="backend", phase="unreachable",
+                       detail=err[:160])
+        return url
 
     def _verify_spent():
         return time.time() - verify_t0
 
-    def _budget_left(stage_name):
+    def _budget_left(stage_name, findings=()):
+        """Findings are shipped HERE, next to the promise that they will be —
+        the two used to live apart and drifted: every gate broke out of its
+        loop on exhaustion without ever appending what it had found, so the
+        user got 'findings ship as warnings' and then no findings. Pass what
+        the gate knows and it cannot happen again."""
         if _verify_spent() < VERIFY_BUDGET:
             return True
         msg = (f"verification budget exhausted after "
@@ -6034,6 +6395,10 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
             _trace(job_id, "gate", gate="budget", phase="exhausted",
                    stage=stage_name, spent_s=round(_verify_spent()))
             _mem_note(mem, msg)
+        for f in findings:
+            w = f"{stage_name} finding (left unfixed): {f}"
+            if w not in warnings:
+                warnings.append(w)
         return False
 
     # ---- runtime gate: cross-file bundle check + real browser, with up to
@@ -6042,13 +6407,14 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
     if (files and any(n.endswith((".html", ".htm")) for n in files)
             and not _job_cancelled(job_id)):
         prev_gate: list = []
-        for attempt in range(3):
+        for attempt in range(fix_rounds):
             if _job_cancelled(job_id):
                 break
             _set_stage(job_id, "browser check" if attempt == 0
                        else "browser re-check")
             gate_errors = _dup_symbol_check(files) + _bundle_check(files)
-            runtime_errors, _shot = _browser_check(files)
+            runtime_errors, _shot = _browser_check(
+                files, base_url=_gate_url(), entry_path=entry_path)
             _trace(job_id, "gate", gate="browser", phase="result",
                    attempt=attempt, screenshot=bool(_shot),
                    static_errors=len(gate_errors), runtime_errors=runtime_errors[:6])
@@ -6101,7 +6467,7 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
                 "title": "fix runtime errors",
                 "detail": detail, "edit_only": attempt == 0, "fix": True,
                 "files": [], "done_when": "the page loads and draws without errors"}
-            if not _budget_left("browser gate"):
+            if not _budget_left("browser gate", gate_errors[:4]):
                 break
             prev_gate = list(gate_errors)
             if not _execute_step(job_id, fix_step, 1, 1, plan["goal"],
@@ -6121,11 +6487,13 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
             feats = "Features the finished build promises:\n- " \
                     + "\n- ".join(plan["features"][:4])
             behavior_checks = _write_checks(job_id, feats, files, mem=mem)
-        for vround in range(3):
+        for vround in range(fix_rounds):
             if not behavior_checks or _job_cancelled(job_id):
                 break
             _set_stage(job_id, "verifying behavior")
-            results, fatal = _run_behavior_checks(files, behavior_checks)
+            results, fatal = _run_behavior_checks(
+                files, behavior_checks, base_url=_gate_url(),
+                entry_path=entry_path)
             failing = [r for r in results if not r["ok"]]
             _trace(job_id, "gate", gate="behavior", phase="result", attempt=vround,
                    checks=len(results), failed=len(failing), fatal=bool(fatal),
@@ -6185,7 +6553,9 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
             vfix = {"title": "make behavior checks pass", "detail": detail,
                     "edit_only": vround == 0, "fix": True,
                     "files": [], "done_when": "all behavior checks pass"}
-            if not _budget_left("behavior checks"):
+            if not _budget_left("behavior checks",
+                                [f"{r['desc']} — {r['detail']}"
+                                 for r in failing[:4]]):
                 break
             if not _execute_step(job_id, vfix, 1, 1, plan["goal"], outline,
                                  files, step_notes, warnings, step_system,
@@ -6201,12 +6571,13 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
     if (files and any(n.endswith((".html", ".htm")) for n in files)
             and not _job_cancelled(job_id)):
         prev_vis: list = []
-        for vattempt in range(3):
+        for vattempt in range(fix_rounds):
             if _job_cancelled(job_id):
                 break
             _set_stage(job_id, "visual check" if vattempt == 0
                        else "visual re-check")
-            _errs, shot = _browser_check(files)
+            _errs, shot = _browser_check(
+                files, base_url=_gate_url(), entry_path=entry_path)
             ready = _vision_ready(_vision_url())
             _trace(job_id, "gate", gate="vision", phase="run", attempt=vattempt,
                    screenshot=bool(shot), vision_ready=ready,
@@ -6257,7 +6628,7 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
             if vattempt == 1:
                 detail += ("\nTargeted edits already failed once — rewrite "
                            "the ENTIRE smallest file that owns the layout.")
-            if not _budget_left("visual check"):
+            if not _budget_left("visual check", defects[:4]):
                 break
             prev_vis = list(defects)
             vstep = {"title": "fix what the page visibly gets wrong",
@@ -6271,6 +6642,12 @@ def run_code_pipeline(job_id: str, question: str, session_id: str):
                                  temp=0.35 if vattempt == 1 else None):
                 warnings.append("visual fix aborted — specialist unreachable")
                 break
+
+    # Verification is over — the container has nothing left to serve. A crash
+    # before this point leaks it, which is what the crewe-bes- sweep at startup
+    # is for.
+    if backend:
+        backend.stop()
 
     # ---- assemble the answer ----
     changed_overall = {n: c for n, c in files.items() if proj_files.get(n) != c}
@@ -6353,6 +6730,60 @@ def _specialist_error(route, url, exc):
             "loading; llama.cpp answers `/health` with 503 until it is.")
 
 
+def answer_about_project(job_id, question, session_id):
+    """Answer a question ABOUT the active build: reads every file, writes none.
+
+    The code route's only other mode is a full rebuild, which is the wrong
+    answer to "what do I need to install" — and the wrong thing to do to a
+    working project. This loads the real source and replies in one call."""
+    with SESSIONS_LOCK:
+        sess = sessions().get(session_id, {})
+        files = dict(sess.get("files") or {})
+        history = list(sess.get("history") or [])
+    _set_stage(job_id, "reading the project")
+    system = (
+        "You are the engineer who built the project below, answering a "
+        "question about it.\n"
+        "ANSWER ONLY. Never output files, never rewrite or 'simplify' the "
+        "project, and never offer a fresh version of it — the user asked a "
+        "question, not for a change.\n"
+        "Be specific to THIS code: name the actual files, functions, "
+        "dependencies, commands and ports you can see. If the answer is a set "
+        "of dependencies, read them off the real imports and give the exact "
+        "install command. If it is how to run the project, give the real "
+        "entry point. Never answer with a generic example.\n"
+        "If the project genuinely does not answer the question, say so "
+        "plainly. If the question is not about this project at all, just "
+        "answer it normally.\n"
+        "If doing what the user wants would require changing the code, say "
+        "what the change would be and that they should ask for it — do not "
+        "make it here.")
+    parts = [_files_context(files, limit=step_file_chars())]
+    if history:
+        last = history[-1]
+        parts.append(f"Previous exchange:\nUser: {last.get('q', '')[:600]}\n"
+                     f"You: {last.get('a', '')[:1500]}")
+    parts.append("Question about this project:\n" + question)
+    _set_stage(job_id, "answering")
+    try:
+        answer = _strip_think(_stream_chat(
+            coder_url(),
+            [{"role": "system", "content": system},
+             {"role": "user", "content": "\n\n".join(parts)}],
+            job_id, temperature=0.2, max_tokens=4096, label="ask")).strip()
+    except Exception as e:
+        answer = _specialist_error("code", coder_url(), e)
+    if not answer:
+        answer = ("[router: the coder returned an empty answer — ask again, "
+                  "or phrase it as a change if you want the build altered]")
+    _append_history(session_id, question, answer, "code")
+    with JOBS_LOCK:
+        JOBS[job_id]["answer"] = answer
+        JOBS[job_id]["done"] = True
+    spawn_owned(target=summarize, args=(session_id, question, answer),
+                daemon=True).start()
+
+
 def run_job(job_id: str, route: str, question: str, session_id: str,
             effort: str = DEFAULT_EFFORT):
     """Stream from the specialist, counting tokens as they arrive, store final answer."""
@@ -6363,8 +6794,13 @@ def run_job(job_id: str, route: str, question: str, session_id: str,
         run_audio_job(job_id, question, session_id)
         return
     if route == "code":
+        with JOBS_LOCK:
+            ask_only = bool(JOBS.get(job_id, {}).get("ask_only"))
         try:
-            run_code_pipeline(job_id, question, session_id)
+            if ask_only:
+                answer_about_project(job_id, question, session_id)
+            else:
+                run_code_pipeline(job_id, question, session_id)
         except Exception as e:
             # a bug in the pipeline must never leave the UI polling forever
             print(f"[code] pipeline crashed: {e}")
@@ -7101,6 +7537,44 @@ def upload_remove(session_id, up_id):
     return jsonify({"ok": True, "removed": removed})
 
 
+def _route_request(question, has_files, last_route, prev_q="", prev_a=""):
+    """Pick the route for one message. Returns (route, ask_only).
+
+    Extracted from ask() so the decision can be tested without a request, a
+    session, or a live classifier — three separate bugs have landed in this
+    chain (an edit request eating an 11-file project, a question about the
+    build getting answered blind, a "what do I need to install" sent to web
+    search), and every one of them was a decision nothing could exercise.
+    Order matters: each branch is more specific than the one below it."""
+    # Pasted errors about an in-progress build must reach the code route even
+    # when the classifier would call them 'general'.
+    if has_files and _ERRORISH.search(question):
+        return "code", False
+    # A change requested against an ACTIVE build belongs to the code route,
+    # which is the only one that can actually load the files and edit them.
+    if (has_files and _EDITISH.search(question)
+            and not _ASKS_ABOUT.match(question)
+            and not _EXPLAINS.search(question)):
+        return "code", False
+    # Short continuation replies ("no", "keep going") stay with the previous
+    # specialist — its history has the conversation state (e.g. a game in
+    # progress), and the classifier can't route a bare "no" reliably.
+    if last_route in SPECIALISTS and _CONTINUATION.match(question):
+        return last_route, False
+    # A QUESTION during an active build goes to the coder to be ANSWERED, not
+    # built. These used to fall through to the classifier, which sent "what
+    # requirements do I need to install for this app?" to the web-search route
+    # — off to search the internet for generic instructions while the
+    # project's own imports sat unread in the session. The chat routes were no
+    # better: they get the manifest (names and sizes) and are told to say they
+    # cannot read the source. The coder is the only route that can load the
+    # files, so questions go there in READ-ONLY ask mode.
+    if has_files and (question.rstrip().endswith("?")
+                      or _ASKS_PROJECT.match(question)):
+        return "code", True
+    return classify(question, prev_q, prev_a, last_route), False
+
+
 @app.route("/ask", methods=["POST"])
 def ask():
     body       = request.json or {}
@@ -7133,26 +7607,17 @@ def ask():
 
     # Pasted errors about an in-progress build must reach the code route even
     # when the classifier would call them 'general'.
-    if has_files and _ERRORISH.search(question):
-        route = "code"
-    # A change requested against an ACTIVE build belongs to the code route,
-    # which is the only one that can actually load the files and edit them.
-    elif (has_files and _EDITISH.search(question)
-            and not _ASKS_ABOUT.match(question)):
-        route = "code"
-    # Short continuation replies ("no", "keep going") stay with the previous
-    # specialist — its history has the conversation state (e.g. a game in
-    # progress), and the classifier can't route a bare "no" reliably.
-    elif last_route in SPECIALISTS and _CONTINUATION.match(question):
-        route = last_route
-    else:
-        route = classify(question, prev_q, prev_a, last_route)
+    route, ask_only = _route_request(question, has_files, last_route,
+                                     prev_q, prev_a)
 
     # The code route is the only one that EXECUTES model-written code on this box
     # (headless browser + node). Limit it to admins. Non-admins get a clean
     # message delivered through the normal job/poll UI — returning a raw error
     # here would leave the client spinner polling a job that never exists.
-    if route == "code" and not (current_user() or {}).get("is_admin"):
+    # Ask mode is exempt: it reads the session's own files and answers. The
+    # gate exists because BUILDING executes model-written code on this box.
+    if (route == "code" and not ask_only
+            and not (current_user() or {}).get("is_admin")):
         job_id = uuid.uuid4().hex
         with JOBS_LOCK:
             JOBS[job_id] = {"owner": _owner(), "tokens": 0, "done": True, "route": "code",
@@ -7173,7 +7638,7 @@ def ask():
     with JOBS_LOCK:
         JOBS[job_id] = {"owner": _owner(), "tokens": 0, "done": False, "route": route, "answer": "",
                         "stage": "drafting", "audio": None, "stage_ts": time.time(),
-                        "effort": effort}
+                        "effort": effort, "ask_only": ask_only}
         _prune_jobs(JOBS)
 
     spawn_owned(target=run_job, args=(job_id, route, question, session_id, effort),
@@ -8558,6 +9023,10 @@ PAGE = r"""<!DOCTYPE html>
   .sess-name { font-size:13px; font-weight:500; white-space:nowrap; overflow:hidden;
                text-overflow:ellipsis; padding-right:18px; color:var(--ink); }
   .sess-meta { font-size:11px; color:var(--muted); margin-top:2px; }
+  .sess-live { display:inline-block; width:6px; height:6px; border-radius:50%;
+               background:var(--accent); margin-right:5px; vertical-align:middle;
+               animation:pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity:.25; } 50% { opacity:1; } }
   .sess-del { position:absolute; right:7px; top:50%; transform:translateY(-50%);
               background:none; border:0; color:var(--muted); cursor:pointer;
               font-size:13px; padding:2px 4px; display:none; height:auto;
@@ -8778,7 +9247,24 @@ const go = document.getElementById('go');
 const chat = document.getElementById('chat');
 const inner = document.getElementById('inner');
 const emptyState = document.getElementById('emptyState');
-let activeJob = null;   // job_id while a reply is generating (Send ⇄ Stop)
+// In-flight jobs, keyed by SESSION id — not one global, because /ask already
+// runs the job in a background thread and /progress can be re-read at any time.
+// A single global meant "new chat" silently adopted the running job: the reply
+// node was wiped, the answer was filed under the wrong chat, and the new chat
+// could not send until the old one finished. Each entry is
+//   {jobId, route, tokens, stage, stageAge, el, poll}
+// where `el` is rebuilt on every session switch (switching clears `inner`, so a
+// stashed node would be an orphan nothing can see).
+const LIVE = Object.create(null);
+function liveJob(){ return LIVE[sessionId] || null; }
+
+// Send ⇄ Stop reflects only the chat you are LOOKING at.
+function syncGo(){
+  const j = liveJob();
+  go.textContent = j ? 'Stop' : 'Send';
+  go.classList.toggle('stop', !!j);
+  go.disabled = false;
+}
 
 function updateEmptyState(){
   const show = !inner.children.length;
@@ -8869,9 +9355,15 @@ function extractFiles(mdText){
     const beforeLines=before.trimEnd().split('\n');
     let filename=null;
     for(let i=beforeLines.length-1;i>=Math.max(0,beforeLines.length-4);i--){
-      const line=beforeLines[i].trim().replace(/[`*_#>]+/g,' ').trim();
+      // Strip markdown emphasis but NOT '_': snake_case is the commonest
+      // filename style there is, and stripping it turned graph_client.py into
+      // "graph client.py", whose chip then read `client.py` — a file the user
+      // could not find because it never existed under that name.
+      const line=beforeLines[i].trim().replace(/[`*#>]+/g,' ').trim();
       const fnm=line.match(/([a-zA-Z0-9_\-]+(?:\/[a-zA-Z0-9_\-.]+)*\.[a-zA-Z0-9]+)/);
-      if(fnm&&!fnm[1].match(/^https?:/)&&fnm[1].length<80){filename=fnm[1];break;}
+      // _italic_ labels would otherwise leave the emphasis on the name.
+      const cand=fnm?fnm[1].replace(/^_+/,'').replace(/_+$/,''):null;
+      if(cand&&!cand.match(/^https?:/)&&cand.length<80){filename=cand;break;}
     }
     if(!filename){
       const firstLine=code.split('\n')[0];
@@ -8977,11 +9469,27 @@ function switchSession(id){
   currentMsgs=getMsgs(id);
   inner.innerHTML='';
   currentMsgs.forEach(renderStoredMsg);
+  attachLive();
   scrollDown(); renderSidebar(); loadMemory(); updateEmptyState(); closeSb();
-  refreshAttachments();
+  refreshAttachments(); syncGo();
+}
+
+// Rebuild the pending node for the visible chat's running job. Called after
+// anything that clears `inner`, so a job you switched away from is still there
+// — mid-answer, with its live token count — when you come back.
+function attachLive(){
+  const j=liveJob();
+  if(!j) return;
+  j.el=addReply();
+  renderPending(j.el,j.route,j.tokens,j.stage,j.stageAge);
 }
 
 function deleteSession(id){
+  // Deleting the chat is the one place a running job should actually die —
+  // there is nowhere left to file the answer.
+  const j=LIVE[id];
+  if(j){ clearInterval(j.poll); delete LIVE[id];
+         fetch('/stop/'+j.jobId,{method:'POST'}).catch(()=>{}); }
   sessions=sessions.filter(s=>s.id!==id);
   localStorage.removeItem('routerMsgs_'+id); saveSessions();
   if(sessionId===id){
@@ -8989,9 +9497,10 @@ function deleteSession(id){
     else sessionId=sessions[0].id;
     localStorage.setItem('routerCurrentSession',sessionId);
     currentMsgs=getMsgs(sessionId);
-    inner.innerHTML=''; currentMsgs.forEach(renderStoredMsg); scrollDown(); loadMemory(); updateEmptyState();
+    inner.innerHTML=''; currentMsgs.forEach(renderStoredMsg); attachLive();
+    scrollDown(); loadMemory(); updateEmptyState();
   }
-  renderSidebar();
+  renderSidebar(); syncGo();
 }
 
 function renderSidebar(){
@@ -9000,8 +9509,11 @@ function renderSidebar(){
   sessions.forEach(s=>{
     const el=document.createElement('div');
     el.className='sess'+(s.id===sessionId?' active':'');
+    const working=!!LIVE[s.id];
     el.innerHTML=`<div class="sess-name">${escapeHtml(s.name)}</div>
-      <div class="sess-meta">${relTime(s.createdAt)}</div>
+      <div class="sess-meta">${working
+        ? '<span class="sess-live"></span>working…'
+        : relTime(s.createdAt)}</div>
       <button class="sess-del" title="Delete">✕</button>`;
     el.addEventListener('click',e=>{if(!e.target.classList.contains('sess-del'))switchSession(s.id);});
     el.querySelector('.sess-del').addEventListener('click',e=>{e.stopPropagation();deleteSession(s.id);});
@@ -9010,21 +9522,29 @@ function renderSidebar(){
 }
 
 document.getElementById('newChat').addEventListener('click',()=>{
+  // Deliberately does NOT touch LIVE: the previous chat keeps polling and files
+  // its own answer, so starting a new chat never costs you the old answer.
   const s=createSession(); sessionId=s.id;
   localStorage.setItem('routerCurrentSession',sessionId);
-  currentMsgs=[]; inner.innerHTML=''; renderSidebar(); loadMemory(); updateEmptyState(); closeSb(); q.focus();
+  currentMsgs=[]; inner.innerHTML=''; renderSidebar(); loadMemory();
+  updateEmptyState(); closeSb(); syncGo(); q.focus();
 });
 
 // ---- message persistence ----------------------------------------------------
-function pushMsg(msg){
-  currentMsgs.push(msg); saveMsgs(sessionId,currentMsgs);
-  const s=sessions.find(s=>s.id===sessionId);
-  if(s&&s.name==='New chat'){
-    const first=currentMsgs.find(m=>m.type==='user');
+// A background answer must land in the chat that ASKED, not whichever chat is
+// on screen when it finishes — the session id is passed in, never read live.
+function pushMsgTo(sid,msg){
+  const s=sessions.find(x=>x.id===sid);
+  if(!s) return;                                   // chat deleted mid-answer
+  const msgs = sid===sessionId ? currentMsgs : getMsgs(sid);
+  msgs.push(msg); saveMsgs(sid,msgs);
+  if(s.name==='New chat'){
+    const first=msgs.find(m=>m.type==='user');
     if(first){s.name=first.content.slice(0,28)+(first.content.length>28?'…':'');saveSessions();}
   }
   renderSidebar();
 }
+function pushMsg(msg){ pushMsgTo(sessionId,msg); }
 
 function renderStoredMsg(msg){
   if(msg.type==='user'){
@@ -9142,7 +9662,10 @@ function lastCodeMsg(){
 
 async function ask(){
   const question=q.value.trim();
-  if(!question||activeJob)return;
+  if(!question||liveJob())return;
+  // Pinned now: every later step files against THIS chat, however many times
+  // the user switches sessions before the answer lands.
+  const sid=sessionId;
   q.value=''; q.style.height='auto'; go.disabled=true;
 
   addUser(question);
@@ -9154,37 +9677,46 @@ async function ask(){
   try{
     res=await(await fetch('/ask',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({question,session_id:sessionId,seed_code:lastCodeMsg(),
+      body:JSON.stringify({question,session_id:sid,seed_code:lastCodeMsg(),
                            effort:(document.getElementById('effort')||{}).value||'hard'})
     })).json();
   }catch(e){
-    reply.innerHTML=`<div class="answer">router unreachable: ${escapeHtml(String(e))}</div>`;
-    go.disabled=false; return;
+    if(sid===sessionId){
+      reply.innerHTML=`<div class="answer">router unreachable: ${escapeHtml(String(e))}</div>`;
+      syncGo();
+    }
+    return;
   }
 
   const route=res.route, jobId=res.job_id;
-  activeJob=jobId; go.textContent='Stop'; go.classList.add('stop'); go.disabled=false;
-  renderPending(reply,route,0);
+  const job={jobId,route,tokens:0,stage:'drafting',stageAge:0,el:reply,poll:null};
+  LIVE[sid]=job;
+  if(sid===sessionId){ syncGo(); renderPending(reply,route,0); }
+  renderSidebar();
 
-  const poll=setInterval(async()=>{
+  job.poll=setInterval(async()=>{
     let p;
     try{p=await(await fetch('/progress/'+jobId)).json();}catch(e){return;}
     if(p.done){
-      clearInterval(poll);
-      renderAnswer(reply,route,p.answer,p.audio);
-      pushMsg({type:'assistant',content:p.answer,route,audio:p.audio,timestamp:Date.now()});
-      activeJob=null; go.textContent='Send'; go.classList.remove('stop');
-      go.disabled=false; q.focus();
-      setTimeout(loadMemory,3000);
+      clearInterval(job.poll); delete LIVE[sid];
+      // File it FIRST, so the answer is saved even for a chat nobody is watching.
+      pushMsgTo(sid,{type:'assistant',content:p.answer,route,audio:p.audio,timestamp:Date.now()});
+      if(sid===sessionId){
+        renderAnswer(job.el,route,p.answer,p.audio);
+        syncGo(); q.focus(); setTimeout(loadMemory,3000);
+      }
+      renderSidebar();
     } else {
-      renderPending(reply,route,p.tokens,p.stage,p.stage_age);
+      job.tokens=p.tokens; job.stage=p.stage; job.stageAge=p.stage_age;
+      if(sid===sessionId) renderPending(job.el,route,p.tokens,p.stage,p.stage_age);
     }
   },400);
 }
 
 q.addEventListener('input',()=>{ q.style.height='auto'; q.style.height=Math.min(q.scrollHeight,160)+'px'; });
 go.addEventListener('click',()=>{
-  if(activeJob){ fetch('/stop/'+activeJob,{method:'POST'}).catch(()=>{}); }
+  const j=liveJob();
+  if(j){ fetch('/stop/'+j.jobId,{method:'POST'}).catch(()=>{}); }
   else ask();
 });
 q.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask();} });
@@ -11943,20 +12475,85 @@ select{padding:9px 11px;border:1px solid var(--line);border-radius:9px;backgroun
 .proj .acts{display:flex;gap:8px;margin-top:9px;align-items:center}
 .proj .acts button{padding:5px 12px;font-size:12.5px}
 .proj .acts a{color:var(--gold);text-decoration:none;font-size:12.5px}
-</style></head><body><div class="wrap">
+
+/* ---- three-column shell: projects | conversation | drawer ---------------- */
+body{padding:0;height:100vh;overflow:hidden}
+.app{display:grid;grid-template-columns:238px minmax(0,1fr) 330px;height:100vh}
+.side{border-right:1px solid var(--line);background:var(--card);
+      display:flex;flex-direction:column;min-height:0}
+.side .top{padding:13px 14px;margin:0;border-bottom:1px solid var(--line)}
+.side .top h1{font-size:19px}
+.side .top a{font-size:12.5px}
+.side-scroll{flex:1;min-height:0;overflow-y:auto;padding:9px}
+.side-bot{padding:10px 14px;border-top:1px solid var(--line);
+          color:var(--muted);font-size:11.5px;line-height:1.45}
+#projCard{margin:0;padding:0;border:0;background:transparent;border-radius:0}
+#projCard h2,#projCard .fshint{display:none}
+.projgrid{display:flex;flex-direction:column;gap:5px}
+.proj{padding:8px 10px;border-radius:9px}
+.proj h3{font-size:13.5px;margin:0 0 2px}
+.proj .meta{font-size:11px}
+.proj .sum{display:none}
+.proj .acts{margin-top:6px;gap:6px}
+.proj .acts button{padding:3px 9px;font-size:11.5px}
+.proj .acts a{font-size:11.5px}
+.main{min-width:0;overflow-y:auto;padding:20px 24px 40px}
+.main .card{margin-bottom:14px}
+#feed{max-height:none}
+.drawer{border-left:1px solid var(--line);background:var(--card);
+        display:flex;flex-direction:column;min-height:0}
+.tabs{display:flex;border-bottom:1px solid var(--line);flex:none}
+.tabs button{flex:1;background:transparent;color:var(--muted);border-radius:0;
+             padding:11px 2px;font-size:12.5px;font-weight:600;
+             border-bottom:2px solid transparent}
+.tabs button.on{color:var(--gold);border-bottom-color:var(--gold)}
+.panes{flex:1;min-height:0;overflow-y:auto;padding:12px}
+.pane .card{border:0;padding:0;background:transparent;margin:0}
+.pane .card h2{font-size:14px}
+.empty{color:var(--muted);font-size:12.5px;line-height:1.5;margin:4px 2px}
+#preview{height:300px}
+#fsList{max-height:none}
+/* Long lines are hard to scan; the drawer keeps its own full width. */
+.main-inner{max-width:820px}
+/* Nine controls in one row: everything is trimmed just enough that the primary
+   button stays on the first line instead of wrapping alone onto a second. */
+.bar{flex-wrap:wrap;row-gap:8px;gap:8px}
+.bar button{padding:8px 11px;font-size:13px;white-space:nowrap}
+.bar select{max-width:112px;font-size:12.5px;padding-right:4px}
+#coder{max-width:154px}      /* its labels carry the model name */
+.bar .plan{font-size:12.5px;white-space:nowrap}
+.bar .status{flex-basis:100%;margin:0}
+.main .card h2{font-size:15px}
+/* Narrow screens stack the three columns rather than losing any of them. */
+@media(max-width:1040px){
+  body{overflow:auto;height:auto}
+  .app{grid-template-columns:1fr;height:auto}
+  .side,.drawer{border:0;border-bottom:1px solid var(--line)}
+  .side-scroll{max-height:210px}
+  .panes{max-height:430px}
+}
+</style></head><body>
+<div class="app">
+
+<aside class="side">
 <div class="top">
   <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><rect width="64" height="64" rx="14" fill="#8b4a18"/><path d="M32 57V34M32 34 16 13M32 34 48 13" stroke="#faf6f0" stroke-width="7" stroke-linecap="round" fill="none"/><circle cx="32" cy="34" r="6" fill="#faf6f0"/></svg>
   <h1>Agent</h1><a href="/">&larr; Back to Crewe</a>
 </div>
-<p class="note">A coding agent working in a sandboxed Linux container (real shell, package installs, no access to your network). Admin only. One run at a time.</p>
-
+  <div class="side-scroll">
 <div class="card hidden" id="projCard"><h2>📚 Projects</h2>
   <div id="projList" class="projgrid"></div>
   <p class="fshint">Each request starts its own project. <b>Continue</b> a project to build on its files — otherwise the agent always starts clean.</p>
 </div>
+  </div>
+  <div class="side-bot">Admin only · one run at a time · the agent works in a
+  sandboxed container unless you pick another target.</div>
+</aside>
 
+<main class="main"><div class="main-inner">
 <p class="note hidden" id="projChip" style="margin:0 0 10px">📂 Continuing <b id="projName"></b> — the agent starts from this project's files.
   <a href="#" onclick="clearProject();return false" style="color:var(--gold)">✕ start a new project instead</a></p>
+<p class="note hidden" id="folderChip" style="margin:0 0 10px">📁 Working in <b id="folderName"></b> — the agent edits these files in place. <a href="#" onclick="clearFolder();return false" style="color:var(--gold)">✕ use a fresh run folder</a></p>
 <textarea id="task" placeholder="Describe what to build — e.g. 'Write a Python CLI that dedupes a CSV file, install any packages it needs, and test it on sample data.'"></textarea>
 <div class="bar">
   <select id="target" title="where the agent works" onchange="targetNote();rememberChoice('target','creweAgentTarget')"></select>
@@ -11974,6 +12571,7 @@ select{padding:9px 11px;border:1px solid var(--line);border-radius:9px;backgroun
   <button id="stop" class="stop hidden" onclick="stopRun()">Stop</button>
   <span class="status" id="status"></span>
 </div>
+<p class="note hidden" id="targetWarn" style="color:var(--err);margin-top:-8px">⚠ This target is a real machine over SSH — it is <b>not</b> sandboxed. Commands run for real, as that host's user.</p>
 <div id="qCard" class="card hidden">
   <h2>❓ A few questions first</h2>
   <div id="qList"></div>
@@ -12008,31 +12606,48 @@ select{padding:9px 11px;border:1px solid var(--line);border-radius:9px;backgroun
   <textarea id="planText" style="min-height:190px;font-family:ui-monospace,monospace;font-size:12.5px"></textarea>
   <p class="note" style="margin:8px 0 0">Edit freely, then hit <b>Run agent</b> to build exactly this. Clear the box to let the agent plan on its own.</p>
 </div>
-<p class="note hidden" id="targetWarn" style="color:var(--err);margin-top:-8px">⚠ This target is a real machine over SSH — it is <b>not</b> sandboxed. Commands run for real, as that host's user.</p>
+<div class="card"><h2>Transcript</h2><div id="feed"></div>
+<div class="bar hidden" id="noteBar" style="margin:8px 0 0"><input id="note" style="flex:1;min-width:0" placeholder="Send the agent a note mid-run — delivered after its current action" onkeydown="if(event.key==='Enter'){sendNote();}"><button id="noteBtn" onclick="sendNote()">Send note</button></div>
+</div>
+<div class="card hidden" id="summaryCard"><h2>Summary</h2><div id="summary"></div></div>
+<div class="card hidden" id="followCard"><h2>💬 Follow up</h2>
+  <textarea id="followTask" style="min-height:56px" placeholder="e.g. The board is too small — make it fill the page, and add a score display."></textarea>
+  <div class="bar" style="margin:10px 0 0">
+    <button onclick="followUp()">Improve it</button>
+    <span class="status">runs the agent again in the same workspace, with this build and its summary as context</span>
+  </div>
+</div></main>
 
-<div class="card hidden" id="fsCard">
+<aside class="drawer">
+  <div class="tabs">
+    <button id="tab-files" class="on" onclick="drawerTab('files')">Files</button>
+    <button id="tab-preview" onclick="drawerTab('preview')">Preview</button>
+    <button id="tab-browse" onclick="drawerTab('browse')">Browse</button>
+    <button id="tab-test" onclick="drawerTab('test')">Test</button>
+  </div>
+  <div class="panes">
+<div class="pane" id="pane-files"><div class="card hidden" id="filesCard"><h2>Files</h2><div id="files"></div></div>
+<p class="empty hidden" id="empty-files">Files the agent writes appear here after a run.</p></div>
+<div class="pane hidden" id="pane-preview"><div class="card hidden" id="previewCard"><h2>👁 Preview</h2>
+  <a class="dl" id="previewOpen" href="#" target="_blank">↗ Open in a new tab</a>
+  <iframe id="preview" sandbox="allow-scripts" title="preview of the built app"></iframe>
+</div>
+<p class="empty hidden" id="empty-preview">A build with an index.html renders here.</p></div>
+<div class="pane hidden" id="pane-browse"><div class="card hidden" id="fsCard">
   <h2>📁 Files on <span id="fsHost"></span></h2>
   <div class="fsbar">
     <button onclick="fsUp()" title="Parent directory">↑ Up</button>
     <button onclick="fsLoad()" title="Refresh">⟳</button>
     <button onclick="fsMkdir()" title="Create a directory here">＋ New folder</button>
+    <button onclick="setWorkFolder()" title="Run the agent inside this folder" style="background:var(--ok);color:var(--btn-ink)">✓ Work here</button>
     <span id="fsPath"></span>
   </div>
   <div id="fsList"></div>
   <p class="fshint">Click a folder to open it · click a file to insert its path
-  into the task box · new agent runs land in <code>~/crewe-agent/&lt;run-id&gt;</code>.</p>
+  into the task box · <b>Work here</b> points the agent at this folder, so it edits these files in place. Without it a run lands in a fresh <code>~/crewe-agent/&lt;run-id&gt;</code>.</p>
 </div>
-
-<div class="card"><h2>Transcript</h2><div id="feed"></div>
-<div class="bar hidden" id="noteBar" style="margin:8px 0 0"><input id="note" style="flex:1;min-width:0" placeholder="Send the agent a note mid-run — delivered after its current action" onkeydown="if(event.key==='Enter'){sendNote();}"><button id="noteBtn" onclick="sendNote()">Send note</button></div>
-</div>
-<div class="card hidden" id="summaryCard"><h2>Summary</h2><div id="summary"></div></div>
-<div class="card hidden" id="filesCard"><h2>Files</h2><div id="files"></div></div>
-<div class="card hidden" id="previewCard"><h2>👁 Preview</h2>
-  <a class="dl" id="previewOpen" href="#" target="_blank">↗ Open in a new tab</a>
-  <iframe id="preview" sandbox="allow-scripts" title="preview of the built app"></iframe>
-</div>
-<div class="card hidden" id="testCard"><h2>🧪 Test it</h2>
+<p class="empty hidden" id="empty-browse">Choose <b>local</b> or an SSH host as the target to browse folders and pick one to work in.</p></div>
+<div class="pane hidden" id="pane-test"><div class="card hidden" id="testCard"><h2>🧪 Test it</h2>
   <div class="fsbar">
     <input id="testCmd" type="text" placeholder="e.g. python3 app.py --help &nbsp;·&nbsp; pip install -r requirements.txt && python3 -m pytest"
       onkeydown="if(event.key==='Enter')runTest()">
@@ -12044,12 +12659,10 @@ select{padding:9px 11px;border:1px solid var(--line);border-radius:9px;backgroun
   test of that machine's environment. Installed packages don't carry over — reinstall them in the
   same command if needed.</p>
 </div>
-<div class="card hidden" id="followCard"><h2>💬 Follow up</h2>
-  <textarea id="followTask" style="min-height:56px" placeholder="e.g. The board is too small — make it fill the page, and add a score display."></textarea>
-  <div class="bar" style="margin:10px 0 0">
-    <button onclick="followUp()">Improve it</button>
-    <span class="status">runs the agent again in the same workspace, with this build and its summary as context</span>
+<p class="empty hidden" id="empty-test">After a run, try a command against its files in a fresh sandbox.</p></div>
   </div>
+</aside>
+
 </div>
 
 <script>
@@ -12091,8 +12704,10 @@ function targetNote(){
   $('targetWarn').classList.toggle('hidden', !(isSSH||kind==='local'));
   if(isSSH) $('targetWarn').innerHTML='⚠ This target is a real machine over SSH — it is <b>not</b> sandboxed. Commands run for real, as that host&#39;s user.';
   else if(kind==='local') $('targetWarn').innerHTML='⚠ local runs <b>UNSANDBOXED on this server</b> — commands run for real as the router&#39;s own user, with its permissions.';
-  $('fsCard').classList.toggle('hidden', !isSSH);
-  if(isSSH){ $('fsHost').textContent=opt.value; fsPath='~'; fsLoad(); }
+  fsMaybeLoad();
+  // A folder belongs to the target it was picked on — keeping it after a
+  // switch would point the agent at a path that does not exist there.
+  if(agentFolder) clearFolder();
 }
 
 // ---- remote file browser ----------------------------------------------------
@@ -12291,6 +12906,7 @@ async function startRun(payload){
   // nothing selected every run starts a brand-new one (payload.project may
   // also be set directly, e.g. by a follow-up)
   if(payload.project===undefined && selectedProject) payload.project=selectedProject;
+  if(agentFolder && payload.folder===undefined) payload.folder=agentFolder;
   let r,j; try{ r=await fetch('/agent/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); j=await r.json(); }
   catch(e){ addLine('error','!','request failed'); return; }
   if(j.error){ addLine('error','!', j.error); return; }
@@ -12353,6 +12969,11 @@ async function selectProject(p){
   // pure LOAD: bring the project's saved state onto the page. No model call
   // happens here — the coder is only ever invoked by Run agent / Improve it.
   selectedProject=p.id; $('projName').textContent=p.title;
+  // The project remembers where it lives, so continuing it resumes in the same
+  // folder instead of silently starting somewhere else.
+  if(p.folder){ agentFolder=p.folder; $('folderName').textContent=p.folder;
+                $('folderChip').classList.remove('hidden'); }
+  else clearFolder();
   $('projChip').classList.remove('hidden'); loadProjects(); $('task').focus();
   ['summaryCard','filesCard','previewCard','testCard','followCard'].forEach(id=>$(id).classList.add('hidden'));
   $('testOut').classList.add('hidden'); $('testOut').textContent=''; $('testCmd').value='';
@@ -12372,7 +12993,7 @@ async function selectProject(p){
   $('followCard').classList.remove('hidden');
 }
 function clearProject(){
-  selectedProject=null; $('projChip').classList.add('hidden');
+  selectedProject=null; $('projChip').classList.add('hidden'); clearFolder();
   ['summaryCard','filesCard','previewCard','testCard','followCard'].forEach(id=>$(id).classList.add('hidden'));
   loadProjects();
 }
@@ -12449,19 +13070,71 @@ async function sendNote(){
   }catch(e){ $('status').textContent='note: request failed'; }
   b.disabled=false;
 }
+
+// ---- drawer tabs ------------------------------------------------------------
+const DRAWER_TABS=['files','preview','browse','test'];
+function drawerTab(name){
+  DRAWER_TABS.forEach(t=>{
+    $('tab-'+t).classList.toggle('on', t===name);
+    $('pane-'+t).classList.toggle('hidden', t!==name);
+  });
+  try{ localStorage.setItem('creweAgentTab',name); }catch(e){}
+  if(name==='browse') fsMaybeLoad();
+  syncEmpty();
+}
+// Each pane's card keeps its own .hidden state (existing code toggles it), so
+// the empty note is simply its inverse — no second source of truth.
+function syncEmpty(){
+  [['files','filesCard'],['preview','previewCard'],
+   ['browse','fsCard'],['test','testCard']].forEach(([t,card])=>{
+    $('empty-'+t).classList.toggle('hidden', !$(card).classList.contains('hidden'));
+  });
+}
+
+// ---- the folder the agent works IN -----------------------------------------
+let agentFolder=null, fsLoadedFor=null;
+function setWorkFolder(){
+  if(!fsPath) return;
+  agentFolder=fsPath;
+  $('folderName').textContent=fsPath;
+  $('folderChip').classList.remove('hidden');
+}
+function clearFolder(){
+  agentFolder=null;
+  $('folderChip').classList.add('hidden');
+}
+// Browsing is available wherever the agent can actually act on files: an SSH
+// host or this server. The sandbox is a throwaway container, so there is
+// nothing to browse and nothing worth pinning.
+function fsMaybeLoad(){
+  const sel=$('target'), opt=sel.options[sel.selectedIndex];
+  const kind=opt?opt.dataset.kind:'';
+  if(kind==='ssh'||kind==='local'){
+    $('fsCard').classList.remove('hidden');
+    $('fsHost').textContent=(kind==='local')?'this server':opt.value;
+    if(fsLoadedFor!==opt.value){ fsLoadedFor=opt.value; fsPath='~'; fsLoad(); }
+  } else {
+    $('fsCard').classList.add('hidden');
+  }
+  syncEmpty();
+}
+try{ drawerTab(localStorage.getItem('creweAgentTab')||'files'); }catch(e){ drawerTab('files'); }
 </script>
-</div></body></html>"""
+</body></html>"""
 
 def agent_runs_dir(uid=None):
     return _ustore("agent_runs", uid)
 
-def _reap_sandbox_containers():
-    """Remove stray crewe-sbx-* containers. Safe because only ONE agent run
-    happens at a time (AGENT_ACTIVE), so any container alive when a new run
-    starts is a leak from a run that was killed or wedged."""
+def _reap_sandbox_containers(prefix="crewe-sbx-"):
+    """Remove stray containers with this name prefix. Safe for crewe-sbx-
+    because only ONE agent run happens at a time (AGENT_ACTIVE), so any
+    container alive when a new run starts is a leak from a killed or wedged
+    run. Build servers use their OWN prefix precisely so this sweep — which
+    also fires when an AGENT run starts — cannot take a live build's server
+    down in the middle of its verification."""
     try:
         import subprocess as _sp
-        ids = _sp.run(["docker", "ps", "-q", "--filter", "name=crewe-sbx-"],
+        ids = _sp.run(["docker", "ps", "-q", "--filter", "name=" + prefix],
                       capture_output=True, text=True, timeout=15).stdout.split()
         if ids:
             _sp.run(["docker", "rm", "-f", *ids], capture_output=True, timeout=30)
@@ -12854,14 +13527,14 @@ def _agent_browser_check(res, snapshot, on_event):
 
 
 def _run_agent_job(job_id, task, uid, target="sandbox", plan=True, plan_text=None,
-                   coder=None, project=None, max_steps=None):
+                   coder=None, project=None, max_steps=None, folder=None):
     # EVERYTHING runs under the try whose finally releases AGENT_ACTIVE — an
     # exception in the preamble (disk-full in makedirs, a broken agent.py
     # import) used to kill this thread with the lock held, bricking the agent
     # with 429s until a restart.
     try:
         return _run_agent_job_inner(job_id, task, uid, target, plan, plan_text,
-                                    coder, project, max_steps)
+                                    coder, project, max_steps, folder)
     except Exception as e:
         print(f"[agent] job {job_id} crashed: {e}")
         with AGENT_JOBS_LOCK:
@@ -12882,7 +13555,7 @@ def _run_agent_job(job_id, task, uid, target="sandbox", plan=True, plan_text=Non
 
 
 def _run_agent_job_inner(job_id, task, uid, target, plan, plan_text,
-                         coder, project, max_steps):
+                         coder, project, max_steps, folder=None):
     import agent as _agent
     if coder is None:
         coder = _agent_default_coder()
@@ -12908,13 +13581,13 @@ def _run_agent_job_inner(job_id, task, uid, target, plan, plan_text,
         # run_agent tears down on exit
         if target == "local":
             import local_workspace
-            return local_workspace.LocalWorkspace(run_id=job_id)
+            return local_workspace.LocalWorkspace(run_id=job_id, workdir=folder)
         if host:
             import ssh_workspace
             return ssh_workspace.SSHWorkspace(
                 host=host["host"], user=host["user"], port=host.get("port", 22),
                 key=host.get("key"), workdir_base=host.get("workdir", "~/crewe-agent"),
-                run_id=job_id)
+                run_id=job_id, workdir=folder)
         return None
     def on_event(e):
         with AGENT_JOBS_LOCK:
@@ -13053,6 +13726,21 @@ def agent_run():
     pid = (body.get("project") or "").strip()
     if pid and not _project(pid):
         return jsonify({"error": "unknown project"}), 400
+    # A folder binds the run to REAL files: the agent edits them in place
+    # instead of starting in a fresh ~/crewe-agent/<run-id>. It sticks to the
+    # project, so every later run on that project continues in the same place —
+    # which is what "carry on with the thing I was working on" has to mean.
+    folder = (body.get("folder") or "").strip()
+    if not folder and pid:
+        folder = ((_project(pid) or {}).get("folder") or "")
+    if folder:
+        if target == "sandbox":
+            return jsonify({"error": "the sandbox target is a throwaway "
+                                     "container — pick local or an SSH host "
+                                     "to work in a real folder"}), 400
+        folder, ferr = _agent_folder_ok(folder, local=(target == "local"))
+        if ferr:
+            return jsonify({"error": ferr}), 400
     try:
         max_steps = min(40, max(1, int(body.get("steps") or AGENT_MAX_STEPS)))
     except (TypeError, ValueError):
@@ -13073,7 +13761,16 @@ def agent_run():
                 ps = _load_projects()
                 ps.append({"id": pid, "title": title, "created": time.time(),
                            "updated": time.time(), "job_id": None, "jobs": [],
-                           "summary": None})
+                           "summary": None, "folder": folder or None,
+                           "target": target})
+                _save_projects(ps)
+        elif folder:
+            with AGENT_PROJECTS_LOCK:
+                ps = _load_projects()
+                for q in ps:
+                    if q.get("id") == pid:
+                        q["folder"] = folder
+                        q["target"] = target
                 _save_projects(ps)
         job_id = uuid.uuid4().hex
         with AGENT_JOBS_LOCK:
@@ -13084,7 +13781,7 @@ def agent_run():
             _prune_jobs(AGENT_JOBS)
         spawn_owned(target=_run_agent_job,
                     args=(job_id, task, _owner(), target, plan, plan_text, coder,
-                          pid, max_steps),
+                          pid, max_steps, folder or None),
                     daemon=True).start()
     except Exception:
         try:
@@ -13092,7 +13789,7 @@ def agent_run():
         except RuntimeError:
             pass
         raise
-    return jsonify({"job_id": job_id, "project": pid})
+    return jsonify({"job_id": job_id, "project": pid, "folder": folder or None})
 
 @app.route("/agent/plan", methods=["POST"])
 def agent_plan():
@@ -13203,6 +13900,37 @@ def agent_hosts():
 # Same security rails as the agent itself: the client sends a host NAME, the
 # allowlist resolves it, SSH is key-only BatchMode, and the remote user's own
 # permissions are the boundary. Short-lived ssh calls, no persistent state.
+# Directories the agent must never be pointed at. It edits files in place in
+# whatever folder it is given, so "work in /" or "work in my home" puts the
+# router's own source, ~/.ssh and /etc inside its reach. An admin can still do
+# anything by hand — this only stops it happening by a misclick in a browser.
+_FS_FORBIDDEN = {"/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32",
+                 "/lib64", "/proc", "/root", "/run", "/sbin", "/srv", "/sys",
+                 "/usr", "/var", "/home"}
+
+
+def _agent_folder_ok(path, local):
+    """Validate a folder the agent will work IN. Returns (path, error)."""
+    raw = (path or "").strip()
+    if not raw:
+        return None, "no folder given"
+    p = os.path.expanduser(raw) if local else raw
+    if local:
+        p = os.path.abspath(p)
+    if not p.startswith("/") and not p.startswith("~"):
+        return None, "folder must be an absolute path"
+    probe = p.rstrip("/") or "/"
+    if probe in _FS_FORBIDDEN:
+        return None, (f"{probe} is a system directory — choose a project "
+                      f"folder inside it")
+    if local and probe == os.path.expanduser("~").rstrip("/"):
+        return None, ("your whole home directory is too broad — choose a "
+                      "project folder inside it")
+    if local and not os.path.isdir(p):
+        return None, f"{p} is not a directory"
+    return p, None
+
+
 def _agent_fs_ssh(name):
     h = _agent_host(name)
     if not h:
@@ -13229,9 +13957,37 @@ def _agent_fs_resolve(ws, path):
     return path, None
 
 
+def _agent_fs_local_list(path):
+    """Browse this host's own filesystem. Admin-only like every /agent route,
+    and only when local mode is enabled — the target that can act on these
+    files at all is gated the same way."""
+    if not _agent_local_ok():
+        return jsonify({"error": "local mode is disabled — set "
+                                 "CREWE_AGENT_ALLOW_LOCAL=1"}), 400
+    p = os.path.abspath(os.path.expanduser((path or "~").strip() or "~"))
+    entries = []
+    try:
+        with os.scandir(p) as it:
+            for e in it:
+                try:
+                    is_dir = e.is_dir()
+                    size = e.stat().st_size if e.is_file() else 0
+                except OSError:
+                    is_dir, size = False, 0     # broken symlink, no permission
+                entries.append({"name": e.name, "dir": is_dir, "size": size})
+    except OSError as exc:
+        return jsonify({"error": str(exc)[:200], "path": p}), 502
+    entries.sort(key=lambda e: (not e["dir"], e["name"].startswith("."),
+                                e["name"].lower()))
+    return jsonify({"path": p, "entries": entries[:500],
+                    "truncated": len(entries) > 500})
+
+
 @app.route("/agent/fs/<name>/list")
 def agent_fs_list(name):
     import shlex
+    if name == "local":
+        return _agent_fs_local_list(request.args.get("path"))
     ws, err = _agent_fs_ssh(name)
     if err:
         return err
@@ -13263,6 +14019,21 @@ def agent_fs_list(name):
 @app.route("/agent/fs/<name>/mkdir", methods=["POST"])
 def agent_fs_mkdir(name):
     import shlex
+    if name == "local":
+        if not _agent_local_ok():
+            return jsonify({"error": "local mode is disabled"}), 400
+        b = request.json or {}
+        folder = (b.get("folder") or "").strip()
+        if (not folder or "/" in folder or folder in (".", "..")
+                or "\x00" in folder or len(folder) > 120):
+            return jsonify({"error": "invalid folder name"}), 400
+        base = os.path.abspath(os.path.expanduser((b.get("path") or "~").strip()))
+        target = os.path.join(base, folder)
+        try:
+            os.mkdir(target)
+        except OSError as exc:
+            return jsonify({"error": str(exc)[:200]}), 502
+        return jsonify({"ok": True, "path": target})
     ws, err = _agent_fs_ssh(name)
     if err:
         return err
@@ -13375,6 +14146,7 @@ def agent_projects_list():
                     rel += [os.path.relpath(os.path.join(_r, f), snap) for f in fs]
                 has_html = any(f.endswith(".html") for f in rel)
         out.append({"id": p.get("id"), "title": p.get("title") or "(untitled)",
+                    "folder": p.get("folder"), "target": p.get("target"),
                     "updated": p.get("updated"), "runs": len(p.get("jobs") or []),
                     "summary": (p.get("summary") or "")[:220],
                     "job_id": jid, "files": len(rel), "has_html": has_html,
@@ -13573,6 +14345,7 @@ if __name__ == "__main__":
     _start_photo_backfill()
     _start_meta_backfill()
     _reap_sandbox_containers()   # a restart mid-run leaves its container behind
+    _reap_sandbox_containers("crewe-bes-")   # ...and the same for build servers
     # Bind host: default 0.0.0.0 keeps LAN/tailnet direct access working. For a
     # pure public-via-tunnel deploy, set CREWE_BIND=127.0.0.1 so ONLY cloudflared
     # can reach Flask (closes any header-spoofing path and hides :5000 from LAN).

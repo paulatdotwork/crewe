@@ -35,12 +35,14 @@ def _clip(s, limit=20_000):
 
 class SSHWorkspace:
     def __init__(self, host, user, *, port=22, key=None,
-                 workdir_base="~/crewe-agent", run_id=None):
+                 workdir_base="~/crewe-agent", run_id=None, workdir=None):
         self.host = host
         self.user = user
         self.port = int(port or 22)
         self.key = key
         self.workdir_base = workdir_base or "~/crewe-agent"
+        # An EXISTING remote folder to work in, instead of a fresh per-run dir.
+        self.pinned_workdir = workdir
         self.run_id = run_id or uuid.uuid4().hex[:12]
         self.workdir = None            # resolved on start()
         self._started = False
@@ -67,10 +69,14 @@ class SSHWorkspace:
             raise WorkspaceError(f"ssh connect failed for {self.user}@{self.host}: "
                                  f"{r.stderr.strip()}")
         home = r.stdout.strip() or "."
-        base = self.workdir_base
-        if base.startswith("~"):
-            base = home + base[1:]
-        self.workdir = f"{base.rstrip('/')}/{self.run_id}"
+        if self.pinned_workdir:
+            wd = self.pinned_workdir
+            self.workdir = (home + wd[1:]) if wd.startswith("~") else wd
+        else:
+            base = self.workdir_base
+            if base.startswith("~"):
+                base = home + base[1:]
+            self.workdir = f"{base.rstrip('/')}/{self.run_id}"
         r = subprocess.run(self._ssh() + [f"mkdir -p {shlex.quote(self.workdir)}"],
                            capture_output=True, text=True, timeout=30)
         if r.returncode != 0:

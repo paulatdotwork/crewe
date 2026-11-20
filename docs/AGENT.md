@@ -52,6 +52,14 @@ below the 32k cap is retried once at 8k.
   project's saved state (files, preview, summary) without any model call, and
   the next run seeds its workspace from that project's latest snapshot, with
   the previous summary as context.
+- **Work in a real folder** — the Browse tab lists folders on the target and
+  **Work here** pins one; the run then executes in that folder, editing files
+  in place, instead of a fresh workdir. The folder is saved on the project, so
+  continuing resumes there; switching target clears it. System folders
+  (`/`, `/etc`, `/usr`, `/home` and the like) are refused, as is your whole
+  home directory on this machine, and the sandbox target takes no folder (it
+  is a throwaway container). Browsing this machine needs
+  `CREWE_AGENT_ALLOW_LOCAL=1`.
 - **Auto-plan** — small local models scope-creep; by default the task is first
   expanded into a bounded MVP spec (editable before running).
 - **Workspace briefing** — before the first model turn the harness states the
@@ -90,7 +98,11 @@ to judge the first.
 - **Finish gate** — `finish` is refused (at most twice, only with steps to
   spare) when source files changed and nothing ran since, or a syntax error
   is outstanding — flagged files are re-read first, so a `sed`/`rm` fix
-  counts.
+  counts. It also refuses third-party imports that nothing records
+  (`requirements.txt`, `pyproject.toml`, `package.json` and the like): the
+  user receives the files, not the container the packages were installed in.
+  Standard-library and project-local modules never count, and the refusal
+  spends the same bounded budget, so it cannot block delivery.
 - **Verdict** — every run ends with `✓ verified — <cmd> exited 0 after the
   last change` or `⚠ unverified — <why>`, in the transcript and the job
   status. "Done" is never claimed for code that was never run.

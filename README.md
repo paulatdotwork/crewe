@@ -17,6 +17,9 @@
 - **Projects**: every run starts its own project; browse past builds as
   cards, preview HTML builds live, test any build with one command in a
   fresh sandbox, continue a project or delete it
+- **Work in a real folder**: browse the target from the side panel and pin a
+  folder; the run edits files there in place, and continuing the project
+  resumes in the same folder (system folders and a bare home are refused)
 - Streamed model calls: live "coder writing…" progress, Stop that lands
   mid-generation, silence-based timeouts that never kill a slow-but-alive
   local model
@@ -47,6 +50,12 @@
 - Agentic code pipeline: plan → per-step build → foreman check → delivery inspection → real-browser runtime gate
 - **Behavior verification**: the model writes click/assert checks, the harness runs them in headless Firefox; bug reports are *reproduced* before fixing and re-verified after (SWE-agent style)
 - Working memory per job (what was tried, what failed and survived) so retries never loop the same fix; jobs are auditable in a per-job markdown log
+- **Backend builds**: when the plan includes a server, the gates run against
+  that server inside the sandbox rather than against static copies of its
+  files (`CREWE_BACKEND=0` turns this off)
+- Follow-ups stay proportionate: a single small change skips the planner and
+  edits in place, and a question about the build is answered from its source
+  instead of triggering a rebuild
 - Builds are playable in-app at `/play/<session>/`
 
 **Reading your documents**

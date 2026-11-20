@@ -17,8 +17,10 @@ in the running app.
 """
 import os
 import shlex
+import socket
 import subprocess
 import tempfile
+import time
 import uuid
 
 DEFAULT_IMAGE = os.environ.get("CREWE_SANDBOX_IMAGE", "crewe-sandbox:latest")
@@ -51,15 +53,30 @@ SANDBOX_USER = os.environ.get("CREWE_SANDBOX_USER", "1000:1000")
 
 class Sandbox:
     def __init__(self, image=DEFAULT_IMAGE, *, network="none", memory="1g",
-                 cpus="2", pids=256, workdir="/workspace"):
+                 cpus="2", pids=256, workdir="/workspace", serve_port=None,
+                 name_prefix=NAME_PREFIX):
         self.image = image
         self.network = network            # "none" (A) or a docker network name (B)
+        # Port a server inside the sandbox listens on, so the host can drive it
+        # in a browser. Deliberately NOT docker's -p: EGRESS_NETWORK is
+        # internal=true and docker silently ignores port publishing on an
+        # internal network (verified 2026-08-27 — the mapping never appears in
+        # `docker port` and the host never listens). The host owns the bridge
+        # gateway, so it can reach the container IP directly, which is better
+        # anyway: nothing is bound in the host's port space and there is no
+        # published port for the LAN to find.
+        self.serve_port = serve_port
+        self._ip = None
         self.memory = memory
         self.cpus = str(cpus)
         self.pids = str(pids)
         self.workdir = workdir
         self.cid = None
-        self.name = NAME_PREFIX + uuid.uuid4().hex[:12]
+        # Callers that are NOT the agent pass their own prefix: the agent's
+        # reaper force-removes every crewe-sbx-* container it finds, on the
+        # assumption that only one agent runs at a time. A code-pipeline build
+        # server is a different lifecycle and must not be swept up by it.
+        self.name = name_prefix + uuid.uuid4().hex[:12]
 
     # -- lifecycle ------------------------------------------------------------
     def start(self):
@@ -67,6 +84,11 @@ class Sandbox:
             return self
         args = ["run", "-d", "--name", self.name]
         env = []
+        if self.serve_port and self.network == "none":
+            # --network none has no network stack at all, so nothing can reach
+            # a server in it. "egress" is the INTERNAL bridge: reachable from
+            # this host, still no route to the internet.
+            self.network = "egress"
         if self.network == "egress":
             # sandbox joins the internal (no-internet) net; its only way out is
             # the proxy, which the package managers use via these env vars.
@@ -128,6 +150,69 @@ class Sandbox:
         except SandboxError:
             return 124, "", f"command timed out after {timeout}s"
         return r.returncode, _clip(r.stdout), _clip(r.stderr)
+
+    def container_ip(self):
+        """The container's address on the docker bridge. Cached: it cannot
+        change for the life of the container."""
+        if not self.cid:
+            raise SandboxError("sandbox not started")
+        if not self._ip:
+            r = _docker("inspect", self.cid, "--format",
+                        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                        timeout=20)
+            self._ip = (r.stdout or "").strip()
+            if not self._ip:
+                raise SandboxError("sandbox has no container IP — started with "
+                                   "network='none'?")
+        return self._ip
+
+    def base_url(self):
+        """URL the HOST can use to reach the sandboxed server."""
+        if not self.serve_port:
+            raise SandboxError("sandbox has no serve_port")
+        return f"http://{self.container_ip()}:{int(self.serve_port)}"
+
+    def run_bg(self, cmd, log="/tmp/crewe-bg.log", timeout=30):
+        """Start a long-running process (a dev server) and return at once.
+
+        run() blocks until the command exits — which a server never does, so
+        booting one with it just hangs until the timeout. nohup plus & detaches
+        the process inside the container, where it is reparented to init and
+        outlives this exec. Returns the pid as a string.
+
+        Output goes to `log` so a server that dies on boot can still be
+        diagnosed with read_file(log): a crashed server with no captured stderr
+        is the most confusing failure this can produce, and the traceback is
+        the single most useful thing to hand back to the model."""
+        if not self.cid:
+            raise SandboxError("sandbox not started")
+        wrapped = (f"nohup sh -c {shlex.quote(cmd)} > {shlex.quote(log)} 2>&1 & "
+                   f"echo $!")
+        code, out, err = self.run(wrapped, timeout=timeout)
+        if code != 0:
+            raise SandboxError(f"failed to start background command: "
+                               f"{(err or out).strip()[:300]}")
+        return out.strip()
+
+    def wait_for_port(self, timeout=45):
+        """Block until the server answers from the HOST side, or return False.
+
+        Probing from the host proves the whole path the browser will use. A
+        server bound to 127.0.0.1 INSIDE the container listens happily and is
+        still unreachable from here — only a host-side probe catches that, so
+        sandboxed servers must bind 0.0.0.0 (safe: a throwaway container on an
+        internal network)."""
+        if not self.serve_port:
+            raise SandboxError("sandbox has no serve_port")
+        ip, port = self.container_ip(), int(self.serve_port)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with socket.socket() as s:
+                s.settimeout(1.0)
+                if s.connect_ex((ip, port)) == 0:
+                    return True
+            time.sleep(0.4)
+        return False
 
     def write_file(self, path, content):
         """Write a file inside the sandbox. Streamed via the exec user's stdin so

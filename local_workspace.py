@@ -24,11 +24,18 @@ def _clip(s, limit=20_000):
 
 
 class LocalWorkspace:
-    def __init__(self, run_id, workdir_base=None):
-        base = os.path.expanduser(
-            workdir_base
-            or os.environ.get("CREWE_AGENT_LOCAL_DIR", "~/crewe-agent"))
-        self.workdir = os.path.join(base, run_id)
+    def __init__(self, run_id, workdir_base=None, workdir=None):
+        if workdir:
+            # An EXISTING folder the operator picked: the agent works in it
+            # directly, editing the real files there, instead of starting in a
+            # fresh per-run directory. _abs() still confines every path to this
+            # root, so the agent cannot wander out of the folder it was given.
+            self.workdir = os.path.abspath(os.path.expanduser(workdir))
+        else:
+            base = os.path.expanduser(
+                workdir_base
+                or os.environ.get("CREWE_AGENT_LOCAL_DIR", "~/crewe-agent"))
+            self.workdir = os.path.join(base, run_id)
 
     # -- lifecycle -------------------------------------------------------------
     def __enter__(self):
